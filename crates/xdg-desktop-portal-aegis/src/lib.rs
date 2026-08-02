@@ -20,8 +20,10 @@
 //! encrypted at-rest vault and needs no compositor IPC; a transitional
 //! `org.freedesktop.secrets` compat shim (`secret::compat`) serves the
 //! classic Secret Service API until portal-native secret retrieval is
-//! universal. Inward it is an ordinary scoped
-//! IPC client: pixels come from `Request::CaptureOutput` under the built-in
+//! universal. FileChooser launches one portal-owned GTK4 prompter process;
+//! no file data crosses compositor IPC. For compositor-owned resources the
+//! backend is an ordinary scoped IPC client: pixels come from
+//! `Request::CaptureOutput` under the built-in
 //! `aegis-portal` named scope with a sealed-memfd blob transfer
 //! transport, screencast frames arrive through the same scope's output-frame
 //! stream and are republished as a PipeWire producer stream, and idle
@@ -308,19 +310,12 @@ pub fn run() -> Result<(), PortalError> {
             PortalError::Bus(zbus::Error::Failure(format!("spawn inhibit worker: {e}")))
         })?;
 
-    // File picks block on user interaction (up to the compositor's pick
-    // timeout), so they get their own worker rather than the capture one.
+    // FileChooser dispatches one supervised UI task/process per request and
+    // never shares the compositor capture worker.
     let file_chooser_tracker = Arc::clone(&tracker);
-    let file_chooser_socket = socket.clone();
     std::thread::Builder::new()
         .name("aegis-portal-file-chooser".to_string())
-        .spawn(move || {
-            file_chooser::file_chooser_worker(
-                file_chooser_rx,
-                file_chooser_tracker,
-                PortalCapture::new(file_chooser_socket),
-            )
-        })
+        .spawn(move || file_chooser::file_chooser_worker(file_chooser_rx, file_chooser_tracker))
         .map_err(|e| {
             PortalError::Bus(zbus::Error::Failure(format!(
                 "spawn file chooser worker: {e}"

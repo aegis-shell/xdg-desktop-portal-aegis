@@ -70,11 +70,20 @@ pub fn private_bus() -> Option<PrivateBus> {
 /// `AEGIS_PORTAL_E2E_DAEMON_LOG=<path>` captures the daemon's stderr into
 /// that file for debugging hung flows.
 pub fn spawn_daemon(bus: &PrivateBus, data: &PathBuf, runtime: &PathBuf) -> Child {
+    daemon_command(bus, data, runtime)
+        .spawn()
+        .expect("spawn xdg-desktop-portal-aegis")
+}
+
+/// Construct the hermetic daemon command so a test can add interface-specific
+/// environment before spawning it.
+pub fn daemon_command(bus: &PrivateBus, data: &PathBuf, runtime: &PathBuf) -> Command {
     let stderr: Stdio = match std::env::var_os("AEGIS_PORTAL_E2E_DAEMON_LOG") {
         Some(path) => Stdio::from(std::fs::File::create(path).expect("create daemon log file")),
         None => Stdio::null(),
     };
-    Command::new(env!("CARGO_BIN_EXE_xdg-desktop-portal-aegis"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xdg-desktop-portal-aegis"));
+    command
         .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
         .env("XDG_DATA_HOME", data)
         .env("XDG_RUNTIME_DIR", runtime)
@@ -83,9 +92,8 @@ pub fn spawn_daemon(bus: &PrivateBus, data: &PathBuf, runtime: &PathBuf) -> Chil
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         )
         .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn xdg-desktop-portal-aegis")
+        .stderr(stderr);
+    command
 }
 
 /// Kill a daemon child on drop.

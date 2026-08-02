@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 aegis-ipc = { workspace = true }
+aegis-portal-prompter = { workspace = true }
 aegis-portal-runtime = { workspace = true }
 aegis-portal-secret = { workspace = true }
 # aegis-ipc's pick results and window snapshots carry aegis-core types (Rect,
@@ -29,6 +30,7 @@ thiserror = { workspace = true }
 pipewire = "0.10"
 dirs = { workspace = true }
 rand = "0.8"
+serde_json.workspace = true
 # Account portal: getpwuid for the account id and GECOS real name.
 libc = { workspace = true }
 

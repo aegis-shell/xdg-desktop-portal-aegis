@@ -11,10 +11,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use aegis_ipc::{
-    AppPickResult, Capabilities, FilePickOptions, FilePickResult, Handler, JournalSnapshot,
-    OpClass, Scope, Server,
-};
+use aegis_ipc::{AppPickResult, Capabilities, Handler, JournalSnapshot, OpClass, Scope, Server};
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
@@ -79,19 +76,10 @@ impl Handler for FakeCompositor {
                 OpClass::StreamOutput,
                 OpClass::IdleInhibit,
                 OpClass::PickTarget,
-                OpClass::PickFile,
                 OpClass::PickApp,
             ]),
             ..Scope::default()
         })
-    }
-
-    fn pick_file(
-        &self,
-        _conn_id: u64,
-        _options: FilePickOptions,
-    ) -> Result<FilePickResult, String> {
-        Err("no file pick expected in this test".into())
     }
 
     fn pick_app(

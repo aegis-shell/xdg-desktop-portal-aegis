@@ -7,11 +7,13 @@ requests into Aegis's scoped IPC, publishes ScreenCast streams through
 PipeWire, and hosts the encrypted Secret portal and transitional Secret
 Service compatibility API.
 
-The repository builds one D-Bus-activated `xdg-desktop-portal-aegis`
-process from a small Cargo workspace:
+The repository builds a D-Bus-activated backend plus a disposable FileChooser
+UI host from a small Cargo workspace:
 
 - `xdg-desktop-portal-aegis` assembles the backend interfaces, IPC adapters,
   and workers.
+- `aegis-portal-prompter` runs one GTK4 file dialog per request. It owns file
+  browsing and never connects to compositor IPC.
 - `aegis-portal-runtime` owns the shared portal Request lifecycle.
 - `aegis-portal-secret` owns the encrypted vault and both Secret APIs.
 - `aegis-pam` optionally forwards a verified login password for vault
@@ -27,7 +29,8 @@ for the authoritative matrix.
 
 ## Build
 
-Install PipeWire, SPA, PAM, and `pkg-config` development packages, then run:
+Install GTK4, PipeWire, SPA, PAM, and `pkg-config` development packages, then
+run:
 
 ```bash
 cargo build --locked --release --workspace
@@ -35,8 +38,9 @@ cargo test --locked --workspace
 ```
 
 The backend binary is private and is normally activated by D-Bus. Packaging
-installs it as `/usr/lib/xdg-desktop-portal-aegis` together with the files
-under `contrib/`.
+installs it as `/usr/lib/xdg-desktop-portal-aegis`, installs
+`aegis-portal-prompter` as `/usr/lib/aegis-portal-prompter`, and installs the
+files under `contrib/`.
 
 The repository's own source is MIT-licensed. A binary package that includes
 the optional `pam_aegis.so` module must additionally declare GPL-3.0-only

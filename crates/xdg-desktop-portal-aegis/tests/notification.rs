@@ -81,7 +81,6 @@ impl Handler for FakeCompositor {
                 OpClass::StreamOutput,
                 OpClass::IdleInhibit,
                 OpClass::PickTarget,
-                OpClass::PickFile,
                 OpClass::PickApp,
                 OpClass::Notify,
                 OpClass::DismissNotification,

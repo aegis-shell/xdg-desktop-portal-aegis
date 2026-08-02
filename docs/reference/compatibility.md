@@ -12,3 +12,8 @@ The committed `Cargo.lock` resolves that tagged source. Distribution
 packages must express an exact dependency on the Aegis version in this
 table. A local path patch is development state and does not change release
 compatibility.
+
+The unreleased FileChooser process-boundary work is coordinated with Aegis
+IPC protocol 20. It does not change the published `v0.0.1` mapping; the next
+Portal release must pin the Aegis tag that publishes protocol 20 before that
+release is cut.

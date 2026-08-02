@@ -109,16 +109,6 @@ impl PortalCapture {
         self.client()?.pick_target(kind)
     }
 
-    /// Run one interactive file pick through compositor chrome (the
-    /// FileChooser portal's compositor side). Same blocking, no-retry
-    /// discipline as [`PortalCapture::pick`].
-    pub(crate) fn pick_file(
-        &mut self,
-        options: aegis_ipc::FilePickOptions,
-    ) -> io::Result<aegis_ipc::FilePickResult> {
-        self.client()?.pick_file(options)
-    }
-
     /// Run one interactive application pick through compositor chrome (the
     /// AppChooser portal's compositor side). Same blocking, no-retry
     /// discipline as [`PortalCapture::pick`].

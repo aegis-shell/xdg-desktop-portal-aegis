@@ -1,0 +1,26 @@
+[package]
+name = "aegis-portal-prompter"
+description = "Out-of-process native prompt surfaces for xdg-desktop-portal-aegis"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-logging = { workspace = true }
+gdk4-wayland = "0.10.1"
+gtk4 = "0.10.1"
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lib]
+name = "aegis_portal_prompter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aegis-portal-prompter"
+path = "src/main.rs"

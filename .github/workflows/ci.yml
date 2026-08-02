@@ -33,7 +33,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dbus-daemon libclang-dev libpam0g-dev \
+            dbus-daemon libclang-dev libgtk-4-dev libpam0g-dev \
             libpipewire-0.3-dev libspa-0.2-dev pkg-config
       - name: Format
         run: cargo fmt --all -- --check

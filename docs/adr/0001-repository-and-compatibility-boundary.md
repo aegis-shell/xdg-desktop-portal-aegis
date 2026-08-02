@@ -1,6 +1,6 @@
 # ADR-0001: Repository and compatibility boundary
 
-- Status: Accepted
+- Status: Superseded by [ADR-0002](0002-resource-authority-and-file-chooser-process-boundary.md)
 - Date: 2026-08-02
 
 ## Context

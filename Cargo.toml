@@ -18,6 +18,7 @@ aegis-ipc = { version = "=0.0.9", git = "https://github.com/ming2k/aegis", tag =
 aegis-logging = { version = "=0.0.9", git = "https://github.com/ming2k/aegis", tag = "v0.0.9" }
 
 aegis-portal-runtime = { version = "=0.0.1", path = "crates/aegis-portal-runtime" }
+aegis-portal-prompter = { version = "=0.0.1", path = "crates/aegis-portal-prompter" }
 aegis-portal-secret = { version = "=0.0.1", path = "crates/aegis-portal-secret" }
 
 dirs = "5"

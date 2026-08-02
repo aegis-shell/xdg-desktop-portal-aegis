@@ -1,59 +1,45 @@
-//! `org.freedesktop.impl.portal.FileChooser` v3: native file picking.
+//! `org.freedesktop.impl.portal.FileChooser` v3.
 //!
-//! `OpenFile`, `SaveFile`, and `SaveFiles` export a
-//! `org.freedesktop.impl.portal.Request` object at the caller's `handle`,
-//! then hand the request to a dedicated worker which runs the compositor's
-//! file-picker chrome over scoped IPC (`PickFile`, the user-consent pick
-//! added in IPC version 13). The picker is ordinary modal chrome over the
-//! live scene; no screen content is captured.
-//!
-//! Result URIs are always `file://` URIs, as the backend contract requires.
-//! `SaveFiles` maps to a directory pick; the suggested file names from the
-//! `files` option are appended to the chosen folder per the spec.
-//!
-//! Accepted-but-ignored options: `modal` and `parent_window` (the chrome is
-//! always a session-modal overlay), `choices` combo boxes (no UI for them
-//! yet), and `current_filter` preselection (the picker starts at the first
-//! filter; the selected filter is still reported back).
-//!
-//! Response codes follow the portal specification: 0 success, 1 cancelled
-//! (the client called `Request.Close` first, or the user dismissed the
-//! picker), 2 other error.
+//! The backend owns D-Bus translation and request lifetime. Each request is
+//! rendered by a fresh `aegis-portal-prompter` child, communicating over a
+//! private JSON pipe contract. No file path or directory entry crosses Aegis
+//! compositor IPC, and closing the portal request terminates the child.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
+use aegis_portal_prompter::{
+    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PrompterRequest, PrompterResponse,
+    SelectionMode, SelectionRequest, SelectionResponse,
+};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
-use crate::ipc::PortalCapture;
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+
+const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
+const PROMPTER_ENV: &str = "AEGIS_PORTAL_PROMPTER";
 
 /// The served interface version: 3 adds the `current_file` option to
 /// `SaveFile` (2 added `SaveFiles`).
 pub(crate) const FILE_CHOOSER_VERSION: u32 = 3;
 
-/// One file-chooser request handed from the bus methods to the worker.
+/// One file-chooser request handed from the bus methods to the dispatcher.
+/// The request contains the complete portal semantics; no UI policy is
+/// reconstructed by the worker task.
 pub(crate) enum FileChooserJob {
     Choose {
         request_path: String,
-        app_id: String,
-        options: aegis_ipc::FilePickOptions,
-        /// Suggested file names from the `SaveFiles` `files` option,
-        /// appended to the chosen folder in the result URIs.
-        save_files: Vec<OsString>,
+        request: SelectionRequest,
         reply: ResponseSender,
     },
 }
 
-/// The served file-chooser interface. Methods only register the request
-/// object and enqueue; the user-facing pick happens on the worker.
 pub(crate) struct FileChooserIface {
-    /// Async handle onto the same connection; only used inside served
-    /// methods, which already run on zbus's executor (screenshot precedent).
     pub(crate) conn: zbus::Connection,
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
     pub(crate) jobs: mpsc::Sender<FileChooserJob>,
@@ -65,79 +51,88 @@ impl FileChooserIface {
         &self,
         handle: ObjectPath<'_>,
         app_id: &str,
-        _parent_window: &str,
+        parent_window: &str,
         title: &str,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        let pick = aegis_ipc::FilePickOptions {
-            mode: aegis_ipc::FilePickMode::Open,
-            multiple: parsed.multiple,
-            directory: parsed.directory,
-            title: dialog_title(title),
+        let request = SelectionRequest {
+            mode: if parsed.directory {
+                SelectionMode::OpenDirectory
+            } else {
+                SelectionMode::OpenFile
+            },
+            app_id: app_id.to_owned(),
+            title: title.to_owned(),
             accept_label: parsed.accept_label,
+            modal: parsed.modal,
+            parent_window: nonempty(parent_window),
+            multiple: parsed.multiple,
             current_folder: parsed.current_folder,
             current_name: None,
+            current_file: None,
             filters: parsed.filters,
+            current_filter: parsed.current_filter,
+            choices: parsed.choices,
+            files: Vec::new(),
         };
-        self.choose(handle, app_id, pick, Vec::new()).await
+        self.choose(handle, request).await
     }
 
     async fn save_file(
         &self,
         handle: ObjectPath<'_>,
         app_id: &str,
-        _parent_window: &str,
+        parent_window: &str,
         title: &str,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        // `current_file` (saving an existing file) splits into the folder and
-        // suggested name, overriding the individual options when present.
-        let (current_folder, current_name) = match parsed.current_file {
-            Some(file) => {
-                let name = file
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .or(parsed.current_name);
-                let folder = file.parent().map(PathBuf::from).or(parsed.current_folder);
-                (folder, name)
-            }
-            None => (parsed.current_folder, parsed.current_name),
-        };
-        let pick = aegis_ipc::FilePickOptions {
-            mode: aegis_ipc::FilePickMode::Save,
-            multiple: false,
-            directory: false,
-            title: dialog_title(title),
+        let request = SelectionRequest {
+            mode: SelectionMode::SaveFile,
+            app_id: app_id.to_owned(),
+            title: title.to_owned(),
             accept_label: parsed.accept_label,
-            current_folder,
-            current_name,
+            modal: parsed.modal,
+            parent_window: nonempty(parent_window),
+            multiple: false,
+            current_folder: parsed.current_folder,
+            current_name: parsed.current_name,
+            current_file: parsed.current_file,
             filters: parsed.filters,
+            current_filter: parsed.current_filter,
+            choices: parsed.choices,
+            files: Vec::new(),
         };
-        self.choose(handle, app_id, pick, Vec::new()).await
+        self.choose(handle, request).await
     }
 
     async fn save_files(
         &self,
         handle: ObjectPath<'_>,
         app_id: &str,
-        _parent_window: &str,
+        parent_window: &str,
         title: &str,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        let pick = aegis_ipc::FilePickOptions {
-            mode: aegis_ipc::FilePickMode::ChooseDir,
-            multiple: false,
-            directory: true,
-            title: dialog_title(title),
+        let request = SelectionRequest {
+            mode: SelectionMode::SaveFiles,
+            app_id: app_id.to_owned(),
+            title: title.to_owned(),
             accept_label: parsed.accept_label,
+            modal: parsed.modal,
+            parent_window: nonempty(parent_window),
+            multiple: false,
             current_folder: parsed.current_folder,
             current_name: None,
+            current_file: None,
             filters: Vec::new(),
+            current_filter: None,
+            choices: parsed.choices,
+            files: parsed.save_files,
         };
-        self.choose(handle, app_id, pick, parsed.save_files).await
+        self.choose(handle, request).await
     }
 
     #[zbus(property, name = "version")]
@@ -147,235 +142,384 @@ impl FileChooserIface {
 }
 
 impl FileChooserIface {
-    /// Shared method body: register the request, enqueue the pick, await the
-    /// worker (screenshot.rs precedent — zbus's executor never blocks).
     async fn choose(
         &self,
         handle: ObjectPath<'_>,
-        app_id: &str,
-        options: aegis_ipc::FilePickOptions,
-        save_files: Vec<OsString>,
+        request: SelectionRequest,
     ) -> zbus::fdo::Result<PortalResponse> {
-        let path = handle.as_str().to_string();
+        let path = handle.as_str().to_owned();
         log::info!(
-            "portal: FileChooser for '{app_id}' ({:?}) at {path}",
-            options.mode
+            "portal: FileChooser for '{}' ({:?}) at {path}",
+            request.app_id,
+            request.mode
         );
 
         aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
         let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.send(FileChooserJob::Choose {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            options,
-            save_files,
-            reply,
-        });
-        if queued.is_err() {
+        if self
+            .jobs
+            .send(FileChooserJob::Choose {
+                request_path: path.clone(),
+                request,
+                reply,
+            })
+            .is_err()
+        {
             aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
             return Err(zbus::fdo::Error::Failed(
-                "file chooser worker is gone".to_string(),
+                "file chooser worker is gone".to_owned(),
             ));
         }
         let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("file chooser worker dropped its response".to_string())
+            zbus::fdo::Error::Failed("file chooser worker dropped its response".to_owned())
         });
         aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
         result
     }
 }
 
-/// Worker loop: one pick at a time, serialized like captures. Each pick
-/// blocks on user interaction, so a dedicated thread keeps it off both
-/// zbus's executor and the capture worker.
+/// Dispatch each request to its own supervised task. A modal chooser belongs
+/// to one calling application and must not block unrelated portal clients or
+/// delay cancellation of a queued request.
 pub(crate) fn file_chooser_worker(
     rx: mpsc::Receiver<FileChooserJob>,
     tracker: Arc<Mutex<RequestTracker>>,
-    mut capture: PortalCapture,
 ) {
     while let Ok(FileChooserJob::Choose {
         request_path,
-        app_id,
-        options,
-        save_files,
+        request,
         reply,
     }) = rx.recv()
     {
-        let result = run_pick(
-            &mut capture,
-            &tracker,
-            &request_path,
-            &app_id,
-            options,
-            save_files,
-        );
-        let _ = reply.send_blocking(result);
+        let tracker = Arc::clone(&tracker);
+        if let Err(error) = std::thread::Builder::new()
+            .name("aegis-file-chooser".to_owned())
+            .spawn(move || {
+                let result = run_pick(&tracker, &request_path, request);
+                let _ = reply.send_blocking(result);
+            })
+        {
+            log::error!("portal: could not spawn FileChooser task: {error}");
+        }
     }
 }
 
-/// Execute one pick and produce the `(response_code, results)` pair.
 fn run_pick(
-    capture: &mut PortalCapture,
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
-    app_id: &str,
-    options: aegis_ipc::FilePickOptions,
-    save_files: Vec<OsString>,
+    request: SelectionRequest,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if tracker.lock().unwrap().was_closed(request_path) {
-        return (1, HashMap::new());
+        return cancelled();
     }
-    let filters = options.filters.clone();
-    match capture.pick_file(options) {
-        Ok(aegis_ipc::FilePickResult::Paths { paths, filter }) => {
-            // A Close racing the pick wins over a completed result.
+    if let Err(error) = request.validate() {
+        log::warn!("portal: invalid FileChooser request: {error}");
+        return failed();
+    }
+
+    let app_id = request.app_id.clone();
+    match invoke_prompter(tracker, request_path, &request) {
+        Ok(response @ SelectionResponse::Selected { .. }) => {
+            // Request.Close wins a race with a completed child response.
             if tracker.lock().unwrap().was_closed(request_path) {
-                return (1, HashMap::new());
+                return cancelled();
             }
-            let results = build_results(paths, filter, &filters, &save_files);
-            log::info!("portal: FileChooser for '{app_id}' → {} uri(s)", results.0);
-            (0, results.1)
+            if let Err(error) = response.validate_for(&request) {
+                log::warn!("portal: invalid FileChooser response for '{app_id}': {error}");
+                return failed();
+            }
+            let SelectionResponse::Selected {
+                paths,
+                current_filter,
+                choices,
+            } = response
+            else {
+                unreachable!()
+            };
+            let (count, results) = build_results(paths, current_filter, choices);
+            log::info!("portal: FileChooser for '{app_id}' -> {count} uri(s)");
+            (0, results)
         }
-        Ok(aegis_ipc::FilePickResult::Cancelled) => (1, HashMap::new()),
-        Err(error) => {
-            log::warn!("portal: FileChooser for '{app_id}' failed: {error}");
-            (2, HashMap::new())
+        Ok(SelectionResponse::Cancelled) => cancelled(),
+        Ok(SelectionResponse::Failed { message }) | Err(message) => {
+            log::warn!("portal: FileChooser for '{app_id}' failed: {message}");
+            failed()
         }
     }
 }
 
-/// Build the results vardict: `uris` plus the selected-filter echo
-/// (`current_filter` and the `choices` pair) when filters were supplied.
-/// Returns the uri count alongside for logging.
-fn build_results(
-    paths: Vec<PathBuf>,
-    filter: Option<u32>,
-    filters: &[aegis_ipc::FileFilter],
-    save_files: &[OsString],
-) -> (usize, HashMap<String, Value<'static>>) {
-    // SaveFiles: the picker returned the chosen folder; append each
-    // suggested name per the spec.
-    let mut files: Vec<PathBuf> = if save_files.is_empty() {
-        paths
-    } else {
-        let folder = paths.into_iter().next().unwrap_or_default();
-        save_files.iter().map(|name| folder.join(name)).collect()
+fn invoke_prompter(
+    tracker: &Arc<Mutex<RequestTracker>>,
+    request_path: &str,
+    request: &SelectionRequest,
+) -> Result<SelectionResponse, String> {
+    let executable = prompter_executable()?;
+    let mut child = Command::new(&executable)
+        // A file chooser implementing the portal must never recursively call
+        // the portal it is serving.
+        .env("GTK_USE_PORTAL", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", executable.display()))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "prompter stdin was not piped".to_owned())?;
+    let send_result = serde_json::to_writer(&mut stdin, &PrompterRequest::new(request.clone()))
+        .map_err(|error| error.to_string())
+        .and_then(|()| stdin.write_all(b"\n").map_err(|error| error.to_string()));
+    if let Err(error) = send_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("could not send prompter request: {error}"));
+    }
+    drop(stdin);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "prompter stdout was not piped".to_owned())?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_MESSAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+
+    let status = loop {
+        if tracker.lock().unwrap().was_closed(request_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Ok(SelectionResponse::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(format!("could not wait for prompter: {error}"));
+            }
+        }
     };
-    files.retain(|path| !path.as_os_str().is_empty());
+    let bytes = reader
+        .join()
+        .map_err(|_| "prompter response reader panicked".to_owned())?
+        .map_err(|error| format!("could not read prompter response: {error}"))?;
+    if bytes.len() as u64 > MAX_MESSAGE_BYTES {
+        return Err("prompter response exceeds the 8 MiB process-contract limit".into());
+    }
+    if bytes.is_empty() {
+        return Err(format!("prompter exited with {status} and no response"));
+    }
+    let response: PrompterResponse = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("prompter exited with {status} and returned invalid JSON: {error}")
+    })?;
+    response.into_selection()
+}
 
-    let uris: Vec<String> = files.iter().map(|path| files::file_uri(path)).collect();
-    let count = uris.len();
-    let mut results = HashMap::from([("uris".to_string(), Value::from(uris))]);
-
-    if let Some(selected) = filter
-        && let Some(active) = filters.get(selected as usize)
+fn prompter_executable() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(PROMPTER_ENV).filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(current) = std::env::current_exe()
+        && let Some(directory) = current.parent()
     {
-        // Echo the selected filter as the spec's `(sa(us))` structure and as
-        // the `choices` ("filters", label) pair; rules map back to the
-        // (type, value) form, globs = 0, MIME = 1.
-        let rules: Vec<(u32, String)> = active
-            .patterns
-            .iter()
-            .map(|pattern| (pattern_type(pattern), pattern.clone()))
-            .collect();
+        let sibling = directory.join("aegis-portal-prompter");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    let installed = PathBuf::from("/usr/lib/aegis-portal-prompter");
+    if installed.is_file() {
+        return Ok(installed);
+    }
+    Err(format!(
+        "aegis-portal-prompter was not found; set {PROMPTER_ENV} or install /usr/lib/aegis-portal-prompter"
+    ))
+}
+
+fn build_results(
+    paths: Vec<BytePath>,
+    current_filter: Option<FileFilter>,
+    choices: Vec<(String, String)>,
+) -> (usize, HashMap<String, Value<'static>>) {
+    let uris: Vec<String> = paths
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .map(|path| files::file_uri(&path.to_path_buf()))
+        .collect();
+    let count = uris.len();
+    let mut results = HashMap::from([("uris".to_owned(), Value::from(uris))]);
+    if let Some(filter) = current_filter {
         results.insert(
-            "current_filter".to_string(),
-            Value::Structure(zbus::zvariant::Structure::from((
-                active.label.clone(),
-                rules,
-            ))),
+            "current_filter".to_owned(),
+            Value::Structure(zbus::zvariant::Structure::from(filter_to_wire(filter))),
         );
-        results.insert(
-            "choices".to_string(),
-            Value::from(vec![("filters".to_string(), active.label.clone())]),
-        );
+    }
+    if !choices.is_empty() {
+        results.insert("choices".to_owned(), Value::from(choices));
     }
     (count, results)
 }
 
-/// The serialized-filter rule type: 0 = glob pattern, 1 = MIME type.
-fn pattern_type(pattern: &str) -> u32 {
-    if pattern.contains('/') { 1 } else { 0 }
+fn cancelled() -> (u32, HashMap<String, Value<'static>>) {
+    (1, HashMap::new())
 }
 
-/// Options parsed out of the `a{sv}` argument, before the per-method mapping
-/// onto `FilePickOptions`.
+fn failed() -> (u32, HashMap<String, Value<'static>>) {
+    (2, HashMap::new())
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 struct ParsedOptions {
+    modal: bool,
     multiple: bool,
     directory: bool,
     accept_label: Option<String>,
-    current_folder: Option<PathBuf>,
+    current_folder: Option<BytePath>,
     current_name: Option<String>,
-    current_file: Option<PathBuf>,
-    filters: Vec<aegis_ipc::FileFilter>,
-    save_files: Vec<OsString>,
+    current_file: Option<BytePath>,
+    filters: Vec<FileFilter>,
+    current_filter: Option<FileFilter>,
+    choices: Vec<Choice>,
+    save_files: Vec<BytePath>,
 }
 
-/// Parse the shared FileChooser options dict. Wrongly typed keys are ignored
-/// (screenshot.rs precedent); the per-method meaning is applied by the
-/// caller.
 fn parse_options(options: &HashMap<String, Value<'_>>) -> ParsedOptions {
-    let get_bool = |key: &str| {
+    let get_bool = |key: &str, default| {
         options
             .get(key)
             .and_then(|value| bool::try_from(value).ok())
-            .unwrap_or(false)
+            .unwrap_or(default)
     };
     let get_string = |key: &str| {
         options
             .get(key)
             .and_then(|value| String::try_from(value).ok())
     };
-    // Path options are NUL-terminated byte arrays on the wire.
     let get_path = |key: &str| {
         options
             .get(key)
             .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
-            .map(|bytes| {
-                let bytes: Vec<u8> = bytes.into_iter().take_while(|b| *b != 0).collect();
-                PathBuf::from(OsString::from_vec(bytes))
-            })
+            .and_then(byte_path)
     };
     let filters = options
         .get("filters")
-        .and_then(|value| Vec::<(String, Vec<(u32, String)>)>::try_from(value.clone()).ok())
+        .and_then(|value| {
+            Vec::<(String, Vec<(u32, String)>)>::try_from(value.try_clone().ok()?).ok()
+        })
         .unwrap_or_default()
         .into_iter()
-        .map(|(label, rules)| aegis_ipc::FileFilter {
+        .map(filter_from_wire)
+        .collect();
+    let current_filter = options
+        .get("current_filter")
+        .and_then(filter_from_value)
+        .map(filter_from_wire);
+    let choices = options
+        .get("choices")
+        .and_then(|value| {
+            Vec::<(String, String, Vec<(String, String)>, String)>::try_from(
+                value.try_clone().ok()?,
+            )
+            .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, label, options, selected)| Choice {
+            id,
             label,
-            patterns: rules.into_iter().map(|(_, value)| value).collect(),
+            options,
+            selected,
         })
         .collect();
     let save_files = options
         .get("files")
-        .and_then(|value| Vec::<Vec<u8>>::try_from(value.clone()).ok())
+        .and_then(|value| Vec::<Vec<u8>>::try_from(value.try_clone().ok()?).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|bytes| {
-            let bytes: Vec<u8> = bytes.into_iter().take_while(|b| *b != 0).collect();
-            OsString::from_vec(bytes)
-        })
+        .filter_map(byte_path)
         .collect();
 
     ParsedOptions {
-        multiple: get_bool("multiple"),
-        directory: get_bool("directory"),
-        accept_label: get_string("accept_label"),
-        current_folder: get_path("current_folder"),
+        modal: get_bool("modal", true),
+        multiple: get_bool("multiple", false),
+        directory: get_bool("directory", false),
+        accept_label: get_string("accept_label").filter(|label| !label.is_empty()),
+        current_folder: get_path("current_folder").filter(|path| path.to_path_buf().is_absolute()),
         current_name: get_string("current_name"),
-        current_file: get_path("current_file"),
+        current_file: get_path("current_file").filter(|path| path.to_path_buf().is_absolute()),
         filters,
+        current_filter,
+        choices,
         save_files,
     }
 }
 
-/// An empty dialog title means "use the picker's per-mode default".
-fn dialog_title(title: &str) -> Option<String> {
-    if title.is_empty() {
-        None
-    } else {
-        Some(title.to_string())
+fn byte_path(mut bytes: Vec<u8>) -> Option<BytePath> {
+    if bytes.last() != Some(&0) {
+        return None;
     }
+    bytes.pop();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    Some(BytePath(bytes))
+}
+
+fn filter_from_wire((label, rules): (String, Vec<(u32, String)>)) -> FileFilter {
+    FileFilter {
+        label,
+        rules: rules
+            .into_iter()
+            .filter_map(|(kind, value)| {
+                let kind = match kind {
+                    0 => FilterRuleKind::Glob,
+                    1 => FilterRuleKind::Mime,
+                    _ => return None,
+                };
+                Some(FilterRule { kind, value })
+            })
+            .collect(),
+    }
+}
+
+fn filter_from_value(value: &Value<'_>) -> Option<(String, Vec<(u32, String)>)> {
+    let Value::Structure(structure) = value else {
+        return None;
+    };
+    let [label, rules] = structure.fields() else {
+        return None;
+    };
+    Some((
+        String::try_from(label).ok()?,
+        Vec::<(u32, String)>::try_from(rules.try_clone().ok()?).ok()?,
+    ))
+}
+
+fn filter_to_wire(filter: FileFilter) -> (String, Vec<(u32, String)>) {
+    let rules = filter
+        .rules
+        .into_iter()
+        .map(|rule| {
+            let kind = match rule.kind {
+                FilterRuleKind::Glob => 0,
+                FilterRuleKind::Mime => 1,
+            };
+            (kind, rule.value)
+        })
+        .collect();
+    (filter.label, rules)
 }
 
 #[cfg(test)]
@@ -385,7 +529,7 @@ mod tests {
     fn options(pairs: &[(&str, Value<'static>)]) -> HashMap<String, Value<'static>> {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
             .collect()
     }
 
@@ -395,75 +539,75 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_empty() {
+    fn defaults_match_the_portal_contract() {
         let parsed = parse_options(&HashMap::new());
+        assert!(parsed.modal);
         assert!(!parsed.multiple && !parsed.directory);
         assert!(parsed.filters.is_empty() && parsed.save_files.is_empty());
         assert!(parsed.current_folder.is_none() && parsed.current_file.is_none());
     }
 
     #[test]
-    fn filters_parse_into_labels_and_patterns() {
-        let rules: Vec<(u32, String)> = vec![(0, "*.png".into()), (1, "image/jpeg".into())];
+    fn filters_keep_their_explicit_rule_types() {
+        let rules = vec![
+            (0u32, "image/*".to_owned()),
+            (1u32, "not-a-slashless-mime".to_owned()),
+        ];
         let parsed = parse_options(&options(&[(
             "filters",
-            Value::from(vec![("Images".to_string(), rules)]),
+            Value::from(vec![("Images".to_owned(), rules)]),
         )]));
         assert_eq!(parsed.filters.len(), 1);
-        assert_eq!(parsed.filters[0].label, "Images");
-        assert_eq!(parsed.filters[0].patterns, ["*.png", "image/jpeg"]);
+        assert_eq!(parsed.filters[0].rules[0].kind, FilterRuleKind::Glob);
+        assert_eq!(parsed.filters[0].rules[1].kind, FilterRuleKind::Mime);
     }
 
     #[test]
-    fn path_options_strip_trailing_nul() {
-        let mut bytes = b"/tmp/docs".to_vec();
-        bytes.push(0);
-        let parsed = parse_options(&options(&[("current_folder", Value::from(bytes))]));
-        assert_eq!(parsed.current_folder, Some(PathBuf::from("/tmp/docs")));
-    }
-
-    #[test]
-    fn pattern_types_match_the_wire_encoding() {
-        assert_eq!(pattern_type("*.png"), 0);
-        assert_eq!(pattern_type("image/png"), 1);
-    }
-
-    #[test]
-    fn results_contain_file_uris() {
-        let (count, results) =
-            build_results(vec![PathBuf::from("/tmp/a file.txt")], None, &[], &[]);
-        assert_eq!(count, 1);
-        let Value::Array(uris) = &results["uris"] else {
-            panic!("uris must be an array");
-        };
-        assert_eq!(uris.len(), 1);
-        let uri = String::try_from(uris.iter().next().unwrap()).unwrap();
-        assert!(uri.starts_with("file://"), "{uri}");
-    }
-
-    #[test]
-    fn save_files_appends_suggested_names_to_the_folder() {
-        let (count, results) = build_results(
-            vec![PathBuf::from("/chosen/dir")],
-            None,
-            &[],
-            &[OsString::from("one.txt"), OsString::from("two.txt")],
+    fn path_options_require_one_trailing_nul_and_reject_interior_nuls() {
+        let parsed = parse_options(&options(&[(
+            "current_folder",
+            Value::from(b"/tmp/docs\0".to_vec()),
+        )]));
+        assert_eq!(
+            parsed.current_folder.unwrap().to_path_buf(),
+            PathBuf::from("/tmp/docs")
         );
-        assert_eq!(count, 2);
-        let Value::Array(uris) = &results["uris"] else {
-            panic!("uris must be an array");
-        };
-        let first = String::try_from(uris.iter().next().unwrap()).unwrap();
-        assert!(first.ends_with("/chosen/dir/one.txt"), "{first}");
+        let parsed = parse_options(&options(&[(
+            "current_folder",
+            Value::from(b"/tmp\0/docs\0".to_vec()),
+        )]));
+        assert!(parsed.current_folder.is_none());
+        let parsed = parse_options(&options(&[(
+            "current_folder",
+            Value::from(b"/tmp/docs".to_vec()),
+        )]));
+        assert!(parsed.current_folder.is_none());
+        let parsed = parse_options(&options(&[(
+            "current_folder",
+            Value::from(b"relative\0".to_vec()),
+        )]));
+        assert!(parsed.current_folder.is_none());
     }
 
     #[test]
-    fn selected_filter_is_echoed_as_current_filter_and_choices() {
-        let filters = vec![aegis_ipc::FileFilter {
+    fn results_preserve_filter_types_and_real_choices() {
+        let filter = FileFilter {
             label: "Images".into(),
-            patterns: vec!["*.png".into(), "image/jpeg".into()],
-        }];
-        let (_, results) = build_results(vec![PathBuf::from("/tmp/x.png")], Some(0), &filters, &[]);
+            rules: vec![FilterRule {
+                kind: FilterRuleKind::Glob,
+                value: "image/*".into(),
+            }],
+        };
+        let (_, results) = build_results(
+            vec![BytePath::from_path("/tmp/a file.png")],
+            Some(filter),
+            vec![("encoding".into(), "utf8".into())],
+        );
+        let Value::Array(uris) = &results["uris"] else {
+            panic!("uris must be an array");
+        };
+        let uri = String::try_from(uris.iter().next().unwrap()).unwrap();
+        assert_eq!(uri, "file:///tmp/a%20file.png");
         assert!(results.contains_key("current_filter"));
         let Value::Array(choices) = &results["choices"] else {
             panic!("choices must be an array");
