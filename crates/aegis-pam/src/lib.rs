@@ -3,10 +3,10 @@
 //! Installed as `auth optional pam_aegis.so` in the login stack (and in the
 //! lock screen's stack), this module writes the just-verified password to
 //! `$XDG_RUNTIME_DIR/aegis-pam-token` (fallback `/run/user/<uid>/`) with
-//! mode 0600. `aegis-portal` consumes and deletes the token to unlock a
-//! password-mode vault without prompting — the wssp-pam pattern. The token
-//! is written atomically (temp-then-rename) so a reader never observes a
-//! partial file, and the in-memory copy is zeroized afterwards.
+//! mode 0600. `xdg-desktop-portal-aegis` consumes and deletes the token to
+//! unlock a password-mode vault without prompting — the wssp-pam pattern.
+//! The token is written atomically (temp-then-rename) so a reader never
+//! observes a partial file, and the in-memory copy is zeroized afterwards.
 //!
 //! Failure posture: a module error never blocks authentication
 //! (`optional`); at worst the vault stays locked and the user is prompted

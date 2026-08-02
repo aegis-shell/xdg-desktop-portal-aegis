@@ -1,9 +1,12 @@
 [package]
 name = "aegis-pam"
-description = "PAM module caching the login authtok for the aegis secret vault's auto-unlock (token file consumed by aegis-portal)"
+description = "PAM module caching the login authtok for the Aegis secret vault's auto-unlock (token consumed by xdg-desktop-portal-aegis)"
+readme = "README.md"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [lib]

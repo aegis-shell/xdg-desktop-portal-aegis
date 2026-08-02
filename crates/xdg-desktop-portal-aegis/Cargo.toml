@@ -1,0 +1,47 @@
+[package]
+name = "xdg-desktop-portal-aegis"
+description = "xdg-desktop-portal backend for the Aegis compositor: D-Bus bridge over scoped Aegis IPC"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aegis-ipc = { workspace = true }
+aegis-portal-runtime = { workspace = true }
+aegis-portal-secret = { workspace = true }
+# aegis-ipc's pick results and window snapshots carry aegis-core types (Rect,
+# WindowId, Window); both resolve from the explicitly supported Aegis release.
+aegis-core = { workspace = true }
+# Session D-Bus bridge: pure-Rust zbus with the blocking API so the service
+# stays on a plain `std::thread` model without an async runtime.
+zbus = { workspace = true }
+async-channel = "2"
+log = { workspace = true }
+aegis-logging = { workspace = true }
+thiserror = { workspace = true }
+# ScreenCast delivery: a PipeWire producer stream fed from the compositor's
+# scoped IPC frame stream. Rust binding over the system
+# libpipewire (rust-version 1.80, within the workspace MSRV); no tokio.
+pipewire = "0.10"
+dirs = { workspace = true }
+rand = "0.8"
+# Account portal: getpwuid for the account id and GECOS real name.
+libc = { workspace = true }
+
+[dev-dependencies]
+# Independent wire-format fixtures keep the assembled daemon tests from
+# trusting the secret implementation under test.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+
+[lib]
+name = "aegis_portal"
+path = "src/lib.rs"
