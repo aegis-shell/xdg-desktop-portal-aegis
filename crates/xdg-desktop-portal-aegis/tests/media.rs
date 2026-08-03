@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aegis_ipc::{
-    Capabilities, CaptureOutputPayload, ConfirmPickResult, Handler, JournalSnapshot, OpClass,
-    PickKind, PickResult, Scope, Server, StreamFramePayload, StreamInfo, StreamPixelFormat,
-    StreamTarget,
+    ActorCapability, CaptureOutputPayload, ConfirmPickResult, ConnectionCapabilities, Handler,
+    JournalSnapshot, PickKind, PickResult, Scope, Server, StreamFramePayload, StreamInfo,
+    StreamPixelFormat, StreamTarget,
 };
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -43,13 +43,13 @@ struct FakeCompositor {
 }
 
 impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> Capabilities {
-        Capabilities {
+    fn policy_caps(&self) -> ConnectionCapabilities {
+        ConnectionCapabilities {
             query: true,
             control: true,
             input: false,
             session: false,
-            realm: false,
+            interaction_domain: false,
         }
     }
 
@@ -77,15 +77,15 @@ impl Handler for FakeCompositor {
         }
     }
 
-    fn command(&self, _conn_id: u64, _cmd: aegis_ipc::Command) {}
+    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
 
     fn resolve_scope(&self, name: &str) -> Option<Scope> {
         (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
             ops: Some(vec![
-                OpClass::CaptureOutput,
-                OpClass::PickTarget,
-                OpClass::PickConfirm,
-                OpClass::StreamOutput,
+                ActorCapability::CaptureOutput,
+                ActorCapability::PickTarget,
+                ActorCapability::PickConfirm,
+                ActorCapability::StreamOutput,
             ]),
             ..Scope::default()
         })

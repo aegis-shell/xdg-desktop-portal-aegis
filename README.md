@@ -22,8 +22,8 @@ UI host from a small Cargo workspace:
 
 Portal and Aegis releases have independent version sequences. Each Portal
 release pins exactly one supported Aegis Git tag because the scoped IPC
-schema and compositor mechanisms evolve together. Portal `v0.0.1` supports
-Aegis `v0.0.9`; see the [Compatibility Reference](docs/reference/compatibility.md)
+schema and compositor mechanisms evolve together. Portal `v0.0.2` supports
+Aegis `v0.0.11`; see the [Compatibility Reference](docs/reference/compatibility.md)
 for the authoritative matrix.
 
 ## Build

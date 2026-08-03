@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aegis_ipc::{
-    Capabilities, ConfirmPickResult, Handler, JournalSnapshot, OpClass, Scope, Server,
+    ActorCapability, ConfirmPickResult, ConnectionCapabilities, Handler, JournalSnapshot, Scope,
+    Server,
 };
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -33,13 +34,13 @@ struct FakeCompositor {
 }
 
 impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> Capabilities {
-        Capabilities {
+    fn policy_caps(&self) -> ConnectionCapabilities {
+        ConnectionCapabilities {
             query: true,
             control: true,
             input: false,
             session: false,
-            realm: false,
+            interaction_domain: false,
         }
     }
 
@@ -67,11 +68,11 @@ impl Handler for FakeCompositor {
         }
     }
 
-    fn command(&self, _conn_id: u64, _cmd: aegis_ipc::Command) {}
+    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
 
     fn resolve_scope(&self, name: &str) -> Option<Scope> {
         (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
-            ops: Some(vec![OpClass::PickConfirm]),
+            ops: Some(vec![ActorCapability::PickConfirm]),
             ..Scope::default()
         })
     }

@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use aegis_ipc::{Capabilities, Client, LOCAL_PORTAL_SCOPE, StreamMessage};
+use aegis_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE, StreamMessage};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -154,12 +154,12 @@ fn run_cast(
     started: &mpsc::Sender<Result<CastStarted, String>>,
 ) -> Result<(), String> {
     // Inward half first: without frames there is nothing to publish.
-    let caps = Capabilities {
+    let caps = ConnectionCapabilities {
         query: true,
         control: true,
         input: false,
         session: false,
-        realm: false,
+        interaction_domain: false,
     };
     let mut client =
         Client::connect_scoped_with_timeout(socket, caps, LOCAL_PORTAL_SCOPE, IPC_TIMEOUT)

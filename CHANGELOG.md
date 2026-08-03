@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-08-03
+
 ### Changed
 
 - Moved FileChooser UI and filesystem enumeration out of Aegis compositor
@@ -73,5 +75,6 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.2
 [0.0.1]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.1

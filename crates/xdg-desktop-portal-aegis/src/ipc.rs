@@ -13,7 +13,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use aegis_ipc::{Capabilities, Client, LOCAL_PORTAL_SCOPE};
+use aegis_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE};
 
 /// Lease TTL requested at handshake and renewal; matches the reference
 /// client's default (`LeaseRequest::default`).
@@ -43,12 +43,12 @@ impl PortalCapture {
     }
 
     fn connect(&self) -> io::Result<Client> {
-        let caps = Capabilities {
+        let caps = ConnectionCapabilities {
             query: true,
             control: true,
             input: false,
             session: false,
-            realm: false,
+            interaction_domain: false,
         };
         let client = Client::connect_scoped_with_timeout(
             &self.socket,

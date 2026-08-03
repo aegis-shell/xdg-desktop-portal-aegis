@@ -330,7 +330,7 @@ pub(crate) fn spawn_watcher(
 pub(crate) fn prime_store(socket: &Path, store: &SettingsStore) {
     let result = aegis_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::Capabilities::QUERY,
+        aegis_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )
     .and_then(|mut client| client.settings());
@@ -373,7 +373,7 @@ fn watch_connection(
 ) -> std::io::Result<()> {
     let mut events = aegis_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::Capabilities::QUERY,
+        aegis_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )?;
     events.subscribe()?;
@@ -381,7 +381,7 @@ fn watch_connection(
 
     let mut query = aegis_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::Capabilities::QUERY,
+        aegis_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )?;
     update_and_emit(conn, store, query.settings()?.preferences);

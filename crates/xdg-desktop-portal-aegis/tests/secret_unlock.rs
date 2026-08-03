@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aegis_ipc::{
-    Capabilities, Handler, JournalSnapshot, OpClass, Scope, SecretPromptResult, Server,
+    ActorCapability, ConnectionCapabilities, Handler, JournalSnapshot, Scope, SecretPromptResult,
+    Server,
 };
 use argon2::Argon2;
 use argon2::password_hash::SaltString;
@@ -67,17 +68,58 @@ fn write_password_vault(secrets_dir: &std::path::Path) {
 
 struct FakeCompositor {
     answer: SecretPromptResult,
+    grants: std::sync::Mutex<aegis_authority::ResourceGrantRegistry>,
 }
 
 impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> Capabilities {
-        Capabilities {
+    fn policy_caps(&self) -> ConnectionCapabilities {
+        ConnectionCapabilities {
             query: true,
             control: true,
             input: false,
             session: false,
-            realm: false,
+            interaction_domain: false,
         }
+    }
+
+    fn issue_resource_grant(
+        &self,
+        session: aegis_authority::ActorSessionId,
+        principal: Option<&str>,
+        resource: aegis_authority::ActorResource,
+        ttl: Duration,
+        uses: u32,
+        _confirm_exact_resource: bool,
+    ) -> Result<aegis_authority::ResourceGrant, String> {
+        let principal = principal
+            .map(aegis_authority::ActorPrincipal::new)
+            .transpose()
+            .map_err(str::to_owned)?;
+        self.grants.lock().unwrap().issue(
+            session,
+            principal,
+            resource.required_capability(),
+            resource,
+            ttl,
+            uses,
+        )
+    }
+
+    fn consume_resource_grant(
+        &self,
+        session: aegis_authority::ActorSessionId,
+        principal: Option<&str>,
+        id: &aegis_authority::ResourceGrantId,
+        resource: &aegis_authority::ActorResource,
+    ) -> Result<aegis_authority::ResourceGrant, String> {
+        let principal = principal
+            .map(aegis_authority::ActorPrincipal::new)
+            .transpose()
+            .map_err(str::to_owned)?;
+        self.grants
+            .lock()
+            .unwrap()
+            .consume(session, principal.as_ref(), id, resource)
     }
 
     fn windows(&self) -> Vec<aegis_core::window::Window> {
@@ -104,11 +146,11 @@ impl Handler for FakeCompositor {
         }
     }
 
-    fn command(&self, _conn_id: u64, _cmd: aegis_ipc::Command) {}
+    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
 
     fn resolve_scope(&self, name: &str) -> Option<Scope> {
         (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
-            ops: Some(vec![OpClass::PromptSecret]),
+            ops: Some(vec![ActorCapability::PromptSecret]),
             ..Scope::default()
         })
     }
@@ -145,7 +187,10 @@ fn retrieve_secret_while_locked(answer: SecretPromptResult) -> Option<(u32, Vec<
     write_password_vault(&data_dir.join("aegis/secrets"));
     let runtime_dir = temp_dir("runtime");
 
-    let fake = Arc::new(FakeCompositor { answer });
+    let fake = Arc::new(FakeCompositor {
+        answer,
+        grants: std::sync::Mutex::new(aegis_authority::ResourceGrantRegistry::default()),
+    });
     let _server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
         .expect("bind fake compositor IPC");
     let _daemon = KillOnDrop(spawn_daemon(&bus, &data_dir, &runtime_dir));

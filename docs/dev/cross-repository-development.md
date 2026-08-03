@@ -6,8 +6,8 @@ graph. The development worktree normally remains on the long-lived local `dev`
 branch and resolves the live sibling Aegis sources through Cargo `[patch]`.
 
 This mirrors the Aegis↔Optics workflow documented in the Aegis repository; the
-Portal plays the downstream role here, depending on `aegis-core`, `aegis-ipc`,
-and `aegis-logging` instead of on Optics bindings.
+Portal plays the downstream role here, depending on `aegis-authority`,
+`aegis-core`, `aegis-ipc`, and `aegis-logging` instead of on Optics bindings.
 
 ## Dependency Modes
 
@@ -67,11 +67,11 @@ test -f ../aegis/Cargo.toml
 
 ### Keep the sibling Aegis checkout at the pinned version
 
-The Portal workspace pins one exact Aegis version (`aegis-core`/`aegis-ipc`/
-`aegis-logging`, currently `=0.0.9`). The `[patch]` only takes effect when the
-sibling `../aegis` checkout is at that same version — Cargo rejects a path
-patch whose version does not satisfy the `=x.y.z` requirement and silently
-falls back to the tagged Git source.
+The Portal workspace pins one exact Aegis version (`aegis-authority`/
+`aegis-core`/`aegis-ipc`/`aegis-logging`, currently `=0.0.11`). The `[patch]`
+only takes effect when the sibling `../aegis` checkout is at that same
+version — Cargo rejects a path patch whose version does not satisfy the
+`=x.y.z` requirement and silently falls back to the tagged Git source.
 
 So before resolving the worktree-local graph, put the sibling Aegis checkout at
 the pinned tag:
@@ -106,9 +106,10 @@ Verify the selected source:
 cargo tree -i aegis-core
 cargo tree -i aegis-ipc
 cargo tree -i aegis-logging
+cargo tree -i aegis-authority
 ```
 
-All three trees must show paths below the sibling `aegis` checkout (not the
+All four trees must show paths below the sibling `aegis` checkout (not the
 `https://github.com/ming2k/aegis` Git source).
 
 ## Daily Development
@@ -199,7 +200,7 @@ exist when a future change does require unreleased IPC:
    worktree and reconcile the version so the patch is actually used:
 
    ```bash
-   # In .cargo/config.toml, change the three paths from ../aegis to ../aegis-dev,
+   # In .cargo/config.toml, change the four paths from ../aegis to ../aegis-dev,
    # and widen the version requirement in Cargo.toml for the joint build, e.g.
    #   aegis-ipc = { path = "../aegis-dev/crates/aegis-ipc" }   # via [patch]
    # Never commit the widened requirement; restore the exact pin before commit.
@@ -230,8 +231,9 @@ mv .cargo/config.toml /tmp/portal-aegis-local.toml
 git restore Cargo.lock
 ```
 
-Update the `aegis-core`, `aegis-ipc`, and `aegis-logging` dependencies in the
-workspace `Cargo.toml` to the new `=X.Y.Z` / tag `vX.Y.Z`, and update the
+Update the `aegis-authority`, `aegis-core`, `aegis-ipc`, and `aegis-logging`
+dependencies in the workspace `Cargo.toml` to the new `=X.Y.Z` / tag
+`vX.Y.Z`, and update the
 [Compatibility Reference](../reference/compatibility.md) table.
 
 Resolve and validate the remote graph:

@@ -88,15 +88,17 @@ struct IpcSecretPrompter {
 impl SecretPrompter for IpcSecretPrompter {
     fn prompt_secret(&self, title: &str, reason: Option<&str>) -> Result<PromptResponse, String> {
         let mut capture = PortalCapture::new(self.socket.clone());
-        match capture.prompt_secret(
-            title.to_string(),
-            reason.map(std::string::ToString::to_string),
-        ) {
-            Ok(aegis_ipc::SecretPromptResult::Secret { value }) => {
-                Ok(PromptResponse::Secret(value))
+        let mut result = capture
+            .prompt_secret(
+                title.to_string(),
+                reason.map(std::string::ToString::to_string),
+            )
+            .map_err(|error| error.to_string())?;
+        match &mut result {
+            aegis_ipc::SecretPromptResult::Secret { value } => {
+                Ok(PromptResponse::Secret(std::mem::take(value)))
             }
-            Ok(aegis_ipc::SecretPromptResult::Cancelled) => Ok(PromptResponse::Cancelled),
-            Err(error) => Err(error.to_string()),
+            aegis_ipc::SecretPromptResult::Cancelled => Ok(PromptResponse::Cancelled),
         }
     }
 }

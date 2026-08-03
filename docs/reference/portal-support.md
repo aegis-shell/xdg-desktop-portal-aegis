@@ -34,7 +34,7 @@ interface.
 
 | Component | Purpose |
 |-----------|---------|
-| Aegis `v0.0.9` | Scoped IPC protocol 19 and compositor consent chrome |
+| Aegis `v0.0.11` | Scoped IPC protocol 24 and compositor consent chrome |
 | `xdg-desktop-portal` | Public portal frontend |
 | `xdg-desktop-portal-gtk` | Complete fallback interfaces |
 | GTK 4.10 or newer | One-shot FileChooser process |

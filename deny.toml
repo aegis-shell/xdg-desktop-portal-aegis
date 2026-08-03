@@ -17,9 +17,6 @@ allow = [
     "Unicode-3.0",
 ]
 exceptions = [
-    { allow = ["GPL-3.0-only"], crate = "aegis-core" },
-    { allow = ["GPL-3.0-only"], crate = "aegis-ipc" },
-    { allow = ["GPL-3.0-only"], crate = "aegis-logging" },
     { allow = ["GPL-3.0"], crate = "pamsm" },
     { allow = ["GPL-3.0-only"], crate = "aegis-pam" },
 ]

@@ -13,9 +13,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-audit"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "aegis-authority"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+dependencies = [
+ "aegis-core",
+ "getrandom 0.3.4",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "aegis-core"
-version = "0.0.9"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.9#858d1bf11ed77eeb97888c3dcc42aabb0bc4c777"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "serde",
  "serde_json",
@@ -23,19 +46,23 @@ dependencies = [
 
 [[package]]
 name = "aegis-ipc"
-version = "0.0.9"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.9#858d1bf11ed77eeb97888c3dcc42aabb0bc4c777"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
+ "aegis-audit",
+ "aegis-authority",
  "aegis-core",
+ "aegis-semantic",
  "libc",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
 name = "aegis-logging"
-version = "0.0.9"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.9#858d1bf11ed77eeb97888c3dcc42aabb0bc4c777"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "log",
  "tracing",
@@ -45,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-pam"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "pamsm",
@@ -54,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-prompter"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aegis-logging",
  "gdk4-wayland",
@@ -66,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-channel",
  "log",
@@ -75,20 +102,16 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-secret"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aegis-portal-runtime",
- "aes",
  "argon2",
  "async-channel",
- "cbc",
  "chacha20poly1305",
  "dirs",
  "hkdf",
- "hmac",
  "libc",
  "log",
- "num-bigint",
  "rand",
  "serde",
  "serde_json",
@@ -99,14 +122,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "aes"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+name = "aegis-semantic"
+version = "0.0.11"
+source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures",
+ "aegis-core",
+ "serde",
 ]
 
 [[package]]
@@ -339,15 +360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "block-padding"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
 name = "blocking"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -387,15 +399,6 @@ dependencies = [
  "glib-sys",
  "libc",
  "system-deps",
-]
-
-[[package]]
-name = "cbc"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
-dependencies = [
- "cipher",
 ]
 
 [[package]]
@@ -822,13 +825,25 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi 5.3.0",
+ "wasip2",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi",
+ "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -1086,7 +1101,6 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding",
  "generic-array",
 ]
 
@@ -1242,35 +1256,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "num-bigint"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
-dependencies = [
- "num-integer",
- "num-traits",
- "rand",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
 ]
 
 [[package]]
@@ -1456,6 +1441,12 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "r-efi"
@@ -1977,6 +1968,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasip2"
+version = "1.0.4+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2112,9 +2112,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
 name = "xdg-desktop-portal-aegis"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
+ "aegis-authority",
  "aegis-core",
  "aegis-ipc",
  "aegis-logging",

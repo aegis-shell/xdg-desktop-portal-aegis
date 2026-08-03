@@ -7,6 +7,7 @@
 # The generated .cargo/config.toml is ignored by Git. Adjust the paths when
 # the adjacent Aegis checkout is not named "aegis".
 [patch."https://github.com/ming2k/aegis"]
+aegis-authority = { path = "../aegis/crates/aegis-authority" }
 aegis-core = { path = "../aegis/crates/aegis-core" }
 aegis-ipc = { path = "../aegis/crates/aegis-ipc" }
 aegis-logging = { path = "../aegis/crates/aegis-logging" }
