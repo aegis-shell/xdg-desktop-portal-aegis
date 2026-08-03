@@ -1,4 +1,4 @@
-//! `org.freedesktop.impl.portal.Screenshot` v2.
+//! `org.freedesktop.impl.portal.Screenshot` v3.
 //!
 //! `Screenshot` exports an `org.freedesktop.impl.portal.Request` object at the
 //! exact `handle` supplied by the portal frontend, then awaits a dedicated
@@ -10,6 +10,13 @@
 //! Version 2 adds `PickColor`: the compositor's crosshair picker returns the
 //! clicked point's RGB, which the response reports as the spec's `color`
 //! `(ddd)` triple (0–1 doubles).
+//!
+//! Version 3 advertises the target modes the compositor can isolate safely.
+//! Aegis currently advertises Area only: output capture is retained as the
+//! legacy no-`target` behavior, while Window and Active Window are withheld
+//! until compositor IPC can render a toplevel independently of occluding
+//! windows. Advertising fewer truthful targets is preferable to leaking
+//! pixels from an unrelated window.
 //!
 //! Response codes follow the portal specification: 0 success, 1 cancelled
 //! (the client called `Request.Close` first, or the user dismissed the
@@ -24,8 +31,10 @@ use crate::files;
 use crate::ipc::PortalCapture;
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 
-/// The served interface version: 2 adds `PickColor`.
-pub(crate) const SCREENSHOT_VERSION: u32 = 2;
+/// The served interface version: 3 adds target selection.
+pub(crate) const SCREENSHOT_VERSION: u32 = 3;
+/// `AvailableTargets` bit: an interactively selected rectangular area.
+pub(crate) const SCREENSHOT_TARGET_AREA: u32 = 4;
 
 /// One screenshot/color request handed from the bus methods to the capture
 /// worker.
@@ -35,6 +44,8 @@ pub(crate) enum CaptureJob {
         token: String,
         app_id: String,
         interactive: bool,
+        target: Option<ScreenshotTarget>,
+        permission_store_checked: bool,
         reply: ResponseSender,
     },
     PickColor {
@@ -47,16 +58,47 @@ pub(crate) enum CaptureJob {
 /// Options parsed out of the `a{sv}` argument.
 pub(crate) struct ScreenshotOptions {
     pub(crate) interactive: bool,
+    pub(crate) target: Option<ScreenshotTarget>,
+    pub(crate) permission_store_checked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenshotTarget {
+    Area,
 }
 
 /// Parse the backend `Screenshot` options dict. Request-token handling belongs
 /// to the portal frontend; backend options contain only request policy.
-pub(crate) fn parse_options(options: &HashMap<String, Value<'_>>) -> ScreenshotOptions {
+pub(crate) fn parse_options(
+    options: &HashMap<String, Value<'_>>,
+) -> Result<ScreenshotOptions, String> {
     let interactive = options
         .get("interactive")
         .and_then(|value| bool::try_from(value).ok())
         .unwrap_or(false);
-    ScreenshotOptions { interactive }
+    let target = match options
+        .get("target")
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| "Screenshot target must be an unsigned integer".to_string())?
+    {
+        None => None,
+        Some(SCREENSHOT_TARGET_AREA) => Some(ScreenshotTarget::Area),
+        Some(target) => {
+            return Err(format!(
+                "Screenshot target {target} is not advertised by this backend"
+            ));
+        }
+    };
+    let permission_store_checked = options
+        .get("permission_store_checked")
+        .and_then(|value| bool::try_from(value).ok())
+        .unwrap_or(false);
+    Ok(ScreenshotOptions {
+        interactive,
+        target,
+        permission_store_checked,
+    })
 }
 
 /// Object-path elements allow `[A-Za-z0-9_]`; the filename and the bus path
@@ -91,7 +133,7 @@ pub(crate) struct ScreenshotIface {
     /// methods, which already run on zbus's executor (tray precedent).
     pub(crate) conn: zbus::Connection,
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
-    pub(crate) jobs: mpsc::Sender<CaptureJob>,
+    pub(crate) jobs: mpsc::SyncSender<CaptureJob>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.Screenshot")]
@@ -103,28 +145,45 @@ impl ScreenshotIface {
         _parent_window: &str,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
-        let options = parse_options(&options);
+        let options = match parse_options(&options) {
+            Ok(options) => options,
+            Err(error) => {
+                log::warn!("portal: refusing Screenshot for '{app_id}': {error}");
+                return Ok((2, HashMap::new()));
+            }
+        };
         let path = handle.as_str().to_string();
         let token = capture_token(&handle);
         log::info!(
-            "portal: Screenshot for '{app_id}' (interactive={}) at {path}",
-            options.interactive
+            "portal: Screenshot for '{app_id}' (interactive={}, target={:?}) at {path}",
+            options.interactive,
+            options.target
         );
 
         aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
         let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.send(CaptureJob::Screenshot {
+        let queued = self.jobs.try_send(CaptureJob::Screenshot {
             request_path: path.clone(),
             token,
             app_id: app_id.to_string(),
             interactive: options.interactive,
+            target: options.target,
+            permission_store_checked: options.permission_store_checked,
             reply,
         });
-        if queued.is_err() {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(zbus::fdo::Error::Failed(
-                "capture worker is gone".to_string(),
-            ));
+        match queued {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!("portal: refusing Screenshot: worker queue is full");
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(zbus::fdo::Error::Failed(
+                    "capture worker is gone".to_string(),
+                ));
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("capture worker dropped its response".to_string())
@@ -145,16 +204,24 @@ impl ScreenshotIface {
 
         aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
         let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.send(CaptureJob::PickColor {
+        let queued = self.jobs.try_send(CaptureJob::PickColor {
             request_path: path.clone(),
             app_id: app_id.to_string(),
             reply,
         });
-        if queued.is_err() {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(zbus::fdo::Error::Failed(
-                "capture worker is gone".to_string(),
-            ));
+        match queued {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!("portal: refusing PickColor: worker queue is full");
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(zbus::fdo::Error::Failed(
+                    "capture worker is gone".to_string(),
+                ));
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("capture worker dropped its response".to_string())
@@ -167,21 +234,65 @@ impl ScreenshotIface {
     fn version(&self) -> u32 {
         SCREENSHOT_VERSION
     }
+
+    #[zbus(property)]
+    fn available_targets(&self) -> u32 {
+        SCREENSHOT_TARGET_AREA
+    }
 }
 
-/// Worker loop: one job at a time. Captures are frame-triggered on the
-/// compositor side, so serializing them is the natural pacing.
+/// Dispatch requests independently. Interactive compositor chrome can stay
+/// open for minutes; it must not head-of-line block unrelated screenshots
+/// or color picks. The cap bounds memory/thread consumption under a hostile
+/// request flood.
 pub(crate) fn capture_worker(
     rx: mpsc::Receiver<CaptureJob>,
     tracker: Arc<Mutex<RequestTracker>>,
-    mut capture: PortalCapture,
+    socket: std::path::PathBuf,
 ) {
+    const MAX_ACTIVE_CAPTURES: usize = 32;
+    struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Ok(job) = rx.recv() {
-        let result = run_job(&mut capture, &tracker, &job);
-        let reply = match &job {
-            CaptureJob::Screenshot { reply, .. } | CaptureJob::PickColor { reply, .. } => reply,
+        if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_ACTIVE_CAPTURES {
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            log::warn!("portal: refusing capture request: concurrency limit reached");
+            let reply = match &job {
+                CaptureJob::Screenshot { reply, .. } | CaptureJob::PickColor { reply, .. } => reply,
+            };
+            let _ = reply.send_blocking((2, HashMap::new()));
+            continue;
+        }
+        let task_tracker = Arc::clone(&tracker);
+        let task_socket = socket.clone();
+        let active_guard = ActiveGuard(Arc::clone(&active));
+        let spawn_failure_reply = match &job {
+            CaptureJob::Screenshot { reply, .. } | CaptureJob::PickColor { reply, .. } => {
+                reply.clone()
+            }
         };
-        let _ = reply.send_blocking(result);
+        if let Err(error) = std::thread::Builder::new()
+            .name("aegis-portal-capture-task".to_owned())
+            .spawn(move || {
+                let _active = active_guard;
+                let mut capture = PortalCapture::new(task_socket);
+                let result = run_job(&mut capture, &task_tracker, &job);
+                let reply = match &job {
+                    CaptureJob::Screenshot { reply, .. } | CaptureJob::PickColor { reply, .. } => {
+                        reply
+                    }
+                };
+                let _ = reply.send_blocking(result);
+            })
+        {
+            log::error!("portal: could not spawn capture task: {error}");
+            let _ = spawn_failure_reply.send_blocking((2, HashMap::new()));
+        }
     }
 }
 
@@ -197,6 +308,8 @@ fn run_job(
             token,
             app_id,
             interactive,
+            target,
+            permission_store_checked,
             ..
         } => {
             if tracker.lock().unwrap().was_closed(request_path) {
@@ -205,7 +318,7 @@ fn run_job(
             // Interactive: the compositor's region picker decides what to
             // capture. A dismissed picker answers 1 (cancelled),
             // exactly like a client Close.
-            let region = if *interactive {
+            let region = if *interactive || *target == Some(ScreenshotTarget::Area) {
                 match capture.pick(aegis_ipc::PickKind::Region) {
                     Ok(aegis_ipc::PickResult::Region { rect }) => Some(rect),
                     Ok(aegis_ipc::PickResult::Cancelled) => return (1, HashMap::new()),
@@ -221,6 +334,30 @@ fn run_job(
             } else {
                 None
             };
+            if tracker.lock().unwrap().was_closed(request_path) {
+                return (1, HashMap::new());
+            }
+            // A non-interactive legacy capture has no picker interaction of
+            // its own. If the frontend did not already verify PermissionStore
+            // consent, require an explicit compositor confirmation here.
+            if !*interactive && target.is_none() && !*permission_store_checked {
+                match capture.pick_confirm(
+                    "Take a Screenshot".to_string(),
+                    format!("Allow {app_id} to capture the current monitor?"),
+                    Some("Capture".to_string()),
+                ) {
+                    Ok(aegis_ipc::ConfirmPickResult::Confirmed) => {}
+                    Ok(aegis_ipc::ConfirmPickResult::Cancelled) => {
+                        return (1, HashMap::new());
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "portal: screenshot confirmation for '{app_id}' failed: {error}"
+                        );
+                        return (2, HashMap::new());
+                    }
+                }
+            }
             if tracker.lock().unwrap().was_closed(request_path) {
                 return (1, HashMap::new());
             }
@@ -318,20 +455,50 @@ mod tests {
 
     #[test]
     fn options_default_to_non_interactive() {
-        let parsed = parse_options(&HashMap::new());
+        let parsed = parse_options(&HashMap::new()).unwrap();
         assert!(!parsed.interactive);
+        assert_eq!(parsed.target, None);
+        assert!(!parsed.permission_store_checked);
     }
 
     #[test]
     fn options_parse_interactive() {
-        let parsed = parse_options(&options(&[("interactive", Value::from(true))]));
+        let parsed = parse_options(&options(&[("interactive", Value::from(true))])).unwrap();
         assert!(parsed.interactive);
     }
 
     #[test]
     fn wrong_typed_options_are_ignored() {
-        let parsed = parse_options(&options(&[("interactive", Value::from("yes"))]));
+        let parsed = parse_options(&options(&[("interactive", Value::from("yes"))])).unwrap();
         assert!(!parsed.interactive);
+    }
+
+    #[test]
+    fn area_target_is_supported_and_unadvertised_targets_are_rejected() {
+        let parsed =
+            parse_options(&options(&[("target", Value::from(SCREENSHOT_TARGET_AREA))])).unwrap();
+        assert_eq!(parsed.target, Some(ScreenshotTarget::Area));
+
+        for target in [1_u32, 2, 8, 3] {
+            assert!(
+                parse_options(&options(&[("target", Value::from(target))])).is_err(),
+                "target {target} must not be accepted unless advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_store_hint_is_parsed_fail_closed() {
+        let checked =
+            parse_options(&options(&[("permission_store_checked", Value::from(true))])).unwrap();
+        assert!(checked.permission_store_checked);
+
+        let wrong_type = parse_options(&options(&[(
+            "permission_store_checked",
+            Value::from("yes"),
+        )]))
+        .unwrap();
+        assert!(!wrong_type.permission_store_checked);
     }
 
     #[test]
@@ -340,8 +507,9 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_version_is_2() {
-        assert_eq!(SCREENSHOT_VERSION, 2);
+    fn screenshot_version_is_3_with_area_target_only() {
+        assert_eq!(SCREENSHOT_VERSION, 3);
+        assert_eq!(SCREENSHOT_TARGET_AREA, 4);
     }
 
     #[test]

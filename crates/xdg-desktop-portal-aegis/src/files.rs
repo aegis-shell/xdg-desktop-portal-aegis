@@ -11,8 +11,10 @@
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use rand::RngCore;
 
 /// The portal capture cache directory:
 /// `$XDG_CACHE_HOME/xdg-desktop-portal-aegis`, else
@@ -44,26 +46,46 @@ pub(crate) fn write_capture(dir: &Path, token: &str, png: &[u8]) -> io::Result<P
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    write_atomic(dir, &format!("screenshot-{millis}-{token}.png"), png)
-}
-
-/// Write an arbitrary payload as `blob-<millis>-<token>` under `dir` with the
-/// same atomic, mode-0600 discipline as [`write_capture`] — for payloads
-/// that are not PNGs (email attachment staging).
-pub(crate) fn write_blob(dir: &Path, token: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    write_atomic(dir, &format!("blob-{millis}-{token}"), bytes)
+    let nonce = random_suffix();
+    write_atomic(
+        dir,
+        &format!("screenshot-{millis}-{token}-{nonce}.png"),
+        png,
+    )
 }
 
 /// Create-temp-then-rename under `dir`, mode 0600, so no consumer observes a
 /// partial payload.
 fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
+    // Open without following the final component and validate before chmod.
+    // Otherwise an attacker-controlled cache symlink could make the portal
+    // change permissions on an unrelated directory.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "screenshot directory must be a user-owned real directory",
+        ));
+    }
+    // The directory contains names and pixels from private screenshots. Do
+    // not rely on the process umask to keep it private.
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    if directory.metadata()?.permissions().mode() & 0o7777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "screenshot directory mode must be 0700",
+        ));
+    }
+
     let final_path = dir.join(name);
-    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let temporary = dir.join(format!(".{name}.{}.tmp", random_suffix()));
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -72,12 +94,26 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, &final_path)
+        std::fs::rename(&temporary, &final_path)?;
+        // Make the directory entry durable too. Without this, a successful
+        // response can still point at a file lost after sudden power loss.
+        directory.sync_all()
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result.map(|()| final_path)
+}
+
+fn random_suffix() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut suffix = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(suffix, "{byte:02x}");
+    }
+    suffix
 }
 
 /// Render an absolute path as a `file://` URI, percent-encoding every byte
@@ -93,6 +129,45 @@ pub(crate) fn file_uri(path: &Path) -> String {
         }
     }
     uri
+}
+
+/// Resolve a local `file://` URI to a filesystem path. A remote authority is
+/// rejected: portal backends must not reinterpret a network URI as a local
+/// path. Percent escapes are decoded byte-for-byte so non-UTF-8 Unix paths
+/// round-trip correctly.
+pub(crate) fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri
+        .strip_prefix("file://localhost/")
+        .map(|path| format!("/{path}"))
+        .or_else(|| uri.strip_prefix("file://").map(str::to_string))?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(rest.len());
+    let mut chars = rest.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let hi = chars.next()?;
+            let lo = chars.next()?;
+            let hex = |value: u8| -> Option<u8> {
+                match value {
+                    b'0'..=b'9' => Some(value - b'0'),
+                    b'a'..=b'f' => Some(value - b'a' + 10),
+                    b'A'..=b'F' => Some(value - b'A' + 10),
+                    _ => None,
+                }
+            };
+            bytes.push(hex(hi)? * 16 + hex(lo)?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    if bytes.contains(&0) {
+        return None;
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
 #[cfg(test)]
@@ -130,12 +205,10 @@ mod tests {
         ));
         let path = write_capture(&dir, "tok1", b"png-bytes").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"png-bytes");
-        assert!(
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("-tok1.png")
-        );
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("screenshot-"));
+        assert!(name.contains("-tok1-"));
+        assert!(name.ends_with(".png"));
         // No temp file lingers next to the result.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         // Mode 0600: portal payloads are screen pixels.
@@ -144,7 +217,36 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_capture_rejects_symlink_directory_without_chmodding_target() {
+        let root = std::env::temp_dir().join(format!(
+            "xdg-desktop-portal-aegis-symlink-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = root.join("target");
+        let link = root.join("cache");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(write_capture(&link, "tok1", b"private pixels").is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -154,5 +256,20 @@ mod tests {
             file_uri(Path::new("/a b/ç.png")),
             "file:///a%20b/%C3%A7.png"
         );
+    }
+
+    #[test]
+    fn file_uri_path_decodes_local_paths_only() {
+        assert_eq!(
+            path_from_file_uri("file:///home/user/My%20Files/a%20b.bin"),
+            Some(PathBuf::from("/home/user/My Files/a b.bin"))
+        );
+        assert_eq!(
+            path_from_file_uri("file://localhost/tmp/x.bin"),
+            Some(PathBuf::from("/tmp/x.bin"))
+        );
+        assert_eq!(path_from_file_uri("file://server/share/x.bin"), None);
+        assert_eq!(path_from_file_uri("https://example.com/x.bin"), None);
+        assert_eq!(path_from_file_uri("file:///bad/%zz.bin"), None);
     }
 }

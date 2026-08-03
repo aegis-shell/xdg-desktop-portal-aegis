@@ -1,4 +1,4 @@
-//! `org.freedesktop.impl.portal.ScreenCast` v3.
+//! `org.freedesktop.impl.portal.ScreenCast` v6.
 //!
 //! The portal frontend supplies Request and Session object paths to the
 //! backend. `CreateSession` exports the Session object, `SelectSources`
@@ -7,15 +7,18 @@
 //! picker and PipeWire work stays on the screencast worker; D-Bus methods
 //! asynchronously await the backend `(response, results)` tuple.
 //!
-//! Scope of this phase: source types `monitor` and `window`, one stream per
-//! session, cursor mode Hidden only. Selection always runs the compositor's
-//! picker (`PickTarget`): click a window, press Enter (or click
-//! empty desktop) for the whole output, Escape to cancel. A window stream
-//! crops the window's visible region from the output frame — occluded parts
-//! show the occluder, and the stream ends if the window closes or its size
-//! changes. Persistence is not advertised: version 4's `restore_data` belongs
-//! to the portal frontend's PermissionStore contract and is deferred until
-//! Aegis can implement that ABI exactly.
+//! This backend advertises monitor sources only, one stream per session, and
+//! cursor mode Hidden. Selection always requires an explicit compositor
+//! confirmation identifying the requesting application. Aegis IPC's legacy window stream is deliberately not
+//! reachable here because it crops the composed output and can therefore
+//! contain pixels from an occluding window. Persistence requests are accepted
+//! but conservatively reduced to `persist_mode = 0`; restore data is treated
+//! as unavailable and therefore causes a normal fresh confirmation, as the
+//! version-4 contract permits. Version 5's `mapping_id` stream property is
+//! optional and omitted because no RemoteDesktop coordinate mapping exists.
+//! Version 6's stable PipeWire `object.serial` is resolved from the registry
+//! and returned as `pipewire-serial`; Start fails rather than claim v6 without
+//! that stable identifier.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,13 +33,10 @@ use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 
 const SESSION_IFACE: &str = "org.freedesktop.impl.portal.Session";
 
-/// Version 3 adds `source_type` stream properties. Persistence starts at v4
-/// and is intentionally not advertised.
-pub(crate) const SCREENCAST_VERSION: u32 = 3;
+/// Version 6 adds the stable `pipewire-serial` stream property.
+pub(crate) const SCREENCAST_VERSION: u32 = 6;
 /// `AvailableSourceTypes` bit: monitor.
 const SOURCE_TYPE_MONITOR: u32 = 1;
-/// `AvailableSourceTypes` bit: window.
-const SOURCE_TYPE_WINDOW: u32 = 2;
 /// `AvailableCursorModes`: Hidden only. No cursor metadata is produced.
 const CURSOR_MODES: u32 = 1;
 /// Waiting for the PipeWire negotiation longer than this is a failure.
@@ -49,6 +49,7 @@ pub(crate) enum CastJob {
         app_id: String,
         source_types: u32,
         cursor_mode: u32,
+        persist_mode: u32,
         reply: ResponseSender,
     },
     Start {
@@ -69,6 +70,7 @@ pub(crate) struct SelectOptions {
     /// Requested source-type mask; must intersect what we offer.
     pub(crate) source_types: u32,
     pub(crate) cursor_mode: u32,
+    pub(crate) persist_mode: u32,
 }
 
 /// Parse `SelectSources` options. Unknown keys are ignored per spec.
@@ -81,22 +83,33 @@ pub(crate) fn parse_select_options(options: &HashMap<String, Value<'_>>) -> Sele
         .get("cursor_mode")
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(1);
+    let persist_mode = options
+        .get("persist_mode")
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
     SelectOptions {
         source_types,
         cursor_mode,
+        persist_mode,
     }
 }
 
 /// Why a `SelectSources` option set cannot be served, as a D-Bus message.
 fn validate_select(options: &SelectOptions) -> Result<(), String> {
-    let supported_sources = SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW;
+    let supported_sources = SOURCE_TYPE_MONITOR;
     if options.source_types == 0 || options.source_types & !supported_sources != 0 {
-        return Err("only monitor and window sources are supported".to_string());
+        return Err("only monitor sources are supported".to_string());
     }
     if options.cursor_mode != CURSOR_MODES {
         return Err(format!(
             "cursor_mode {} is not supported (Hidden only)",
             options.cursor_mode
+        ));
+    }
+    if options.persist_mode > 2 {
+        return Err(format!(
+            "persist_mode {} is not defined by the ScreenCast contract",
+            options.persist_mode
         ));
     }
     Ok(())
@@ -108,7 +121,7 @@ pub(crate) struct ScreenCastIface {
     pub(crate) conn: zbus::Connection,
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
     pub(crate) sessions: Arc<Mutex<SessionRegistry>>,
-    pub(crate) jobs: mpsc::Sender<CastJob>,
+    pub(crate) jobs: mpsc::SyncSender<CastJob>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -190,11 +203,19 @@ impl ScreenCastIface {
             app_id: app_id.to_string(),
             source_types: options.source_types,
             cursor_mode: options.cursor_mode,
+            persist_mode: options.persist_mode,
             reply,
         });
-        if let Err(error) = queued {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(error);
+        match queued {
+            Ok(true) => {}
+            Ok(false) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(error) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(error);
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("screencast worker dropped its response".to_string())
@@ -228,9 +249,16 @@ impl ScreenCastIface {
             app_id: app_id.to_string(),
             reply,
         });
-        if let Err(error) = queued {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(error);
+        match queued {
+            Ok(true) => {}
+            Ok(false) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(error) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(error);
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("screencast worker dropped its response".to_string())
@@ -241,7 +269,7 @@ impl ScreenCastIface {
 
     #[zbus(property, name = "AvailableSourceTypes")]
     fn available_source_types(&self) -> u32 {
-        SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW
+        SOURCE_TYPE_MONITOR
     }
 
     #[zbus(property, name = "AvailableCursorModes")]
@@ -256,26 +284,41 @@ impl ScreenCastIface {
 }
 
 impl ScreenCastIface {
-    fn enqueue(&self, job: CastJob) -> zbus::fdo::Result<()> {
-        self.jobs
-            .send(job)
-            .map_err(|_| zbus::fdo::Error::Failed("screencast worker is gone".to_string()))
+    /// `Ok(false)` is bounded backpressure, reported as portal response 2;
+    /// disconnection remains a D-Bus service failure.
+    fn enqueue(&self, job: CastJob) -> zbus::fdo::Result<bool> {
+        match self.jobs.try_send(job) {
+            Ok(()) => Ok(true),
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!("portal: refusing ScreenCast request: worker queue is full");
+                Ok(false)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(zbus::fdo::Error::Failed(
+                "screencast worker is gone".to_string(),
+            )),
+        }
     }
 }
 
-/// Worker loop: one job at a time. Only `Start` blocks (IPC connect +
-/// PipeWire negotiation, bounded by the cast thread's own failures and
-/// [`START_TIMEOUT`]); serializing casts is the natural pacing.
+/// Dispatch blocking selections and PipeWire negotiations independently.
+/// Session close/end events stay on this dispatcher and therefore remain
+/// responsive even while another application has a confirmation open.
 pub(crate) fn cast_worker(
     rx: mpsc::Receiver<CastJob>,
-    jobs: mpsc::Sender<CastJob>,
+    jobs: mpsc::SyncSender<CastJob>,
     conn: zbus::blocking::Connection,
     tracker: Arc<Mutex<RequestTracker>>,
     sessions: Arc<Mutex<SessionRegistry>>,
     socket: PathBuf,
 ) {
-    // The worker's own scoped client drives the interactive source picker.
-    let mut picker = crate::ipc::PortalCapture::new(socket.clone());
+    const MAX_ACTIVE_CAST_REQUESTS: usize = 32;
+    struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Ok(job) = rx.recv() {
         match job {
             CastJob::SelectSources {
@@ -284,20 +327,44 @@ pub(crate) fn cast_worker(
                 app_id,
                 source_types,
                 cursor_mode,
+                persist_mode,
                 reply,
             } => {
-                let code = select_sources(
-                    &tracker,
-                    &sessions,
-                    &mut picker,
-                    &request_path,
-                    &session_path,
-                    &app_id,
-                    source_types,
-                    cursor_mode,
-                );
-                log::debug!("portal: SelectSources for '{app_id}' → response {code}");
-                let _ = reply.send_blocking((code, HashMap::new()));
+                if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    >= MAX_ACTIVE_CAST_REQUESTS
+                {
+                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    let _ = reply.send_blocking((2, HashMap::new()));
+                    continue;
+                }
+                let task_tracker = Arc::clone(&tracker);
+                let task_sessions = Arc::clone(&sessions);
+                let task_socket = socket.clone();
+                let active_guard = ActiveGuard(Arc::clone(&active));
+                let spawn_failure_reply = reply.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("aegis-portal-select-sources".to_owned())
+                    .spawn(move || {
+                        let _active = active_guard;
+                        let mut picker = crate::ipc::PortalCapture::new(task_socket);
+                        let code = select_sources(
+                            &task_tracker,
+                            &task_sessions,
+                            &mut picker,
+                            &request_path,
+                            &session_path,
+                            &app_id,
+                            source_types,
+                            cursor_mode,
+                            persist_mode,
+                        );
+                        log::debug!("portal: SelectSources for '{app_id}' → response {code}");
+                        let _ = reply.send_blocking((code, HashMap::new()));
+                    })
+                {
+                    log::error!("portal: could not spawn SelectSources task: {error}");
+                    let _ = spawn_failure_reply.send_blocking((2, HashMap::new()));
+                }
             }
             CastJob::Start {
                 request_path,
@@ -305,20 +372,39 @@ pub(crate) fn cast_worker(
                 app_id,
                 reply,
             } => {
-                let response = start_cast(
-                    &tracker,
-                    &sessions,
-                    &jobs,
-                    &socket,
-                    &mut picker,
-                    &request_path,
-                    &session_path,
-                    &app_id,
-                );
-                log::debug!("portal: Start for '{app_id}' → response {}", response.0);
-                let _ = reply.send_blocking(response);
-                // A failed Start leaves the session armed but idle; the
-                // client may retry Start or close the session itself.
+                if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    >= MAX_ACTIVE_CAST_REQUESTS
+                {
+                    active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    let _ = reply.send_blocking((2, HashMap::new()));
+                    continue;
+                }
+                let task_tracker = Arc::clone(&tracker);
+                let task_sessions = Arc::clone(&sessions);
+                let task_jobs = jobs.clone();
+                let task_socket = socket.clone();
+                let active_guard = ActiveGuard(Arc::clone(&active));
+                let spawn_failure_reply = reply.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("aegis-portal-start-cast".to_owned())
+                    .spawn(move || {
+                        let _active = active_guard;
+                        let response = start_cast(
+                            &task_tracker,
+                            &task_sessions,
+                            &task_jobs,
+                            &task_socket,
+                            &request_path,
+                            &session_path,
+                            &app_id,
+                        );
+                        log::debug!("portal: Start for '{app_id}' → response {}", response.0);
+                        let _ = reply.send_blocking(response);
+                    })
+                {
+                    log::error!("portal: could not spawn Start task: {error}");
+                    let _ = spawn_failure_reply.send_blocking((2, HashMap::new()));
+                }
             }
             CastJob::CloseSession { session_path } | CastJob::SessionEnded { session_path } => {
                 close_session(&conn, &sessions, &session_path);
@@ -338,11 +424,12 @@ fn select_sources(
     app_id: &str,
     source_types: u32,
     _cursor_mode: u32,
+    persist_mode: u32,
 ) -> u32 {
     if tracker.lock().unwrap().was_closed(request_path) {
         return 1;
     }
-    let source = match pick_source(picker, source_types) {
+    let source = match pick_source(picker, source_types, app_id) {
         Ok(source) => source,
         Err(code) => return code,
     };
@@ -352,7 +439,7 @@ fn select_sources(
     match sessions
         .lock()
         .unwrap()
-        .mark_sources_selected(session_path, app_id, source)
+        .mark_sources_selected(session_path, app_id, source, persist_mode)
     {
         Ok(()) => 0,
         Err(error) => {
@@ -362,37 +449,24 @@ fn select_sources(
     }
 }
 
-/// Decide the session's source through an explicit user action. The picker
-/// returns a clicked window, Enter/empty-desktop for the whole output, or
-/// Escape to cancel. The selected source must be present in the
-/// request mask.
+/// Decide the session's monitor source through an explicit user action.
 fn pick_source(
     picker: &mut crate::ipc::PortalCapture,
     source_types: u32,
+    app_id: &str,
 ) -> Result<CastSource, u32> {
-    match picker.pick(aegis_ipc::PickKind::Window) {
-        Ok(aegis_ipc::PickResult::Window { id }) if source_types & SOURCE_TYPE_WINDOW != 0 => {
-            Ok(CastSource::Window(id))
-        }
-        Ok(aegis_ipc::PickResult::Window { .. }) => {
-            log::info!("portal: window picked for a monitor-only request; refusing");
-            Err(2)
-        }
-        Ok(aegis_ipc::PickResult::Output) if source_types & SOURCE_TYPE_MONITOR != 0 => {
-            Ok(CastSource::Monitor)
-        }
-        // The picker offered the whole output but the client did not.
-        Ok(aegis_ipc::PickResult::Output) => {
-            log::info!("portal: whole-output pick on a window-only request; refusing");
-            Err(2)
-        }
-        Ok(aegis_ipc::PickResult::Cancelled) => Err(1),
-        Ok(other) => {
-            log::warn!("portal: window pick answered with {other:?}");
-            Err(2)
-        }
+    if source_types != SOURCE_TYPE_MONITOR {
+        return Err(2);
+    }
+    match picker.pick_confirm(
+        "Share Your Screen".to_string(),
+        format!("Allow {app_id} to view the current monitor?"),
+        Some("Share".to_string()),
+    ) {
+        Ok(aegis_ipc::ConfirmPickResult::Confirmed) => Ok(CastSource::Monitor),
+        Ok(aegis_ipc::ConfirmPickResult::Cancelled) => Err(1),
         Err(error) => {
-            log::warn!("portal: window pick failed: {error}");
+            log::warn!("portal: monitor sharing confirmation failed: {error}");
             Err(2)
         }
     }
@@ -404,9 +478,8 @@ fn pick_source(
 fn start_cast(
     tracker: &Arc<Mutex<RequestTracker>>,
     sessions: &Arc<Mutex<SessionRegistry>>,
-    jobs: &mpsc::Sender<CastJob>,
+    jobs: &mpsc::SyncSender<CastJob>,
     socket: &std::path::Path,
-    picker: &mut crate::ipc::PortalCapture,
     request_path: &str,
     session_path: &str,
     app_id: &str,
@@ -414,48 +487,22 @@ fn start_cast(
     if tracker.lock().unwrap().was_closed(request_path) {
         return (1, HashMap::new());
     }
-    let (source, window_geometry) = {
-        let sessions = sessions.lock().unwrap();
-        let source = match sessions.source_for_start(session_path, app_id) {
-            Ok(source) => source,
+    let (source, requested_persist_mode) = {
+        let mut sessions = sessions.lock().unwrap();
+        match sessions.reserve_start(session_path, app_id) {
+            Ok(selection) => selection,
             Err(error) => {
                 log::warn!("portal: Start refused: {error}");
                 return (2, HashMap::new());
             }
-        };
-        drop(sessions);
-        // A window source reports its compositor-logical geometry in the
-        // stream properties; a window gone at Start time fails the Start.
-        let geometry = match source {
-            CastSource::Monitor => None,
-            CastSource::Window(id) => match picker
-                .windows()
-                .ok()
-                .and_then(|windows| windows.into_iter().find(|w| w.id == id))
-            {
-                Some(window) => Some((window.position, window.size)),
-                None => {
-                    log::warn!("portal: Start refused: window {} is gone", id.0);
-                    return (2, HashMap::new());
-                }
-            },
-        };
-        (source, geometry)
-    };
-    let window = match source {
-        CastSource::Monitor => None,
-        CastSource::Window(id) => Some(id),
+        }
     };
     // The cast thread reports compositor-side stream ends back to this
     // worker through a clone of the worker's own job channel.
-    let handle = match cast::spawn(
-        socket.to_path_buf(),
-        session_path.to_string(),
-        jobs.clone(),
-        window,
-    ) {
+    let handle = match cast::spawn(socket.to_path_buf(), session_path.to_string(), jobs.clone()) {
         Ok(handle) => handle,
         Err(error) => {
+            sessions.lock().unwrap().clear_start(session_path);
             log::warn!("portal: could not spawn cast for {session_path}: {error}");
             return (2, HashMap::new());
         }
@@ -466,47 +513,56 @@ fn start_cast(
             if tracker.lock().unwrap().was_closed(request_path) {
                 drop(handle.stop);
                 let _ = handle.thread.join();
+                sessions.lock().unwrap().clear_start(session_path);
                 return (1, HashMap::new());
             }
-            sessions
-                .lock()
-                .unwrap()
-                .mark_started(session_path, handle.stop, handle.thread);
+            if let Err((stop, thread)) =
+                sessions
+                    .lock()
+                    .unwrap()
+                    .mark_started(session_path, handle.stop, handle.thread)
+            {
+                drop(stop);
+                let _ = thread.join();
+                return (1, HashMap::new());
+            }
             log::info!(
-                "portal: cast for {session_path} live as pipewire node {} ({}x{}, {:?})",
+                "portal: cast for {session_path} live as pipewire node {} serial {} ({}x{}, {:?})",
                 started.node_id,
+                started.serial,
                 started.width,
                 started.height,
                 source
             );
-            let (source_type, position, size) = match window_geometry {
-                Some((position, size)) => (
-                    SOURCE_TYPE_WINDOW,
-                    (position.x, position.y),
-                    (size.w, size.h),
-                ),
-                None => (
+            let mut results = HashMap::from([(
+                "streams".to_string(),
+                streams_value(
+                    started.node_id,
+                    started.serial,
                     SOURCE_TYPE_MONITOR,
                     (0, 0),
                     (started.width as i32, started.height as i32),
                 ),
-            };
-            let results = HashMap::from([(
-                "streams".to_string(),
-                streams_value(started.node_id, source_type, position, size),
             )]);
+            if requested_persist_mode != 0 {
+                // Omitting this would make the frontend assume the requested
+                // nonzero mode was granted. Report the safe reduction.
+                results.insert("persist_mode".to_string(), Value::from(0_u32));
+            }
             (0, results)
         }
         Ok(Err(error)) => {
             log::warn!("portal: cast for {session_path} failed: {error}");
             drop(handle.stop);
             let _ = handle.thread.join();
+            sessions.lock().unwrap().clear_start(session_path);
             (2, HashMap::new())
         }
         Err(_) => {
             log::warn!("portal: cast for {session_path} timed out during negotiation");
             drop(handle.stop);
             let _ = handle.thread.join();
+            sessions.lock().unwrap().clear_start(session_path);
             (2, HashMap::new())
         }
     }
@@ -518,9 +574,10 @@ fn close_session(
     sessions: &Arc<Mutex<SessionRegistry>>,
     session_path: &str,
 ) {
-    let Some(_session) = sessions.lock().unwrap().remove(session_path) else {
+    let Some(session) = sessions.lock().unwrap().remove(session_path) else {
         return;
     };
+    crate::session::stop_cast(session);
     log::debug!("portal: screencast session {session_path} closed");
     if let Err(error) = conn.emit_signal(None::<&str>, session_path, SESSION_IFACE, "Closed", &()) {
         log::warn!("portal: could not emit Closed for {session_path}: {error}");
@@ -535,6 +592,7 @@ fn close_session(
 /// type (monitor or window).
 fn streams_value(
     node_id: u32,
+    pipewire_serial: u64,
     source_type: u32,
     position: (i32, i32),
     size: (i32, i32),
@@ -546,6 +604,7 @@ fn streams_value(
         ),
         ("size".to_string(), Value::Structure(Structure::from(size))),
         ("source_type".to_string(), Value::U32(source_type)),
+        ("pipewire-serial".to_string(), Value::U64(pipewire_serial)),
     ]);
     // `append_field` keeps each field's dynamic signature, so the structure
     // types as `(ua{sv})`; `Structure::from` would route the fields through
@@ -582,14 +641,14 @@ mod tests {
         let parsed = parse_select_options(&HashMap::new());
         assert_eq!(parsed.source_types, SOURCE_TYPE_MONITOR);
         assert_eq!(parsed.cursor_mode, 1);
+        assert_eq!(parsed.persist_mode, 0);
         assert!(validate_select(&parsed).is_ok());
     }
 
     #[test]
-    fn select_options_accept_monitor_and_window_mix() {
-        // The picker allows the user to choose either advertised source.
+    fn select_options_refuse_monitor_and_window_mix() {
         let parsed = parse_select_options(&options(&[("types", Value::from(0b11u32))]));
-        assert!(validate_select(&parsed).is_ok());
+        assert!(validate_select(&parsed).is_err());
     }
 
     #[test]
@@ -602,10 +661,10 @@ mod tests {
     }
 
     #[test]
-    fn select_options_accept_window_only_sources() {
+    fn select_options_refuse_window_only_sources() {
         let window_only = parse_select_options(&options(&[("types", Value::from(0b10u32))]));
-        assert_eq!(window_only.source_types, SOURCE_TYPE_WINDOW);
-        assert!(validate_select(&window_only).is_ok());
+        assert_eq!(window_only.source_types, 2);
+        assert!(validate_select(&window_only).is_err());
     }
 
     #[test]
@@ -615,8 +674,19 @@ mod tests {
     }
 
     #[test]
-    fn screencast_version_is_3() {
-        assert_eq!(SCREENCAST_VERSION, 3);
+    fn screencast_version_is_6() {
+        assert_eq!(SCREENCAST_VERSION, 6);
+    }
+
+    #[test]
+    fn persist_modes_are_parsed_and_unknown_values_refused() {
+        for mode in 0_u32..=2 {
+            let parsed = parse_select_options(&options(&[("persist_mode", Value::from(mode))]));
+            assert_eq!(parsed.persist_mode, mode);
+            assert!(validate_select(&parsed).is_ok());
+        }
+        let parsed = parse_select_options(&options(&[("persist_mode", Value::from(3_u32))]));
+        assert!(validate_select(&parsed).is_err());
     }
 
     #[test]
@@ -627,7 +697,7 @@ mod tests {
 
     #[test]
     fn streams_value_has_portal_shape() {
-        let value = streams_value(42, SOURCE_TYPE_MONITOR, (0, 0), (1920, 1080));
+        let value = streams_value(42, 9001, SOURCE_TYPE_MONITOR, (0, 0), (1920, 1080));
         let Value::Array(array) = &value else {
             panic!("streams must be an array");
         };
@@ -639,42 +709,16 @@ mod tests {
             "a(ua{sv})",
             "streams signature"
         );
-    }
-
-    #[test]
-    fn streams_value_reports_window_source_geometry() {
-        let value = streams_value(7, SOURCE_TYPE_WINDOW, (40, 60), (800, 600));
-        let Value::Array(array) = &value else {
-            panic!("streams must be an array");
-        };
         let stream: Value = array.get(0).expect("read").expect("one stream");
         let Value::Structure(stream) = stream else {
             panic!("stream element must be a structure");
         };
-        let fields = stream.fields();
-        let Value::Dict(properties) = &fields[1] else {
+        let Value::Dict(properties) = &stream.fields()[1] else {
             panic!("stream properties must be a dict");
         };
-        let get = |key: &str| {
-            properties
-                .iter()
-                .find(|(k, _)| match k {
-                    Value::Str(s) => s.as_str() == key,
-                    _ => false,
-                })
-                .map(|(_, v)| match v {
-                    Value::Value(inner) => (**inner).clone(),
-                    other => other.clone(),
-                })
-        };
-        assert_eq!(get("source_type"), Some(Value::U32(SOURCE_TYPE_WINDOW)));
-        assert_eq!(
-            get("position"),
-            Some(Value::Structure(Structure::from((40i32, 60i32))))
-        );
-        assert_eq!(
-            get("size"),
-            Some(Value::Structure(Structure::from((800i32, 600i32))))
-        );
+        assert!(properties.iter().any(|(key, value)| {
+            matches!(key, Value::Str(key) if key.as_str() == "pipewire-serial")
+                && matches!(value, Value::Value(value) if **value == Value::U64(9001))
+        }));
     }
 }

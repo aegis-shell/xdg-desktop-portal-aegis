@@ -16,6 +16,19 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// CI/release validation requests hard failures instead of optional skips.
+pub fn e2e_required() -> bool {
+    std::env::var_os("AEGIS_PORTAL_REQUIRE_E2E").is_some()
+}
+
+fn unavailable(message: &str) -> Option<PrivateBus> {
+    assert!(
+        !e2e_required(),
+        "required E2E prerequisite failed: {message}"
+    );
+    None
+}
+
 /// A private session bus; killed on drop.
 pub struct PrivateBus {
     address: String,
@@ -48,20 +61,32 @@ impl Drop for PrivateBus {
 /// Spawn a private `dbus-daemon --session`; `None` when dbus-daemon is not
 /// installed (tests skip).
 pub fn private_bus() -> Option<PrivateBus> {
-    let mut child = Command::new("dbus-daemon")
+    let mut child = match Command::new("dbus-daemon")
         .args(["--session", "--nofork", "--print-address=1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+    {
+        Ok(child) => child,
+        Err(error) => return unavailable(&format!("could not spawn dbus-daemon: {error}")),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return unavailable("dbus-daemon stdout was not piped");
+    };
     let mut line = String::new();
-    BufReader::new(stdout).read_line(&mut line).ok()?;
+    if let Err(error) = BufReader::new(stdout).read_line(&mut line) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return unavailable(&format!("could not read dbus-daemon address: {error}"));
+    }
     let address = line.trim().to_string();
     if address.is_empty() {
         let _ = child.kill();
-        return None;
+        let _ = child.wait();
+        return unavailable("dbus-daemon returned an empty address");
     }
     Some(PrivateBus { address, child })
 }
@@ -86,6 +111,7 @@ pub fn daemon_command(bus: &PrivateBus, data: &PathBuf, runtime: &PathBuf) -> Co
     command
         .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
         .env("XDG_DATA_HOME", data)
+        .env("XDG_CACHE_HOME", data.join("cache"))
         .env("XDG_RUNTIME_DIR", runtime)
         .env(
             "RUST_LOG",

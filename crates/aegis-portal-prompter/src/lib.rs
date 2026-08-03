@@ -337,8 +337,7 @@ fn validate_basename(path: &Path) -> Result<(), String> {
     match (components.next(), components.next()) {
         (Some(Component::Normal(name)), None) if !name.is_empty() => Ok(()),
         _ => Err(format!(
-            "SaveFiles name {:?} is not a single non-empty basename",
-            path
+            "SaveFiles name {path:?} is not a single non-empty basename"
         )),
     }
 }
@@ -376,8 +375,7 @@ fn unique_child(
         }
     }
     Err(format!(
-        "could not construct a unique filename for {:?}",
-        name
+        "could not construct a unique filename for {name:?}"
     ))
 }
 

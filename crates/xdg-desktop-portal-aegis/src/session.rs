@@ -10,13 +10,15 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 
-/// The source a session is armed with. `Window` carries the
-/// compositor's window id; the cast crops that window's visible region from
-/// the output frame.
+const MAX_SESSIONS: usize = 128;
+const MAX_LIVE_CASTS: usize = 16;
+
+/// The source a session is armed with. Window capture is intentionally not
+/// exposed until the compositor can render a toplevel independently of
+/// overlapping windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CastSource {
     Monitor,
-    Window(aegis_core::window::WindowId),
 }
 
 /// State of one portal screencast session.
@@ -26,6 +28,12 @@ pub(crate) struct CastSession {
     pub(crate) sources_selected: bool,
     /// The armed source; meaningful once `sources_selected` holds.
     pub(crate) source: CastSource,
+    /// Persistence requested by the frontend. The current backend safely
+    /// reduces nonzero modes to 0 and reports that reduction from Start.
+    pub(crate) requested_persist_mode: u32,
+    /// Reserved before spawning PipeWire negotiation so concurrent Start
+    /// calls cannot create two producers for one session.
+    pub(crate) starting: bool,
     /// Closing this end makes the cast thread's stop socket readable, which
     /// quits its PipeWire main loop. `None` until `Start` succeeds.
     pub(crate) stop: Option<UnixStream>,
@@ -45,8 +53,8 @@ impl SessionRegistry {
         if self.sessions.contains_key(path) {
             return Err(format!("session {path} already exists"));
         }
-        if app_id.is_empty() {
-            return Err("application id must not be empty".to_string());
+        if self.sessions.len() >= MAX_SESSIONS {
+            return Err(format!("session limit of {MAX_SESSIONS} reached"));
         }
         self.sessions.insert(
             path.to_string(),
@@ -54,6 +62,8 @@ impl SessionRegistry {
                 app_id: app_id.to_string(),
                 sources_selected: false,
                 source: CastSource::Monitor,
+                requested_persist_mode: 0,
+                starting: false,
                 stop: None,
                 cast_thread: None,
             },
@@ -70,6 +80,7 @@ impl SessionRegistry {
         path: &str,
         app_id: &str,
         source: CastSource,
+        requested_persist_mode: u32,
     ) -> Result<(), String> {
         let session = self
             .sessions
@@ -78,19 +89,22 @@ impl SessionRegistry {
         if session.sources_selected {
             return Err(format!("session {path} already selected sources"));
         }
-        if app_id.is_empty() {
-            return Err("application id must not be empty".to_string());
-        }
         if session.app_id != app_id {
             return Err(format!("session {path} belongs to another application"));
         }
         session.sources_selected = true;
         session.source = source;
+        session.requested_persist_mode = requested_persist_mode;
         Ok(())
     }
 
-    /// Validate the application owner and return the source `Start` must cast.
-    pub(crate) fn source_for_start(&self, path: &str, app_id: &str) -> Result<CastSource, String> {
+    /// Validate the application owner and return the source and persistence
+    /// request `Start` must apply.
+    pub(crate) fn reserve_start(
+        &mut self,
+        path: &str,
+        app_id: &str,
+    ) -> Result<(CastSource, u32), String> {
         let session = self
             .sessions
             .get(path)
@@ -101,34 +115,62 @@ impl SessionRegistry {
         if !session.sources_selected {
             return Err(format!("session {path} has not selected sources"));
         }
-        if session.cast_thread.is_some() {
+        if session.starting || session.cast_thread.is_some() {
             return Err(format!("session {path} already started"));
         }
-        Ok(session.source)
+        let live = self
+            .sessions
+            .values()
+            .filter(|session| session.starting || session.cast_thread.is_some())
+            .count();
+        if live >= MAX_LIVE_CASTS {
+            return Err(format!("live cast limit of {MAX_LIVE_CASTS} reached"));
+        }
+        let session = self
+            .sessions
+            .get_mut(path)
+            .ok_or_else(|| format!("unknown session {path}"))?;
+        session.starting = true;
+        Ok((session.source, session.requested_persist_mode))
     }
 
+    pub(crate) fn clear_start(&mut self, path: &str) {
+        if let Some(session) = self.sessions.get_mut(path) {
+            session.starting = false;
+        }
+    }
+
+    /// Install a negotiated cast only if the reserved session still exists.
+    /// On a raced Session.Close, return ownership so the caller can stop and
+    /// join the orphan producer before replying.
     pub(crate) fn mark_started(
         &mut self,
         path: &str,
         stop: UnixStream,
         cast_thread: std::thread::JoinHandle<()>,
-    ) {
+    ) -> Result<(), (UnixStream, std::thread::JoinHandle<()>)> {
         if let Some(session) = self.sessions.get_mut(path) {
+            session.starting = false;
             session.stop = Some(stop);
             session.cast_thread = Some(cast_thread);
+            Ok(())
+        } else {
+            Err((stop, cast_thread))
         }
     }
 
-    /// Remove the session and stop its cast: dropping `stop` signals the
-    /// cast thread, and the thread is joined so its PipeWire stream and IPC
-    /// connection are gone before the caller emits `Closed`.
+    /// Detach a session from the registry. The caller stops/joins its cast
+    /// after dropping the registry lock.
     pub(crate) fn remove(&mut self, path: &str) -> Option<CastSession> {
-        let mut session = self.sessions.remove(path)?;
-        drop(session.stop.take());
-        if let Some(thread) = session.cast_thread.take() {
-            let _ = thread.join();
-        }
-        Some(session)
+        self.sessions.remove(path)
+    }
+}
+
+/// Stop and join a detached cast without holding the session-registry lock.
+pub(crate) fn stop_cast(mut session: CastSession) {
+    drop(session.stop.take());
+    if let Some(thread) = session.cast_thread.take() {
+        let _ = thread.join();
     }
 }
 
@@ -137,7 +179,7 @@ impl SessionRegistry {
 /// frontend observes a fully stopped session.
 pub(crate) struct SessionIface {
     pub(crate) path: String,
-    pub(crate) jobs: std::sync::mpsc::Sender<crate::screencast::CastJob>,
+    pub(crate) jobs: std::sync::mpsc::SyncSender<crate::screencast::CastJob>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.Session")]
@@ -176,46 +218,82 @@ mod tests {
     }
 
     #[test]
-    fn start_requires_selected_sources_and_single_use() {
-        let mut registry = registry_with("/s/1");
+    fn total_session_count_is_bounded() {
+        let mut registry = SessionRegistry::default();
+        for index in 0..MAX_SESSIONS {
+            registry
+                .insert(&format!("/s/{index}"), "org.example.App")
+                .unwrap();
+        }
+        assert!(registry.insert("/s/overflow", "org.example.App").is_err());
+    }
+
+    #[test]
+    fn live_cast_count_is_bounded() {
+        let mut registry = SessionRegistry::default();
+        for index in 0..=MAX_LIVE_CASTS {
+            let path = format!("/s/{index}");
+            registry.insert(&path, "org.example.App").unwrap();
+            registry
+                .mark_sources_selected(&path, "org.example.App", CastSource::Monitor, 0)
+                .unwrap();
+        }
+        for index in 0..MAX_LIVE_CASTS {
+            registry
+                .reserve_start(&format!("/s/{index}"), "org.example.App")
+                .unwrap();
+        }
         assert!(
             registry
-                .source_for_start("/s/1", "org.example.App")
+                .reserve_start(&format!("/s/{MAX_LIVE_CASTS}"), "org.example.App")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn host_applications_with_an_empty_frontend_app_id_are_supported() {
+        let mut registry = SessionRegistry::default();
+        registry.insert("/s/host", "").unwrap();
         registry
-            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor)
+            .mark_sources_selected("/s/host", "", CastSource::Monitor, 0)
             .unwrap();
         assert_eq!(
-            registry.source_for_start("/s/1", "org.example.App"),
-            Ok(CastSource::Monitor)
+            registry.reserve_start("/s/host", ""),
+            Ok((CastSource::Monitor, 0))
         );
+    }
+
+    #[test]
+    fn start_requires_selected_sources_and_single_use() {
+        let mut registry = registry_with("/s/1");
+        assert!(registry.reserve_start("/s/1", "org.example.App").is_err());
+        registry
+            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
+            .unwrap();
+        assert_eq!(
+            registry.reserve_start("/s/1", "org.example.App"),
+            Ok((CastSource::Monitor, 0))
+        );
+        registry.clear_start("/s/1");
+        assert!(registry.reserve_start("/s/1", "org.example.Other").is_err());
         assert!(
             registry
-                .source_for_start("/s/1", "org.example.Other")
-                .is_err()
-        );
-        assert!(
-            registry
-                .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor)
+                .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
                 .is_err()
         );
 
         let (stop, _read) = UnixStream::pair().unwrap();
         let thread = std::thread::spawn(|| {});
-        registry.mark_started("/s/1", stop, thread);
-        assert!(
-            registry
-                .source_for_start("/s/1", "org.example.App")
-                .is_err()
-        );
+        registry.reserve_start("/s/1", "org.example.App").unwrap();
+        registry.mark_started("/s/1", stop, thread).unwrap();
+        assert!(registry.reserve_start("/s/1", "org.example.App").is_err());
     }
 
     #[test]
     fn remove_stops_and_joins_the_cast() {
         let mut registry = registry_with("/s/1");
         registry
-            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor)
+            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
             .unwrap();
         let (stop, read) = UnixStream::pair().unwrap();
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -226,9 +304,10 @@ mod tests {
             let _ = (&read).read(&mut byte);
             thread_flag.store(true, std::sync::atomic::Ordering::Release);
         });
-        registry.mark_started("/s/1", stop, thread);
+        registry.reserve_start("/s/1", "org.example.App").unwrap();
+        registry.mark_started("/s/1", stop, thread).unwrap();
         let session = registry.remove("/s/1").expect("session was live");
-        drop(session);
+        stop_cast(session);
         assert!(flag.load(std::sync::atomic::Ordering::Acquire));
         assert!(!registry.contains("/s/1"));
     }

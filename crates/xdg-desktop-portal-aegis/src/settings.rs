@@ -318,12 +318,11 @@ pub(crate) fn spawn_watcher(
     conn: zbus::blocking::Connection,
     socket: PathBuf,
     store: SettingsStore,
-) {
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aegis-portal-settings".to_owned())
         .spawn(move || watch_loop(conn, socket, store))
         .map(|_| ())
-        .unwrap_or_else(|error| log::warn!("portal: cannot spawn settings watcher: {error}"));
 }
 
 /// Bound the initial IPC query before the D-Bus name is acquired, preventing

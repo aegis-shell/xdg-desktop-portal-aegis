@@ -13,7 +13,7 @@ packages must express an exact dependency on the Aegis version in this
 table. A local path patch is development state and does not change release
 compatibility.
 
-The unreleased FileChooser process-boundary work is coordinated with Aegis
-IPC protocol 20. It does not change the published `v0.0.1` mapping; the next
-Portal release must pin the Aegis tag that publishes protocol 20 before that
-release is cut.
+The current unreleased production-hardening work continues to use Aegis
+`v0.0.9`, whose IPC protocol version is 19. The FileChooser process boundary
+does not add a private Aegis file-picking operation: the backend and its
+one-shot GTK process own that resource flow.

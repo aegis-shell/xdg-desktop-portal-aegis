@@ -1,8 +1,11 @@
-//! `org.freedesktop.impl.portal.Email` v2: compose-email requests.
+//! `org.freedesktop.impl.portal.Email`: compose-email requests.
 //!
-//! `ComposeEmail` stages any attachment fds into the portal cache directory
-//! (they are pipe ends whose contents vanish with the call) and hands the
-//! message to the session's preferred mail client through `xdg-email`
+//! The portal frontend resolves public-API attachment fds into local
+//! `file://` URIs before calling this backend. Stable frontend releases also
+//! pass absolute local paths for host callers when the document portal is
+//! unavailable, so both safe local representations are accepted.
+//! `ComposeEmail` validates and decodes them, then hands the message to the session's preferred
+//! mail client through `xdg-email`
 //! (`--cc`/`--bcc`/`--subject`/`--body`/`--attach`; the recipient list goes
 //! as a `mailto:` URI). The hand-off is fire-and-forget: the mail client
 //! owns the compose window from there. `AEGIS_PORTAL_MAILER` overrides the
@@ -15,18 +18,21 @@
 //! 2 other error.
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::os::fd::AsFd;
+use std::process::Child;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use zbus::zvariant::{Fd, ObjectPath, Value};
+use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
 use aegis_portal_runtime::{PortalResponse, RequestTracker};
 
-/// The served interface version: 2 added `activation_token` (accepted and
-/// ignored — the mail client is not portal-activated).
-pub(crate) const EMAIL_VERSION: u32 = 2;
+const MAX_ACTIVE_MAILERS: usize = 32;
+const MAX_RECIPIENTS: usize = 512;
+const MAX_ATTACHMENTS: usize = 128;
+const MAX_MAILER_ARGUMENT_BYTES: usize = 256 * 1024;
+static ACTIVE_MAILERS: AtomicUsize = AtomicUsize::new(0);
 
 /// The served email interface.
 pub(crate) struct EmailIface {
@@ -53,11 +59,6 @@ impl EmailIface {
         aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
         response
     }
-
-    #[zbus(property, name = "version")]
-    fn version(&self) -> u32 {
-        EMAIL_VERSION
-    }
 }
 
 /// Build the mailer invocation and spawn it. Split from the zbus method so
@@ -72,27 +73,128 @@ fn compose(
         return Ok((1, HashMap::new()));
     }
 
-    let mut parsed = ParsedOptions::from(options);
-    let attachments = stage_attachments(std::mem::take(&mut parsed.attachments));
-    let argv = mailer_argv(&parsed, &attachments);
+    let parsed = match ParsedOptions::from(options) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            log::warn!("portal: rejecting ComposeEmail for '{app_id}': {error}");
+            return Ok((2, HashMap::new()));
+        }
+    };
+    let argv = mailer_argv(&parsed);
 
     let program = mailer_command();
     log::info!(
         "portal: ComposeEmail for '{app_id}' → {program} ({} attachment(s), {} arg(s))",
-        attachments.len(),
+        parsed.attachments.len(),
         argv.len()
     );
-    match std::process::Command::new(&program).args(&argv).spawn() {
-        // The mail client runs on its own; reaping it later would need a
-        // reaper thread, so detach by simply dropping the handle — the
-        // process reparents to init when short-lived, and a mail composer
-        // outliving the portal is fine.
-        Ok(_) => Ok((0, HashMap::new())),
+    let mut command = std::process::Command::new(&program);
+    command.args(&argv);
+    if let Some(token) = &parsed.activation_token {
+        command.env("XDG_ACTIVATION_TOKEN", token);
+    }
+    if ACTIVE_MAILERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_ACTIVE_MAILERS).then_some(active + 1)
+        })
+        .is_err()
+    {
+        log::warn!("portal: refusing ComposeEmail request: mailer limit reached");
+        return Ok((2, HashMap::new()));
+    }
+    match command.spawn() {
+        Ok(child) => match hand_to_reaper(child) {
+            Ok(()) => Ok((0, HashMap::new())),
+            Err(error) => {
+                log::warn!("portal: could not supervise {program}: {error}");
+                Ok((2, HashMap::new()))
+            }
+        },
         Err(error) => {
+            release_mailer_slot();
             log::warn!("portal: could not spawn {program}: {error}");
             Ok((2, HashMap::new()))
         }
     }
+}
+
+/// Keep a single process-reaper thread for all mailer launches. Dropping a
+/// live `Child` does not reap it; a long-lived D-Bus backend would otherwise
+/// accumulate zombies after repeated ComposeEmail calls.
+fn hand_to_reaper(child: Child) -> Result<(), String> {
+    use std::sync::OnceLock;
+
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Child>>> = OnceLock::new();
+    let sender = REAPER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Child>();
+        match std::thread::Builder::new()
+            .name("aegis-mailer-reaper".to_owned())
+            .spawn(move || {
+                let mut children = Vec::new();
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(child) => children.push(child),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            for mut child in children {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                release_mailer_slot();
+                            }
+                            return;
+                        }
+                    }
+                    let mut index = 0;
+                    while index < children.len() {
+                        match children[index].try_wait() {
+                            Ok(Some(_)) => {
+                                let mut child = children.swap_remove(index);
+                                // `try_wait` above reaped and cached the
+                                // status; `wait` consumes that cached result
+                                // and makes the lifecycle explicit.
+                                if let Err(error) = child.wait() {
+                                    log::warn!("portal: could not finalize mailer: {error}");
+                                }
+                                release_mailer_slot();
+                            }
+                            Ok(None) => index += 1,
+                            Err(error) => {
+                                log::warn!("portal: could not reap mailer process: {error}");
+                                let mut child = children.swap_remove(index);
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                release_mailer_slot();
+                            }
+                        }
+                    }
+                }
+            }) {
+            Ok(_) => Some(sender),
+            Err(error) => {
+                log::error!("portal: could not start mailer reaper: {error}");
+                None
+            }
+        }
+    });
+
+    let Some(sender) = sender else {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        release_mailer_slot();
+        return Err("mailer reaper is unavailable".to_owned());
+    };
+    sender.send(child).map_err(|error| {
+        let mut child = error.0;
+        let _ = child.kill();
+        let _ = child.wait();
+        release_mailer_slot();
+        "mailer reaper stopped unexpectedly".to_owned()
+    })
+}
+
+fn release_mailer_slot() {
+    ACTIVE_MAILERS.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// The mailer command: `xdg-email` unless overridden (tests point this at a
@@ -102,17 +204,19 @@ fn mailer_command() -> String {
 }
 
 /// Options parsed out of the `a{sv}` argument.
+#[derive(Debug)]
 struct ParsedOptions {
     addresses: Vec<String>,
     cc: Vec<String>,
     bcc: Vec<String>,
     subject: Option<String>,
     body: Option<String>,
-    attachments: Vec<Vec<u8>>,
+    attachments: Vec<std::path::PathBuf>,
+    activation_token: Option<String>,
 }
 
 impl ParsedOptions {
-    fn from(options: &HashMap<String, Value<'_>>) -> Self {
+    fn from(options: &HashMap<String, Value<'_>>) -> Result<Self, String> {
         let string_list = |key: &str| {
             options
                 .get(key)
@@ -126,24 +230,23 @@ impl ParsedOptions {
         {
             addresses.push(address);
         }
-        // Attachment fds are read eagerly: their contents are only valid for
-        // the duration of the call.
-        let attachments = options
-            .get("attachment_fds")
-            .and_then(|value| Vec::<Fd>::try_from(value.clone()).ok())
-            .unwrap_or_default()
+        let attachment_uris = match options.get("attachments") {
+            Some(value) => Vec::<String>::try_from(value.clone())
+                .map_err(|_| "the attachments option must be an array of URI strings")?,
+            None => Vec::new(),
+        };
+        let attachments = attachment_uris
             .into_iter()
-            .map(|fd| {
-                let mut bytes = Vec::new();
-                if let Ok(owned) = fd.as_fd().try_clone_to_owned() {
-                    let _ = std::fs::File::from(owned).read_to_end(&mut bytes);
-                }
-                bytes
+            .map(|attachment| {
+                attachment_path(&attachment).ok_or_else(|| {
+                    format!(
+                        "attachment is not a valid local file URI or absolute path: {attachment}"
+                    )
+                })
             })
-            .filter(|bytes| !bytes.is_empty())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
-        ParsedOptions {
+        let parsed = ParsedOptions {
             addresses,
             cc: string_list("cc"),
             bcc: string_list("bcc"),
@@ -154,66 +257,97 @@ impl ParsedOptions {
                 .get("body")
                 .and_then(|value| String::try_from(value).ok()),
             attachments,
+            activation_token: options
+                .get("activation_token")
+                .and_then(|value| String::try_from(value).ok()),
+        };
+        parsed.validate_limits()?;
+        Ok(parsed)
+    }
+
+    fn validate_limits(&self) -> Result<(), String> {
+        let recipients = self
+            .addresses
+            .len()
+            .checked_add(self.cc.len())
+            .and_then(|count| count.checked_add(self.bcc.len()))
+            .ok_or_else(|| "recipient count overflow".to_owned())?;
+        if recipients > MAX_RECIPIENTS {
+            return Err(format!(
+                "recipient count exceeds the {MAX_RECIPIENTS}-entry limit"
+            ));
         }
+        if self.attachments.len() > MAX_ATTACHMENTS {
+            return Err(format!(
+                "attachment count exceeds the {MAX_ATTACHMENTS}-entry limit"
+            ));
+        }
+
+        let mut total = 0_usize;
+        let mut add = |length: usize| -> Result<(), String> {
+            total = total
+                .checked_add(length)
+                .ok_or_else(|| "mailer argument size overflow".to_owned())?;
+            if total > MAX_MAILER_ARGUMENT_BYTES {
+                return Err(format!(
+                    "mailer arguments exceed the {MAX_MAILER_ARGUMENT_BYTES}-byte limit"
+                ));
+            }
+            Ok(())
+        };
+        for value in self.addresses.iter().chain(&self.cc).chain(&self.bcc) {
+            add(value.len())?;
+        }
+        for value in [&self.subject, &self.body, &self.activation_token]
+            .into_iter()
+            .flatten()
+        {
+            add(value.len())?;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        for attachment in &self.attachments {
+            add(attachment.as_os_str().as_bytes().len())?;
+        }
+        Ok(())
     }
 }
 
-/// Write attachment payloads to the cache directory so the mail client can
-/// open real paths; returns the staged paths. Failures are logged and the
-/// message goes without that attachment rather than failing outright.
-fn stage_attachments(attachments: Vec<Vec<u8>>) -> Vec<std::path::PathBuf> {
-    let Some(dir) = files::cache_dir() else {
-        if !attachments.is_empty() {
-            log::warn!("portal: dropping attachment(s): no cache directory available");
-        }
-        return Vec::new();
-    };
-    stage_attachments_in(&dir, attachments)
-}
-
-/// The filesystem half of [`stage_attachments`], split out so tests can
-/// point it at a temporary directory (the cache dir is environment-global).
-fn stage_attachments_in(
-    dir: &std::path::Path,
-    attachments: Vec<Vec<u8>>,
-) -> Vec<std::path::PathBuf> {
-    attachments
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, bytes)| {
-            let path = files::write_blob(dir, &format!("attachment{index}"), &bytes)
-                .map_err(|error| log::warn!("portal: could not stage attachment {index}: {error}"))
-                .ok()?;
-            Some(path)
-        })
-        .collect()
+/// Decode the documented `file://` backend representation while accepting
+/// the absolute-path compatibility form emitted by xdg-desktop-portal 1.20
+/// for unsandboxed callers without a document portal mount.
+fn attachment_path(attachment: &str) -> Option<std::path::PathBuf> {
+    if attachment.starts_with("file://") {
+        return files::path_from_file_uri(attachment);
+    }
+    let path = std::path::PathBuf::from(attachment);
+    path.is_absolute().then_some(path)
 }
 
 /// The mailer argument vector: recipients as a `mailto:` URI, everything
 /// else as xdg-email flags.
-fn mailer_argv(parsed: &ParsedOptions, attachments: &[std::path::PathBuf]) -> Vec<String> {
+fn mailer_argv(parsed: &ParsedOptions) -> Vec<std::ffi::OsString> {
     let mut argv = Vec::new();
     for address in &parsed.cc {
-        argv.push("--cc".to_string());
-        argv.push(address.clone());
+        argv.push("--cc".into());
+        argv.push(address.as_str().into());
     }
     for address in &parsed.bcc {
-        argv.push("--bcc".to_string());
-        argv.push(address.clone());
+        argv.push("--bcc".into());
+        argv.push(address.as_str().into());
     }
     if let Some(subject) = &parsed.subject {
-        argv.push("--subject".to_string());
-        argv.push(subject.clone());
+        argv.push("--subject".into());
+        argv.push(subject.as_str().into());
     }
     if let Some(body) = &parsed.body {
-        argv.push("--body".to_string());
-        argv.push(body.clone());
+        argv.push("--body".into());
+        argv.push(body.as_str().into());
     }
-    for path in attachments {
-        argv.push("--attach".to_string());
-        argv.push(path.to_string_lossy().into_owned());
+    for path in &parsed.attachments {
+        argv.push("--attach".into());
+        argv.push(path.as_os_str().to_owned());
     }
-    argv.push(format!("mailto:{}", parsed.addresses.join(",")));
+    argv.push(format!("mailto:{}", parsed.addresses.join(",")).into());
     argv
 }
 
@@ -229,11 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn version_is_2() {
-        assert_eq!(EMAIL_VERSION, 2);
-    }
-
-    #[test]
     fn address_and_addresses_merge_into_the_mailto_uri() {
         let parsed = ParsedOptions::from(&options(&[
             ("address", Value::from("first@example.com")),
@@ -241,11 +370,12 @@ mod tests {
                 "addresses",
                 Value::from(vec!["second@example.com".to_string()]),
             ),
-        ]));
-        let argv = mailer_argv(&parsed, &[]);
+        ]))
+        .unwrap();
+        let argv = mailer_argv(&parsed);
         assert_eq!(
             argv.last().unwrap(),
-            "mailto:second@example.com,first@example.com"
+            std::ffi::OsStr::new("mailto:second@example.com,first@example.com")
         );
     }
 
@@ -256,11 +386,13 @@ mod tests {
             ("bcc", Value::from(vec!["blind@example.com".to_string()])),
             ("subject", Value::from("a subject")),
             ("body", Value::from("the body")),
-        ]));
-        let attachments = vec![std::path::PathBuf::from(
-            "/cache/xdg-desktop-portal-aegis/attachment0",
-        )];
-        let argv = mailer_argv(&parsed, &attachments);
+            (
+                "attachments",
+                Value::from(vec!["file:///documents/attachment%200".to_string()]),
+            ),
+        ]))
+        .unwrap();
+        let argv = mailer_argv(&parsed);
         let flag_value = |flag: &str| {
             let at = argv.iter().position(|arg| arg == flag).unwrap();
             argv[at + 1].clone()
@@ -269,28 +401,57 @@ mod tests {
         assert_eq!(flag_value("--bcc"), "blind@example.com");
         assert_eq!(flag_value("--subject"), "a subject");
         assert_eq!(flag_value("--body"), "the body");
-        assert_eq!(
-            flag_value("--attach"),
-            "/cache/xdg-desktop-portal-aegis/attachment0"
-        );
+        assert_eq!(flag_value("--attach"), "/documents/attachment 0");
     }
 
     #[test]
     fn empty_options_still_produce_a_mailto_uri() {
-        let parsed = ParsedOptions::from(&HashMap::new());
-        let argv = mailer_argv(&parsed, &[]);
-        assert_eq!(argv.as_slice(), ["mailto:"]);
+        let parsed = ParsedOptions::from(&HashMap::new()).unwrap();
+        let argv = mailer_argv(&parsed);
+        assert_eq!(argv.as_slice(), [std::ffi::OsString::from("mailto:")]);
     }
 
     #[test]
-    fn staging_writes_payloads_into_the_cache_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "xdg-desktop-portal-aegis-email-test-{}",
-            std::process::id()
-        ));
-        let staged = stage_attachments_in(&dir, vec![b"payload".to_vec()]);
-        assert_eq!(staged.len(), 1);
-        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"payload");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn invalid_or_remote_attachment_uri_is_rejected() {
+        for uri in [
+            "https://example.com/file",
+            "file://server/share/file",
+            "relative",
+        ] {
+            let error = ParsedOptions::from(&options(&[(
+                "attachments",
+                Value::from(vec![uri.to_string()]),
+            )]))
+            .unwrap_err();
+            assert!(error.contains("valid local file URI or absolute path"));
+        }
+    }
+
+    #[test]
+    fn frontend_compatibility_absolute_attachment_path_is_accepted() {
+        let parsed = ParsedOptions::from(&options(&[(
+            "attachments",
+            Value::from(vec!["/tmp/frontend attachment.bin".to_string()]),
+        )]))
+        .unwrap();
+        assert_eq!(
+            parsed.attachments,
+            [std::path::PathBuf::from("/tmp/frontend attachment.bin")]
+        );
+    }
+
+    #[test]
+    fn oversized_mailer_payload_and_attachment_flood_are_rejected() {
+        let oversized = ParsedOptions::from(&options(&[(
+            "body",
+            Value::from("x".repeat(MAX_MAILER_ARGUMENT_BYTES + 1)),
+        )]));
+        assert!(oversized.is_err());
+
+        let attachments: Vec<String> = (0..=MAX_ATTACHMENTS)
+            .map(|index| format!("file:///tmp/attachment-{index}"))
+            .collect();
+        let flooded = ParsedOptions::from(&options(&[("attachments", Value::from(attachments))]));
+        assert!(flooded.is_err());
     }
 }

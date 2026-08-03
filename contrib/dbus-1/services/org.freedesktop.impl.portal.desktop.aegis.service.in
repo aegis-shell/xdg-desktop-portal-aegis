@@ -1,3 +1,3 @@
 [D-BUS Service]
 Name=org.freedesktop.impl.portal.desktop.aegis
-Exec=/usr/lib/xdg-desktop-portal-aegis
+Exec=@libexecdir@/xdg-desktop-portal-aegis

@@ -7,3 +7,5 @@
   documentation.
 - Record durable Portal architecture decisions in the
   [ADR index](../adr/index.md).
+- Run the [Release Checklist](release-checklist.md) before packaging a
+  production build.

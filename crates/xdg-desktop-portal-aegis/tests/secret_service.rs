@@ -1,44 +1,88 @@
-//! End-to-end smoke test for the secret stack: spawns the real
-//! `xdg-desktop-portal-aegis` daemon on a private session bus (see `tests/common/`) and
-//! exercises the transitional `org.freedesktop.secrets` API plus the native
-//! `org.freedesktop.impl.portal.Secret.RetrieveSecret` fd transfer. The
-//! private bus is hermetic: the live session bus is never touched.
-//!
-//! ```sh
-//! cargo test -p xdg-desktop-portal-aegis --test secret_service
-//! ```
-//!
-//! Without `dbus-daemon` available the test skips cleanly.
+//! End-to-end smoke test for the native Secret portal. The test starts the
+//! real backend on a private session bus, verifies that the incomplete
+//! Secret Service compatibility API is not exposed, and exercises fd-based
+//! secret delivery.
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use zbus::blocking::Proxy;
 use zbus::zvariant::{Fd, ObjectPath, OwnedObjectPath, Value};
 
 mod common;
-use common::{KillOnDrop, private_bus, spawn_daemon, temp_dir, wait_for_name};
+use common::{
+    KillOnDrop, daemon_command, e2e_required, pipe_pair, private_bus, read_all_with_timeout,
+    spawn_daemon, temp_dir, wait_for_name,
+};
 
-const SERVICE: &str = "org.freedesktop.secrets";
-const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 const PORTAL: &str = "org.freedesktop.impl.portal.desktop.aegis";
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 
-/// Mirror of the daemon's wire struct (compat `SecretStruct`).
-#[derive(serde::Deserialize, zbus::zvariant::Type, Debug)]
-#[allow(unused)]
-struct SecretStruct {
-    session: OwnedObjectPath,
-    parameters: Vec<u8>,
-    value: Vec<u8>,
-    content_type: String,
+#[test]
+fn unsafe_secret_storage_prevents_name_acquisition() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::time::Instant;
+
+    let Some(bus) = private_bus() else {
+        eprintln!("unsafe secret storage test: dbus-daemon unavailable, skipping");
+        return;
+    };
+    let conn = bus.connect();
+    let root = temp_dir("unsafe-secret-startup");
+    let data_dir = root.join("data");
+    let runtime_dir = root.join("runtime");
+    let secrets_dir = data_dir.join("aegis/secrets");
+    std::fs::create_dir_all(&secrets_dir).expect("create secret fixture");
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime fixture");
+    std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("make secret fixture private");
+    let key_target = root.join("key-target");
+    std::fs::write(&key_target, "00".repeat(32)).expect("write key target");
+    std::fs::set_permissions(&key_target, std::fs::Permissions::from_mode(0o600))
+        .expect("make key target private");
+    symlink(&key_target, secrets_dir.join("vault.key")).expect("create unsafe key symlink");
+
+    let log_path = root.join("backend.log");
+    let mut command = daemon_command(&bus, &data_dir, &runtime_dir);
+    command.stderr(Stdio::from(
+        std::fs::File::create(&log_path).expect("create backend log"),
+    ));
+    let mut backend = command.spawn().expect("spawn backend");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = backend.try_wait().expect("poll backend") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend did not fail closed for unsafe Secret storage"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success(), "unsafe Secret storage must be fatal");
+
+    let fdo = Proxy::new(
+        &conn,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .expect("D-Bus proxy");
+    let owned: bool = fdo.call("NameHasOwner", &(PORTAL,)).expect("NameHasOwner");
+    assert!(!owned, "a failed backend must never acquire its bus name");
+    let log = std::fs::read_to_string(&log_path).expect("read backend log");
+    assert!(
+        log.contains("secret vault setup failed"),
+        "startup error must identify the failed contract: {log}"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
-/// The HKDF-SHA256 portal-secret derivation, duplicated from
-/// `secret::portal` (the wire contract under test).
-fn expected_portal_secret(data_dir: &std::path::Path) -> [u8; 32] {
+/// The HKDF-SHA256 portal-secret derivation, duplicated from the
+/// implementation so this verifies the wire contract independently.
+fn expected_portal_secret(data_dir: &Path, app_id: &str) -> [u8; 32] {
     let hex = std::fs::read_to_string(data_dir.join("aegis/secrets/vault.key"))
         .expect("daemon must create vault.key");
     let hex = hex.trim();
@@ -49,43 +93,16 @@ fn expected_portal_secret(data_dir: &std::path::Path) -> [u8; 32] {
     }
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &key);
     let mut out = [0u8; 32];
-    hk.expand(b"aegis.portal.Secret/v1", &mut out).unwrap();
+    let mut info = b"aegis.portal.Secret/v1\0".to_vec();
+    info.extend_from_slice(app_id.as_bytes());
+    hk.expand(&info, &mut out).unwrap();
     out
 }
 
-/// Read a pipe to EOF with a timeout guard (the daemon closes its write
-/// end after delivering the secret).
-fn read_all_with_timeout(mut file: std::fs::File, timeout: Duration) -> Vec<u8> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    rx.recv_timeout(timeout)
-        .expect("the portal secret must arrive within the timeout")
-}
-
-/// A plain pipe pair, the fd shape real RetrieveSecret clients (Chrome,
-/// libportal) pass — NOT a socket. Guards the regression where the backend
-/// used the socket-only `shutdown(2)` and failed ENOTSOCK on pipes.
-fn pipe_pair() -> (std::fs::File, OwnedFd) {
-    let mut fds = [-1; 2];
-    // SAFETY: fds is a valid out-array; on success both ends are owned fds.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
-    // SAFETY: each raw fd is wrapped exactly once.
-    unsafe {
-        (
-            std::fs::File::from_raw_fd(fds[0]),
-            OwnedFd::from_raw_fd(fds[1]),
-        )
-    }
-}
-
 #[test]
-fn secret_service_end_to_end() {
+fn native_secret_portal_end_to_end() {
     let Some(bus) = private_bus() else {
-        eprintln!("secret_service_end_to_end: no dbus-daemon, skipping");
+        eprintln!("native_secret_portal_end_to_end: no dbus-daemon, skipping");
         return;
     };
     let conn = bus.connect();
@@ -93,113 +110,30 @@ fn secret_service_end_to_end() {
     let data_dir = temp_dir("data");
     let runtime_dir = temp_dir("runtime");
     let _daemon = KillOnDrop(spawn_daemon(&bus, &data_dir, &runtime_dir));
-
     wait_for_name(&conn, PORTAL);
-    wait_for_name(&conn, SERVICE);
 
-    // -- compat layer: org.freedesktop.Secret.Service ----------------------
-    let service = Proxy::new(
+    let fdo = Proxy::new(
         &conn,
-        SERVICE,
-        SERVICE_PATH,
-        "org.freedesktop.Secret.Service",
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
     )
-    .expect("service proxy");
-
-    let login: OwnedObjectPath = service
-        .call("ReadAlias", &("default",))
-        .expect("ReadAlias default");
-    assert_eq!(
-        login.as_str(),
-        "/org/freedesktop/secrets/collection/login",
-        "the default alias must resolve to the login collection"
-    );
-
-    let (_output, session_path): (zbus::zvariant::OwnedValue, OwnedObjectPath) = service
-        .call("OpenSession", &("plain", Value::from("")))
-        .expect("OpenSession plain");
-
-    // Store a secret through the plain session.
-    let mut attributes = HashMap::new();
-    attributes.insert("purpose".to_string(), "smoke".to_string());
-    let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-    properties.insert(
-        "org.freedesktop.Secret.Item.Label",
-        Value::from("smoke item"),
-    );
-    properties.insert(
-        "org.freedesktop.Secret.Item.Attributes",
-        Value::from(attributes.clone()),
-    );
-    let collection = Proxy::new(
-        &conn,
-        SERVICE,
-        login.as_str(),
-        "org.freedesktop.Secret.Collection",
-    )
-    .expect("collection proxy");
-    let (item_path, _): (OwnedObjectPath, OwnedObjectPath) = collection
-        .call(
-            "CreateItem",
-            &(
-                properties,
-                (
-                    session_path.clone(),
-                    Vec::<u8>::new(),
-                    b"s3cr3t".to_vec(),
-                    "text/plain".to_string(),
-                ),
-                false,
-            ),
-        )
-        .expect("CreateItem");
-
-    // Read it back through both Item.GetSecret and Service.GetSecrets.
-    let item = Proxy::new(
-        &conn,
-        SERVICE,
-        item_path.as_str(),
-        "org.freedesktop.Secret.Item",
-    )
-    .expect("item proxy");
-    let (secret,): (SecretStruct,) = item
-        .call("GetSecret", &(session_path.clone(),))
-        .expect("GetSecret");
-    assert_eq!(secret.value, b"s3cr3t");
-
-    let secrets: HashMap<OwnedObjectPath, SecretStruct> = service
-        .call(
-            "GetSecrets",
-            &(vec![item_path.clone()], session_path.clone()),
-        )
-        .expect("GetSecrets");
-    assert_eq!(secrets[&item_path].value, b"s3cr3t");
-
-    let (matched, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service
-        .call("SearchItems", &(attributes,))
-        .expect("SearchItems");
-    assert!(locked.is_empty());
-    assert!(matched.contains(&item_path));
-
-    // Item.Delete drops the object from the bus, not just the search index.
-    let _: OwnedObjectPath = item.call("Delete", &()).expect("Delete item");
+    .expect("D-Bus proxy");
+    let compat_owned: bool = fdo
+        .call("NameHasOwner", &("org.freedesktop.secrets",))
+        .expect("NameHasOwner");
     assert!(
-        item.call("GetSecret", &(session_path.clone(),))
-            .map(|_: (SecretStruct,)| ())
-            .is_err(),
-        "a deleted item must leave the bus"
+        !compat_owned,
+        "the backend must not claim an incomplete Secret Service API"
     );
-    let mut remaining = HashMap::new();
-    remaining.insert("purpose".to_string(), "smoke".to_string());
-    let (matched, _): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = service
-        .call("SearchItems", &(remaining,))
-        .expect("SearchItems after Delete");
-    assert!(!matched.contains(&item_path));
 
-    // -- native interface: org.freedesktop.impl.portal.Secret --------------
-    // Every backend interface must serve the spec's lowercase `version`
-    // property; xdg-desktop-portal skips interfaces whose version it cannot
-    // read (zbus would otherwise auto-PascalCase it to `Version`).
+    let compat_service_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contrib/dbus-1/services/org.freedesktop.secrets.service");
+    assert!(
+        !compat_service_file.exists(),
+        "packaging must not activate the removed compatibility API"
+    );
+
     let portal = Proxy::new(
         &conn,
         PORTAL,
@@ -209,19 +143,19 @@ fn secret_service_end_to_end() {
     .expect("portal secret proxy");
     let version: u32 = portal.get_property("version").expect("version property");
     assert_eq!(version, 1);
+
     for (interface, expected) in [
         ("org.freedesktop.impl.portal.Settings", 1),
-        ("org.freedesktop.impl.portal.Screenshot", 2),
-        ("org.freedesktop.impl.portal.ScreenCast", 3),
+        ("org.freedesktop.impl.portal.Screenshot", 3),
+        ("org.freedesktop.impl.portal.ScreenCast", 6),
     ] {
         let proxy = Proxy::new(&conn, PORTAL, DESKTOP_PATH, interface).expect("backend proxy");
         let version: u32 = proxy
             .get_property("version")
-            .unwrap_or_else(|e| panic!("{interface} must serve a lowercase version property: {e}"));
+            .unwrap_or_else(|error| panic!("{interface} must expose version: {error}"));
         assert_eq!(version, expected, "{interface} version");
     }
 
-    // Lockdown: stateless, every restriction flag permissive.
     let lockdown = Proxy::new(
         &conn,
         PORTAL,
@@ -240,9 +174,49 @@ fn secret_service_end_to_end() {
     ] {
         let restricted: bool = lockdown
             .get_property(property)
-            .unwrap_or_else(|e| panic!("Lockdown must serve {property}: {e}"));
+            .unwrap_or_else(|error| panic!("Lockdown must expose {property}: {error}"));
         assert!(!restricted, "Lockdown {property} must be permissive");
     }
+    lockdown
+        .set_property("disable-printing", true)
+        .expect("Lockdown property must be writable");
+    // Read through a fresh proxy so this checks the service rather than the
+    // first proxy's property cache racing the PropertiesChanged signal.
+    let lockdown_after_set = Proxy::new(
+        &conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.impl.portal.Lockdown",
+    )
+    .expect("fresh lockdown proxy");
+    let printing_disabled: bool = lockdown_after_set
+        .get_property("disable-printing")
+        .expect("updated Lockdown property");
+    assert!(printing_disabled);
+
+    let introspectable = Proxy::new(
+        &conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.DBus.Introspectable",
+    )
+    .expect("introspection proxy");
+    let xml: String = introspectable
+        .call("Introspect", &())
+        .expect("backend introspection");
+    for interface in ["Account", "Email", "FileChooser"] {
+        let section = interface_section(&xml, interface);
+        assert!(
+            !section.contains("property name=\"version\""),
+            "{interface} backend ABI does not define a version property"
+        );
+    }
+    let lockdown_xml = interface_section(&xml, "Lockdown");
+    assert_eq!(
+        lockdown_xml.matches("access=\"readwrite\"").count(),
+        7,
+        "all Lockdown properties must be read-write"
+    );
 
     let (read_end, write_end) = pipe_pair();
     let fd: Fd<'_> = Fd::from(write_end);
@@ -264,10 +238,174 @@ fn secret_service_end_to_end() {
     let delivered = read_all_with_timeout(read_end, Duration::from_secs(5));
     assert_eq!(
         delivered.as_slice(),
-        &expected_portal_secret(&data_dir),
+        &expected_portal_secret(&data_dir, "dev.aegis.smoke"),
         "the pipe must deliver HKDF-SHA256(vault key, aegis.portal.Secret/v1)"
     );
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&runtime_dir);
+}
+
+fn interface_section<'a>(xml: &'a str, short_name: &str) -> &'a str {
+    let marker = format!("<interface name=\"org.freedesktop.impl.portal.{short_name}\">");
+    let start = xml
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing {short_name} introspection"));
+    let rest = &xml[start..];
+    let end = rest
+        .find("</interface>")
+        .expect("interface has a closing element")
+        + "</interface>".len();
+    &rest[..end]
+}
+
+#[test]
+fn public_frontend_delivers_the_native_secret() {
+    let frontend = [
+        "/usr/libexec/xdg-desktop-portal",
+        "/usr/lib/xdg-desktop-portal",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file());
+    let Some(frontend) = frontend else {
+        assert!(
+            !e2e_required(),
+            "required xdg-desktop-portal frontend is unavailable"
+        );
+        eprintln!("public Secret test: xdg-desktop-portal unavailable, skipping");
+        return;
+    };
+    let Some(bus) = private_bus() else {
+        eprintln!("public Secret test: dbus-daemon unavailable, skipping");
+        return;
+    };
+    let conn = bus.connect();
+
+    let root = temp_dir("secret-frontend");
+    let backend_data = root.join("backend-data");
+    let frontend_data = root.join("frontend-data");
+    let portal_data = root.join("portal-data");
+    let config_home = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let portal_dir = portal_data.join("xdg-desktop-portal/portals");
+    let config_dir = config_home.join("xdg-desktop-portal");
+    for directory in [
+        &backend_data,
+        &frontend_data,
+        &runtime_dir,
+        &portal_dir,
+        &config_dir,
+    ] {
+        std::fs::create_dir_all(directory).expect("create public Secret fixture");
+    }
+    std::fs::write(
+        portal_dir.join("aegis.portal"),
+        include_str!("../../../contrib/xdg-desktop-portal/portals/aegis.portal"),
+    )
+    .expect("stage portal metadata");
+    std::fs::write(
+        // 1.18 only consults the desktop-specific filename when
+        // XDG_CURRENT_DESKTOP is non-empty. Mirror the installed package.
+        config_dir.join("aegis-portals.conf"),
+        "[preferred]\ndefault=aegis\norg.freedesktop.impl.portal.Secret=aegis\n",
+    )
+    .expect("stage portal routing");
+
+    let backend_log = root.join("backend.log");
+    let mut backend = Command::new(env!("CARGO_BIN_EXE_xdg-desktop-portal-aegis"));
+    backend
+        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
+        .env("XDG_DATA_HOME", &backend_data)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&backend_log).expect("backend log"),
+        ));
+    let _backend = KillOnDrop(backend.spawn().expect("spawn Aegis backend"));
+    wait_for_name(&conn, PORTAL);
+
+    let frontend_log = root.join("frontend.log");
+    let mut frontend_command = Command::new(frontend);
+    frontend_command
+        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
+        .env("XDG_CURRENT_DESKTOP", "aegis")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &frontend_data)
+        // xdg-desktop-portal 1.18 discovers test backends through this
+        // dedicated override rather than XDG_DATA_DIRS.
+        .env("XDG_DESKTOP_PORTAL_DIR", &portal_dir)
+        .env(
+            "XDG_DATA_DIRS",
+            format!("{}:/usr/local/share:/usr/share", portal_data.display()),
+        )
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&frontend_log).expect("frontend log"),
+        ));
+    let _frontend = KillOnDrop(
+        frontend_command
+            .spawn()
+            .expect("spawn xdg-desktop-portal frontend"),
+    );
+    wait_for_name(&conn, "org.freedesktop.portal.Desktop");
+
+    let secret = Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        DESKTOP_PATH,
+        "org.freedesktop.portal.Secret",
+    )
+    .expect("public Secret proxy");
+    let token = "aegis_secret_frontend_1";
+    let sender = conn
+        .unique_name()
+        .expect("private bus connection has a unique name")
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let expected_handle = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+    let request = Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        expected_handle.as_str(),
+        "org.freedesktop.portal.Request",
+    )
+    .expect("public request proxy");
+    let mut responses = request
+        .receive_signal("Response")
+        .expect("subscribe Response");
+
+    let (read_end, write_end) = pipe_pair();
+    let fd: Fd<'_> = Fd::from(write_end);
+    let options = HashMap::from([("handle_token".to_owned(), Value::from(token))]);
+    let returned: OwnedObjectPath = secret
+        .call("RetrieveSecret", &(fd, options))
+        .unwrap_or_else(|error| {
+            let log = std::fs::read_to_string(&frontend_log).unwrap_or_default();
+            panic!("public RetrieveSecret failed: {error}\nfrontend log:\n{log}")
+        });
+    assert_eq!(returned.as_str(), expected_handle);
+    let response = responses.next().expect("portal must emit Response");
+    let (code, _results): (u32, HashMap<String, zbus::zvariant::OwnedValue>) =
+        response.body().deserialize().expect("Response body");
+    if code != 0 {
+        let backend_log = std::fs::read_to_string(&backend_log).unwrap_or_default();
+        let frontend_log = std::fs::read_to_string(&frontend_log).unwrap_or_default();
+        panic!(
+            "public RetrieveSecret returned {code}\nbackend log:\n{backend_log}\nfrontend log:\n{frontend_log}"
+        );
+    }
+    let delivered = read_all_with_timeout(read_end, Duration::from_secs(5));
+    // Host callers have an empty app id. Sandboxed callers are covered by
+    // the derivation unit test, which proves distinct IDs produce distinct
+    // keys without requiring a Flatpak installation in CI.
+    assert_eq!(
+        delivered.as_slice(),
+        &expected_portal_secret(&backend_data, "")
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }

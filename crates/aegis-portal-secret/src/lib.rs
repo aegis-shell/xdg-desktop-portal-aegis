@@ -1,60 +1,45 @@
-//! Secret storage for the aegis portal: an at-rest encrypted vault, the
-//! native `org.freedesktop.impl.portal.Secret` backend interface
-//! (`portal`), and a transitional `org.freedesktop.secrets` compatibility
-//! shim (`compat`).
+//! Native `org.freedesktop.impl.portal.Secret` storage for Aegis.
 //!
-//! All secret state lives behind ONE `std::sync::Mutex<SecretState>` shared
-//! by every served interface. Secret-service traffic is rare, so a single
-//! lock beats wssp's per-field lock soup. Interface methods lock, mutate,
-//! and drop the guard before any `.await` — the guard must never cross an
-//! await point (zbus dispatches methods on its async executor). Persisting
-//! (`sync_to_vault`) happens inside the same critical section as the
-//! mutation it belongs to.
+//! The public portal secret is derived from a private, encrypted vault key.
+//! Password-mode vaults can unlock from a one-shot PAM token or the
+//! compositor's masked prompt. This crate deliberately does not implement
+//! `org.freedesktop.secrets`; claiming that separate API without its full
+//! locking, alias, prompt, and collection semantics would be unsafe.
 
-mod compat;
 mod portal;
 mod vault;
 
-use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use aes::Aes128;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-use cbc::{Decryptor, Encryptor};
-use rand::RngCore;
-use rand::rngs::OsRng;
-use zbus::zvariant::OwnedObjectPath;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use vault::{CollectionData, ItemData, Vault, VaultData};
+use vault::{Vault, VaultData};
+
+const PAM_TOKEN_NAME: &str = "aegis-pam-token";
+const MAX_PAM_TOKEN_BYTES: u64 = 64 * 1024;
+const MAX_KEYFILE_BYTES: u64 = 1024;
+const MAX_PENDING_UNLOCKS: usize = 64;
 
 /// Result of asking the desktop shell for the vault password.
 pub enum PromptResponse {
-    /// The user confirmed a password. The secret crate wraps and zeroizes it
-    /// immediately after it crosses this boundary.
+    /// The user confirmed a password. This crate zeroizes it immediately
+    /// after it crosses the boundary.
     Secret(String),
     /// The user dismissed the prompt without submitting a password.
     Cancelled,
 }
 
 /// Narrow host capability required to unlock a password-protected vault.
-///
-/// The secret implementation deliberately knows nothing about Aegis IPC.
-/// The portal binary supplies that transport-specific adapter when it
-/// constructs [`SecretService`].
 pub trait SecretPrompter: Send + Sync + 'static {
     fn prompt_secret(&self, title: &str, reason: Option<&str>) -> Result<PromptResponse, String>;
 }
 
-/// The complete Secret backend linked into the
-/// `xdg-desktop-portal-aegis` process.
-///
-/// It owns one vault and one unlock coordinator shared by the native Secret
-/// portal and the transitional Secret Service compatibility API.
+/// Native Secret portal service and its shared unlock coordinator.
 pub struct SecretService {
     state: Arc<Mutex<SecretState>>,
     prompter: Arc<dyn SecretPrompter>,
@@ -67,8 +52,7 @@ impl SecretService {
         Ok(Self { state, prompter })
     }
 
-    /// Register `org.freedesktop.impl.portal.Secret` on the portal backend's
-    /// shared D-Bus connection and request tracker.
+    /// Register the native Secret backend interface.
     pub fn register_portal(
         &self,
         conn: &zbus::blocking::Connection,
@@ -87,20 +71,43 @@ impl SecretService {
         Ok(())
     }
 
-    /// Register the transitional `org.freedesktop.secrets` objects and start
-    /// the PAM-token watcher on the same connection and vault state.
-    pub fn serve_compat(&self, conn: &zbus::blocking::Connection) -> zbus::Result<()> {
-        compat::serve(conn, &self.state, &self.prompter)?;
-        compat::spawn_pam_watcher(conn.clone(), Arc::clone(&self.state));
-        Ok(())
+    /// Watch for a PAM token that arrives after backend startup (for example
+    /// on screen unlock). The watcher exits permanently once the vault is
+    /// unlocked and never exposes the token to D-Bus.
+    pub fn start_pam_watcher(&self) {
+        if self.state.lock().unwrap().is_unlocked() {
+            return;
+        }
+        let state = Arc::clone(&self.state);
+        let spawned = std::thread::Builder::new()
+            .name("aegis-pam-token-watcher".to_owned())
+            .spawn(move || {
+                loop {
+                    if state.lock().unwrap().is_unlocked() {
+                        return;
+                    }
+                    if let Some(password) = consume_pam_token() {
+                        match state.lock().unwrap().unlock_with_password(&password) {
+                            Ok(()) => {
+                                log::info!("portal: secret vault unlocked by a new PAM token");
+                                return;
+                            }
+                            Err(error) => log::warn!("portal: PAM-token unlock failed: {error}"),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        if let Err(error) = spawned {
+            log::error!("portal: could not start PAM-token watcher: {error}");
+        }
     }
 }
 
 /// Errors that keep secret support from coming up at all.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    /// No `$XDG_DATA_HOME` (or fallback), so the vault directory cannot be
-    /// located.
+    /// No XDG data directory is available.
     #[error("no XDG data directory available")]
     NoDataDir,
     /// Filesystem failure around the vault directory or files.
@@ -117,320 +124,106 @@ pub enum SecretError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// Every piece of mutable secret state, guarded by one mutex.
 struct SecretState {
-    /// The open vault; `None` means locked.
     pub(crate) vault: Option<Vault>,
-    pub(crate) collections: HashMap<String, CollectionRt>,
-    /// Compat session transport keys (AES/DH), keyed by session object path.
-    /// Only the compat layer reads or writes this.
-    pub(crate) sessions: HashMap<OwnedObjectPath, SessionCrypto>,
-    /// Callers queued behind a vault unlock (see `enqueue_unlock_request`).
     pub(crate) pending_unlocks: Vec<PendingUnlock>,
-    /// Whether the unlock worker thread is alive.
     pub(crate) unlock_worker_active: bool,
     pub(crate) vault_path: PathBuf,
     pub(crate) salt_path: PathBuf,
-    pub(crate) key_path: PathBuf,
-}
-
-/// Runtime state of one collection.
-pub(crate) struct CollectionRt {
-    pub(crate) label: String,
-    pub(crate) deleted: bool,
-    pub(crate) items: HashMap<String, ItemRt>,
-}
-
-/// Runtime state of one item.
-pub(crate) struct ItemRt {
-    pub(crate) label: String,
-    pub(crate) attributes: HashMap<String, String>,
-    pub(crate) secret: Vec<u8>,
-    pub(crate) deleted: bool,
-}
-
-/// Compat session transport crypto: plaintext, or AES-128-CBC with the
-/// DH-derived session key (RFC 2409 group 2 + HKDF-SHA256; the exchange
-/// itself lives in `compat::session`). CPU-only, so it runs under the state
-/// lock.
-#[derive(Clone)]
-pub(crate) enum SessionCrypto {
-    Plain,
-    Dh(Vec<u8>),
-}
-
-impl Drop for SessionCrypto {
-    fn drop(&mut self) {
-        if let SessionCrypto::Dh(key) = self {
-            key.zeroize();
-        }
-    }
-}
-
-impl SessionCrypto {
-    /// Encrypt a secret for transport; returns `(parameters, value)` where
-    /// parameters carry the CBC IV (empty for plaintext sessions).
-    pub(crate) fn encrypt(&self, secret: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
-        match self {
-            SessionCrypto::Plain => Ok((vec![], secret.to_vec())),
-            SessionCrypto::Dh(key) => {
-                let mut iv = [0u8; 16];
-                OsRng.fill_bytes(&mut iv);
-                let encryptor = Encryptor::<Aes128>::new(key.as_slice().into(), &iv.into());
-                let mut buf = vec![0u8; secret.len() + 16];
-                buf[..secret.len()].copy_from_slice(secret);
-                let ct_len = encryptor
-                    .encrypt_padded_mut::<Pkcs7>(&mut buf, secret.len())
-                    .map_err(|e| SecretError::Crypto(format!("AES encryption failed: {e}")))?
-                    .len();
-                buf.truncate(ct_len);
-                Ok((iv.to_vec(), buf))
-            }
-        }
-    }
-
-    /// Decrypt a transported secret; `iv` is the parameters field produced
-    /// by `encrypt`.
-    pub(crate) fn decrypt(&self, iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SecretError> {
-        match self {
-            SessionCrypto::Plain => Ok(ciphertext.to_vec()),
-            SessionCrypto::Dh(key) => {
-                if iv.len() != 16 {
-                    return Err(SecretError::Crypto(format!(
-                        "invalid IV length: {}",
-                        iv.len()
-                    )));
-                }
-                let mut iv_arr = [0u8; 16];
-                iv_arr.copy_from_slice(iv);
-
-                let decryptor = Decryptor::<Aes128>::new(key.as_slice().into(), &iv_arr.into());
-                let mut buf = ciphertext.to_vec();
-
-                match decryptor.decrypt_padded_mut::<Pkcs7>(&mut buf) {
-                    Ok(pt) => {
-                        let result = pt.to_vec();
-                        buf.zeroize();
-                        Ok(result)
-                    }
-                    Err(e) => {
-                        buf.zeroize();
-                        log::error!("portal: secret AES decryption/unpad failed: {e}");
-                        Err(SecretError::Crypto(format!("decryption failed: {e}")))
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl SecretState {
-    /// Whether the vault is unlocked (a vault handle exists).
     pub(crate) fn is_unlocked(&self) -> bool {
         self.vault.is_some()
     }
 
-    /// Serialize every non-deleted collection/item and persist the vault.
-    /// Callers invoke this inside the same critical section as the mutation
-    /// they want persisted.
-    pub(crate) fn sync_to_vault(&self) {
-        let Some(vault) = &self.vault else {
-            log::warn!("portal: secret sync_to_vault called while locked; ignoring");
-            return;
-        };
-        let collections = self
-            .collections
-            .iter()
-            .filter(|(_, col)| !col.deleted)
-            .map(|(col_id, col)| CollectionData {
-                id: col_id.clone(),
-                label: col.label.clone(),
-                items: col
-                    .items
-                    .iter()
-                    .filter(|(_, item)| !item.deleted)
-                    .map(|(item_id, item)| ItemData {
-                        id: item_id.clone(),
-                        label: item.label.clone(),
-                        attributes: item.attributes.clone(),
-                        secret: item.secret.clone(),
-                    })
-                    .collect(),
-            })
-            .collect();
-        match vault.save(&VaultData { collections }) {
-            Ok(()) => log::info!("portal: secret vault synced to disk"),
-            Err(error) => log::error!("portal: could not sync secret vault to disk: {error}"),
+    fn unlock_with_password(&mut self, password: &str) -> Result<(), SecretError> {
+        if !self.vault_path.exists() {
+            return Err(SecretError::Vault(
+                "password-mode vault is missing vault.enc".to_owned(),
+            ));
         }
-    }
-
-    /// Load decrypted vault data into the runtime collections map. Clones
-    /// out of `VaultData` because its zeroize-on-drop forbids moves.
-    fn populate(&mut self, data: &VaultData) {
-        self.collections = data
-            .collections
-            .iter()
-            .map(|col| {
-                let items = col
-                    .items
-                    .iter()
-                    .map(|item| {
-                        (
-                            item.id.clone(),
-                            ItemRt {
-                                label: item.label.clone(),
-                                attributes: item.attributes.clone(),
-                                secret: item.secret.clone(),
-                                deleted: false,
-                            },
-                        )
-                    })
-                    .collect();
-                (
-                    col.id.clone(),
-                    CollectionRt {
-                        label: col.label.clone(),
-                        deleted: false,
-                        items,
-                    },
-                )
-            })
-            .collect();
-    }
-
-    /// Unlock the vault with a password: derive the key from the on-disk
-    /// salt, load, populate, and ensure the `login` collection. Shared by
-    /// the PAM-token path (startup and watcher) and the compositor-chrome
-    /// password prompt. The caller zeroizes its copy of the password.
-    pub(crate) fn unlock_with_password(&mut self, password: &str) -> Result<(), SecretError> {
-        let salt = std::fs::read_to_string(&self.salt_path)?;
-        let key = Vault::derive_key(password, salt.trim())?;
+        let salt = read_regular_file(&self.salt_path, 1024, false)?;
+        let salt = std::str::from_utf8(&salt)
+            .map_err(|_| SecretError::Crypto("vault.salt is not UTF-8".to_owned()))?;
+        let mut key = Vault::derive_key(password, salt.trim())?;
         let vault = Vault::new(self.vault_path.clone(), key);
-        let data = vault.load()?;
-        self.populate(&data);
+        key.zeroize();
+        // Authenticated decryption validates the password and the complete
+        // legacy vault before the master key becomes live.
+        let _validated = vault.load()?;
         self.vault = Some(vault);
-        self.ensure_login_collection();
         Ok(())
-    }
-
-    /// Create the `login` collection (and persist it) when absent. Only
-    /// meaningful while unlocked.
-    fn ensure_login_collection(&mut self) {
-        if self.collections.contains_key("login") {
-            return;
-        }
-        self.collections.insert(
-            "login".to_string(),
-            CollectionRt {
-                label: "Login".to_string(),
-                deleted: false,
-                items: HashMap::new(),
-            },
-        );
-        self.sync_to_vault();
     }
 }
 
-// ---------------------------------------------------------------------
-// Unlock coordinator
-//
-// A locked (password-mode) vault unlocks through the compositor's masked
-// secret prompt (`PromptSecret` IPC). Every caller that needs the vault —
-// compat `Unlock`/`CreateCollection` or the native portal `RetrieveSecret`
-// — queues here; ONE worker thread runs the prompt and completes the whole
-// batch, so any mix of callers costs the user exactly one interaction.
-// ---------------------------------------------------------------------
-
-/// The result reported to a portal `RetrieveSecret` call that had to wait
-/// for a vault unlock.
+/// The result reported to a native RetrieveSecret request waiting for an
+/// unlock.
 pub(crate) enum PortalUnlockOutcome {
-    /// The vault unlocked and the derived secret was written to the fd.
     Delivered,
-    /// The user dismissed the prompt (or the vault never unlocked).
     Dismissed,
-    /// The secret could not be derived or delivered.
     Failed,
 }
 
-/// What a queued compat caller wants done once the vault unlocks.
-pub(crate) enum CompatUnlockKind {
-    /// `Service.Unlock`: complete with the requested object list.
-    Unlock(Vec<OwnedObjectPath>),
-    /// `Service.CreateCollection`: create the collection, complete with its
-    /// object path.
-    CreateCollection { alias: String, label: String },
+pub(crate) struct PendingUnlock {
+    pub(crate) fd: OwnedFd,
+    pub(crate) outcome: async_channel::Sender<PortalUnlockOutcome>,
+    pub(crate) tracker: Arc<Mutex<aegis_portal_runtime::RequestTracker>>,
+    pub(crate) request_path: String,
+    pub(crate) app_id: String,
 }
 
-/// One caller waiting on the vault unlock.
-pub(crate) enum PendingUnlock {
-    /// TRANSITIONAL compat request with a bus prompt object to complete.
-    Compat {
-        prompt_path: OwnedObjectPath,
-        kind: CompatUnlockKind,
-    },
-    /// Native portal request: deliver the secret over the caller's fd.
-    PortalRetrieve {
-        fd: OwnedFd,
-        outcome: async_channel::Sender<PortalUnlockOutcome>,
-    },
-}
-
-/// Write a secret to a caller-supplied fd; EOF comes from closing the write
-/// end. The portal frontend forwards whatever fd the app passed — a pipe
-/// (Chrome, libportal) or a socket — and plain write+close works for both,
-/// unlike `shutdown(2)`, which fails ENOTSOCK on anything but a socket.
 pub(crate) fn write_secret_fd(fd: OwnedFd, secret: &[u8]) -> std::io::Result<()> {
     std::fs::File::from(fd).write_all(secret)
 }
 
-/// Queue a caller behind the vault unlock, spawning the single unlock
-/// worker when none is running.
+/// Queue one caller behind the shared unlock prompt. One worker services the
+/// whole batch, while every request retains its own cancellation check.
 pub(crate) fn enqueue_unlock_request(
     state: &Arc<Mutex<SecretState>>,
-    conn: &zbus::blocking::Connection,
     prompter: &Arc<dyn SecretPrompter>,
     request: PendingUnlock,
 ) {
-    let spawn = {
+    let (spawn, rejected) = {
         let mut state = state.lock().unwrap();
-        state.pending_unlocks.push(request);
-        if state.unlock_worker_active {
-            false
+        if state.pending_unlocks.len() >= MAX_PENDING_UNLOCKS {
+            (false, Some(request))
         } else {
-            state.unlock_worker_active = true;
-            true
+            state.pending_unlocks.push(request);
+            if state.unlock_worker_active {
+                (false, None)
+            } else {
+                state.unlock_worker_active = true;
+                (true, None)
+            }
         }
     };
+    if let Some(request) = rejected {
+        log::warn!("portal: refusing RetrieveSecret request: unlock queue limit reached");
+        let _ = request.outcome.send_blocking(PortalUnlockOutcome::Failed);
+        return;
+    }
     if !spawn {
         return;
     }
-    let worker_conn = conn.clone();
+
     let worker_state = Arc::clone(state);
     let worker_prompter = Arc::clone(prompter);
     let spawned = std::thread::Builder::new()
-        .name("aegis-portal-unlock".to_string())
-        .spawn(move || unlock_worker(worker_conn, worker_state, worker_prompter));
+        .name("aegis-portal-unlock".to_owned())
+        .spawn(move || unlock_worker(worker_state, worker_prompter));
     if let Err(error) = spawned {
-        log::error!("portal: could not spawn the unlock worker: {error}");
-        // Fail the queued requests immediately so no caller hangs.
+        log::error!("portal: could not spawn unlock worker: {error}");
         let requests = {
             let mut state = state.lock().unwrap();
             state.unlock_worker_active = false;
             std::mem::take(&mut state.pending_unlocks)
         };
-        complete_unlock_requests(conn, state, requests, false);
+        complete_unlock_requests(state, requests, false);
     }
 }
 
-/// The single unlock worker: prompt only while the vault is still locked,
-/// then complete every queued caller. Callers that queued during a
-/// successful prompt complete against the now-unlocked vault without a
-/// second interaction.
-fn unlock_worker(
-    conn: zbus::blocking::Connection,
-    state: Arc<Mutex<SecretState>>,
-    prompter: Arc<dyn SecretPrompter>,
-) {
+fn unlock_worker(state: Arc<Mutex<SecretState>>, prompter: Arc<dyn SecretPrompter>) {
     loop {
         let requests = {
             let mut state = state.lock().unwrap();
@@ -458,74 +251,60 @@ fn unlock_worker(
                 }
             }
         };
-        if unlocked {
-            // TRANSITIONAL (compat): the freshly unlocked collections and
-            // items go on the bus. Removal: delete this call with `compat/`.
-            if let Err(error) = compat::register_collections(&conn, &state) {
-                log::error!("portal: could not register collections after unlock: {error}");
-            }
-        }
-        complete_unlock_requests(&conn, &state, requests, unlocked);
+        complete_unlock_requests(&state, requests, unlocked);
     }
 }
 
-/// Ask the user for the vault password through compositor chrome and unlock
-/// with it. Blocks on the IPC round-trip; the state lock is only taken for
-/// the key derivation, never across the IPC.
 fn prompt_and_unlock(
     state: &Arc<Mutex<SecretState>>,
     prompter: &dyn SecretPrompter,
 ) -> Result<(), String> {
-    let mut password = match prompter.prompt_secret(
+    let password = match prompter.prompt_secret(
         "Unlock Keyring",
         Some("The secret vault is locked. Enter its password to unlock it."),
     ) {
-        Ok(PromptResponse::Secret(value)) => zeroize::Zeroizing::new(value),
+        Ok(PromptResponse::Secret(value)) => Zeroizing::new(value),
         Ok(PromptResponse::Cancelled) => return Err("prompt dismissed".into()),
         Err(error) => return Err(format!("secret prompt failed: {error}")),
     };
-    let unlocked = {
-        let mut state = state.lock().unwrap();
-        state.unlock_with_password(&password)
-    };
-    password.zeroize();
-    unlocked.map_err(|e| format!("wrong password or unreadable vault: {e}"))
+    state
+        .lock()
+        .unwrap()
+        .unlock_with_password(&password)
+        .map_err(|error| format!("wrong password or unreadable vault: {error}"))
 }
 
-/// Complete one drained batch against the unlock outcome.
 fn complete_unlock_requests(
-    conn: &zbus::blocking::Connection,
     state: &Arc<Mutex<SecretState>>,
     requests: Vec<PendingUnlock>,
     unlocked: bool,
 ) {
     for request in requests {
-        match request {
-            PendingUnlock::Compat { prompt_path, kind } => {
-                // TRANSITIONAL: delete this call with `compat/`.
-                compat::complete_request(conn, state, &prompt_path, kind, unlocked);
-            }
-            PendingUnlock::PortalRetrieve { fd, outcome } => {
-                let result = if unlocked {
-                    deliver_portal_secret(state, fd)
-                } else {
-                    PortalUnlockOutcome::Dismissed
-                };
-                if outcome.send_blocking(result).is_err() {
-                    log::warn!("portal: RetrieveSecret caller went away before unlock completed");
-                }
-            }
+        let cancelled = request
+            .tracker
+            .lock()
+            .unwrap()
+            .was_closed(&request.request_path);
+        let result = if cancelled || !unlocked {
+            PortalUnlockOutcome::Dismissed
+        } else {
+            deliver_portal_secret(state, request.fd, &request.app_id)
+        };
+        if request.outcome.send_blocking(result).is_err() {
+            log::warn!("portal: RetrieveSecret caller went away before unlock completed");
         }
     }
 }
 
-/// Derive the portal secret and stream it into the caller's fd. Runs on the
-/// unlock worker; the batch was already unlocked (or this is not called).
-fn deliver_portal_secret(state: &Arc<Mutex<SecretState>>, fd: OwnedFd) -> PortalUnlockOutcome {
+fn deliver_portal_secret(
+    state: &Arc<Mutex<SecretState>>,
+    fd: OwnedFd,
+    app_id: &str,
+) -> PortalUnlockOutcome {
     let mut secret = {
         let state = state.lock().unwrap();
         match state.vault.as_ref() {
-            Some(vault) => portal::derive_portal_secret(vault.get_master_key()),
+            Some(vault) => portal::derive_portal_secret(vault.get_master_key(), app_id),
             None => return PortalUnlockOutcome::Failed,
         }
     };
@@ -534,55 +313,58 @@ fn deliver_portal_secret(state: &Arc<Mutex<SecretState>>, fd: OwnedFd) -> Portal
     match written {
         Ok(()) => PortalUnlockOutcome::Delivered,
         Err(error) => {
-            log::warn!("portal: could not write the RetrieveSecret fd after unlock: {error}");
+            log::warn!("portal: could not write RetrieveSecret fd after unlock: {error}");
             PortalUnlockOutcome::Failed
         }
     }
 }
 
-/// The PAM token path: `$XDG_RUNTIME_DIR/aegis-pam-token`, falling back
-/// to `/run/user/<uid>/` (mirrors `pam_aegis`'s writer).
-pub(crate) fn pam_token_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !dir.is_empty()
+/// PAM and the backend use the same root-owned session runtime location.
+/// Never trust an inherited XDG_RUNTIME_DIR for a login password token.
+fn pam_token_path() -> PathBuf {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}/{PAM_TOKEN_NAME}"))
+}
+
+fn consume_pam_token() -> Option<Zeroizing<String>> {
+    consume_pam_token_at(&pam_token_path())
+}
+
+/// Open a one-shot token without following links, validate the opened file,
+/// unlink the name before reading, and cap its size.
+fn consume_pam_token_at(path: &Path) -> Option<Zeroizing<String>> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.len() > MAX_PAM_TOKEN_BYTES
     {
-        return Some(PathBuf::from(dir).join("aegis-pam-token"));
-    }
-    // SAFETY: getuid simply reads the process uid.
-    let uid = unsafe { libc::getuid() };
-    Some(PathBuf::from(format!("/run/user/{uid}/aegis-pam-token")))
-}
-
-/// Read and delete the PAM-cached login password, if a token exists and is
-/// safely shaped (owned by this user, mode 0600). Deletion always follows a
-/// read attempt so a stale or malformed token never loops.
-pub(crate) fn consume_pam_token() -> Option<String> {
-    let path = pam_token_path()?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    // SAFETY: getuid simply reads the process uid.
-    let uid = unsafe { libc::getuid() };
-    if metadata.uid() != uid || metadata.permissions().mode() & 0o777 != 0o600 {
-        log::warn!(
-            "portal: refusing PAM token with unsafe ownership/mode at {}",
-            path.display()
-        );
-        let _ = std::fs::remove_file(&path);
+        log::warn!("portal: refusing unsafe PAM token at {}", path.display());
+        let _ = std::fs::remove_file(path);
         return None;
     }
-    let bytes = std::fs::read(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let mut password = String::from_utf8(bytes).ok()?;
-    while password.ends_with('\n') || password.ends_with('\r') {
-        password.pop();
-    }
+    // Refuse reuse even if parsing or password validation later fails.
+    std::fs::remove_file(path).ok()?;
+
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.read_to_end(&mut bytes).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let password = text.trim_end_matches(['\n', '\r']);
     if password.is_empty() {
-        return None;
+        None
+    } else {
+        Some(Zeroizing::new(password.to_owned()))
     }
-    Some(password)
 }
 
-/// Initialize secret support: resolve the vault directory under
-/// `$XDG_DATA_HOME/aegis/secrets` and open (or create) the vault.
 fn init() -> Result<Arc<Mutex<SecretState>>, SecretError> {
     let dir = dirs::data_dir()
         .ok_or(SecretError::NoDataDir)?
@@ -591,172 +373,279 @@ fn init() -> Result<Arc<Mutex<SecretState>>, SecretError> {
     init_in(&dir)
 }
 
-/// Filesystem-level startup, split from `init` so tests can point it at a
-/// temporary directory.
-///
-/// Three on-disk shapes are recognized:
-///
-/// - `vault.key` exists: keyfile mode. The vault opens immediately; a
-///   missing `vault.enc` reads as an empty vault and is created on disk,
-///   while a corrupt one is a hard error (never silently discard secrets).
-/// - Only `vault.salt` exists: a password-mode vault (e.g. migrated from
-///   wssp). A PAM-cached login password (`pam_aegis` token) unlocks
-///   immediately; otherwise the process starts LOCKED and `Unlock` asks
-///   the user through the compositor's masked secret prompt
-///   (`PromptSecret` IPC).
-/// - Neither exists: first run. A fresh keyfile (mode 0600) and an empty
-///   vault are created.
-pub(crate) fn init_in(dir: &Path) -> Result<Arc<Mutex<SecretState>>, SecretError> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+fn init_in(dir: &Path) -> Result<Arc<Mutex<SecretState>>, SecretError> {
+    prepare_private_dir(dir)?;
 
+    let key_path = dir.join("vault.key");
     let mut state = SecretState {
         vault: None,
-        collections: HashMap::new(),
-        sessions: HashMap::new(),
         pending_unlocks: Vec::new(),
         unlock_worker_active: false,
         vault_path: dir.join("vault.enc"),
         salt_path: dir.join("vault.salt"),
-        key_path: dir.join("vault.key"),
     };
 
-    if state.key_path.exists() {
-        let hex = std::fs::read_to_string(&state.key_path)?;
-        let key = Vault::key_from_hex(&hex)?;
+    if key_path.exists() {
+        let hex = read_regular_file(&key_path, MAX_KEYFILE_BYTES, true)?;
+        let hex = std::str::from_utf8(&hex)
+            .map_err(|_| SecretError::Crypto("vault.key is not UTF-8".to_owned()))?;
+        let mut key = Vault::key_from_hex(hex)?;
         let vault = Vault::new(state.vault_path.clone(), key);
+        key.zeroize();
         let missing = !state.vault_path.exists();
-        let data = vault.load()?;
+        let _validated = vault.load()?;
         if missing {
-            // A missing vault file reads as empty; persist it so the next
-            // start sees a real file.
             vault.save(&VaultData {
                 collections: vec![],
             })?;
         }
-        state.populate(&data);
         state.vault = Some(vault);
         log::info!("portal: secret vault unlocked via keyfile");
     } else if state.salt_path.exists() {
-        // A PAM-cached login password (pam_aegis) unlocks without
-        // prompting; otherwise the vault waits for the compositor-chrome
-        // prompt.
+        if !state.vault_path.exists() {
+            return Err(SecretError::Vault(
+                "password-mode vault has vault.salt but no vault.enc".to_owned(),
+            ));
+        }
+        // A locked vault still advertises Secret, so validate every backing
+        // path now rather than deferring symlink/mode/size failures until a
+        // caller is already waiting on an unlock prompt.
+        let _salt = read_regular_file(&state.salt_path, MAX_KEYFILE_BYTES, false)?;
+        Vault::validate_ciphertext(&state.vault_path)?;
         match consume_pam_token() {
-            Some(mut password) => {
-                let mut locked_reason = None;
-                match state.unlock_with_password(&password) {
-                    Ok(()) => log::info!("portal: secret vault unlocked via PAM token"),
-                    Err(error) => locked_reason = Some(format!("PAM-token unlock failed: {error}")),
-                }
-                password.zeroize();
-                if let Some(reason) = locked_reason {
-                    log::warn!("portal: {reason}; starting LOCKED");
-                }
-            }
-            None => {
-                log::info!(
-                    "portal: password-protected secret vault found (vault.salt); starting \
-                     LOCKED, Unlock will prompt through compositor chrome"
-                );
-            }
+            Some(password) => match state.unlock_with_password(&password) {
+                Ok(()) => log::info!("portal: secret vault unlocked via PAM token"),
+                Err(error) => log::warn!("portal: PAM-token unlock failed: {error}"),
+            },
+            None => log::info!("portal: password-protected secret vault starts locked"),
         }
     } else {
-        // First run: keyfile mode, empty vault.
-        let key = Vault::generate_key();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&state.key_path)?;
-        file.write_all(Vault::key_to_hex(&key).as_bytes())?;
-        drop(file);
-        std::fs::set_permissions(&state.key_path, std::fs::Permissions::from_mode(0o600))?;
-        let vault = Vault::new(state.vault_path.clone(), key);
-        vault.save(&VaultData {
-            collections: vec![],
-        })?;
-        state.vault = Some(vault);
-        log::info!(
-            "portal: secret vault initialized in keyfile mode at {}",
-            dir.display()
-        );
+        if state.vault_path.exists() {
+            return Err(SecretError::Vault(
+                "refusing to overwrite vault.enc without vault.key or vault.salt".to_owned(),
+            ));
+        }
+        let mut key = Vault::generate_key();
+        let encoded = Zeroizing::new(Vault::key_to_hex(&key));
+        match vault::atomic_create(&key_path, encoded.as_bytes()) {
+            Ok(()) => {
+                let vault = Vault::new(state.vault_path.clone(), key);
+                key.zeroize();
+                vault.save(&VaultData {
+                    collections: vec![],
+                })?;
+                state.vault = Some(vault);
+                log::info!("portal: secret vault initialized at {}", dir.display());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another concurrently activated backend won initialization.
+                // Use only its fully published key.
+                key.zeroize();
+                let hex = read_regular_file(&key_path, MAX_KEYFILE_BYTES, true)?;
+                let hex = std::str::from_utf8(&hex)
+                    .map_err(|_| SecretError::Crypto("vault.key is not UTF-8".to_owned()))?;
+                let mut key = Vault::key_from_hex(hex)?;
+                let vault = Vault::new(state.vault_path.clone(), key);
+                key.zeroize();
+                if !state.vault_path.exists() {
+                    vault.save(&VaultData {
+                        collections: vec![],
+                    })?;
+                } else {
+                    let _validated = vault.load()?;
+                }
+                state.vault = Some(vault);
+            }
+            Err(error) => return Err(SecretError::Io(error)),
+        }
     }
 
-    if state.is_unlocked() {
-        state.ensure_login_collection();
-    }
     Ok(Arc::new(Mutex::new(state)))
+}
+
+/// Open the final vault directory without following a symlink. Tighten its
+/// mode through the descriptor only after owner/type validation, so a
+/// rejected path cannot chmod a link target as a side effect.
+fn prepare_private_dir(dir: &Path) -> Result<(), SecretError> {
+    std::fs::create_dir_all(dir)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(SecretError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret directory must be a user-owned real directory",
+        )));
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    let metadata = directory.metadata()?;
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err(SecretError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret directory mode must be 0700",
+        )));
+    }
+    Ok(())
+}
+
+/// Read a bounded regular file through an O_NOFOLLOW descriptor. `private`
+/// additionally requires exact mode 0600.
+fn read_regular_file(
+    path: &Path,
+    limit: u64,
+    private: bool,
+) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || (private && metadata.permissions().mode() & 0o7777 != 0o600)
+        || (!private && metadata.permissions().mode() & 0o022 != 0)
+        || metadata.len() > limit
+    {
+        return Err(SecretError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "unsafe file ownership, mode, type, or size: {}",
+                path.display()
+            ),
+        )));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let mut suffix = [0u8; 8];
-        OsRng.fill_bytes(&mut suffix);
-        let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let suffix: String = suffix.iter().map(|byte| format!("{byte:02x}")).collect();
         std::env::temp_dir().join(format!("aegis-secret-test-{tag}-{suffix}"))
     }
 
     #[test]
-    fn first_run_creates_keyfile_and_empty_vault_then_reunlocks() {
+    fn first_run_creates_private_keyfile_and_reopens() {
         let dir = temp_dir("first-run");
-
         let state = init_in(&dir).expect("first-run init");
         assert!(state.lock().unwrap().is_unlocked());
-
-        // Directory and keyfile permissions are hardened.
-        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700);
-        let key_mode = std::fs::metadata(dir.join("vault.key"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(key_mode, 0o600);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("vault.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(dir.join("vault.enc").exists());
-
-        // The login collection is created and persisted.
-        assert!(state.lock().unwrap().collections.contains_key("login"));
-
-        // A second init on the same directory unlocks and sees login.
-        let state = init_in(&dir).expect("second init");
-        let state = state.lock().unwrap();
-        assert!(state.is_unlocked());
-        assert!(state.collections.contains_key("login"));
-
+        assert!(
+            init_in(&dir)
+                .expect("second init")
+                .lock()
+                .unwrap()
+                .is_unlocked()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn salt_only_vault_stays_locked() {
+    fn salt_without_ciphertext_is_rejected() {
         let dir = temp_dir("salt-only");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vault.salt"), "c29tZXNhbHQ").unwrap();
-
-        let state = init_in(&dir).expect("salt-only init must not fail");
-        assert!(!state.lock().unwrap().is_unlocked());
-
+        assert!(init_in(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn session_crypto_roundtrip() {
-        let key = vec![0x42u8; 16];
-        let crypto = SessionCrypto::Dh(key);
-        let (iv, ciphertext) = crypto.encrypt(b"top secret").expect("encrypt");
-        assert_eq!(iv.len(), 16);
-        assert_ne!(ciphertext, b"top secret");
-        let plaintext = crypto.decrypt(&iv, &ciphertext).expect("decrypt");
-        assert_eq!(plaintext, b"top secret");
+    fn orphan_ciphertext_is_never_overwritten() {
+        let dir = temp_dir("orphan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault_path = dir.join("vault.enc");
+        std::fs::write(&vault_path, b"irreplaceable ciphertext").unwrap();
+        let before = std::fs::read(&vault_path).unwrap();
 
-        let (params, value) = SessionCrypto::Plain.encrypt(b"plain").expect("encrypt");
-        assert!(params.is_empty());
+        assert!(init_in(&dir).is_err());
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before);
+        assert!(!dir.join("vault.key").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_directory_is_rejected_without_chmodding_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("directory-symlink");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(init_in(&link).is_err());
         assert_eq!(
-            SessionCrypto::Plain.decrypt(&params, &value).unwrap(),
-            b"plain"
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn locked_vault_rejects_a_symlink_salt_at_startup() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("salt-symlink");
+        let dir = root.join("secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = root.join("salt-target");
+        std::fs::write(&target, b"c29tZXNhbHQ").unwrap();
+        symlink(&target, dir.join("vault.salt")).unwrap();
+        std::fs::write(dir.join("vault.enc"), [0_u8; 24]).unwrap();
+        std::fs::set_permissions(
+            dir.join("vault.enc"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        assert!(init_in(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pam_token_must_be_regular_private_and_is_one_shot() {
+        let dir = temp_dir("pam-token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join(PAM_TOKEN_NAME);
+        std::fs::write(&token, b"password\n").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let consumed = consume_pam_token_at(&token);
+        assert_eq!(
+            consumed.as_ref().map(|value| value.as_str()),
+            Some("password")
+        );
+        assert!(!token.exists());
+
+        std::fs::write(&token, b"leaked").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(consume_pam_token_at(&token).is_none());
+        assert!(!token.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

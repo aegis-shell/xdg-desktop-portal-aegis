@@ -37,11 +37,14 @@ const STREAM_FPS: u32 = 30;
 const STREAM_DIRECTION: Direction = Direction::Output;
 /// Lease TTL requested at handshake and renewal; renewed at half TTL.
 const LEASE_TTL_MS: u64 = 900_000;
+const IPC_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
 pub(crate) struct CastStarted {
     pub(crate) node_id: u32,
+    pub(crate) serial: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
 }
@@ -55,21 +58,17 @@ pub(crate) struct CastHandle {
 }
 
 /// Spawn the cast thread. Returns immediately; the PipeWire negotiation
-/// result arrives on `handle.started` exactly once. `window` selects the
-/// window-source variant: the compositor crops that window's
-/// visible region from the output frame and ends the stream when the window
-/// closes or its size changes.
+/// result arrives on `handle.started` exactly once.
 pub(crate) fn spawn(
     socket: PathBuf,
     session_path: String,
-    jobs: mpsc::Sender<CastJob>,
-    window: Option<aegis_core::window::WindowId>,
+    jobs: mpsc::SyncSender<CastJob>,
 ) -> io::Result<CastHandle> {
     let (stop_read, stop_write) = UnixStream::pair()?;
     let (started_tx, started_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("aegis-portal-cast".to_string())
-        .spawn(move || cast_thread(socket, session_path, jobs, window, stop_read, started_tx))?;
+        .spawn(move || cast_thread(socket, session_path, jobs, stop_read, started_tx))?;
     Ok(CastHandle {
         stop: stop_write,
         started: started_rx,
@@ -97,18 +96,47 @@ struct StreamData {
     latest: LatestFrame,
     width: u32,
     height: u32,
+    start_state: Rc<RefCell<StartState>>,
+}
+
+/// PipeWire reports the node id through the stream state callback and the
+/// stable object serial through registry properties. Either event may arrive
+/// first, so Start completes only after both have been observed.
+struct StartState {
     started: Option<mpsc::Sender<Result<CastStarted, String>>>,
+    paused: Option<(u32, u32, u32)>,
+    serials: std::collections::HashMap<u32, u64>,
+    completed: bool,
+}
+
+impl StartState {
+    fn try_complete(&mut self) {
+        let Some((node_id, width, height)) = self.paused else {
+            return;
+        };
+        let Some(serial) = self.serials.get(&node_id).copied() else {
+            return;
+        };
+        if let Some(started) = self.started.take() {
+            self.completed = true;
+            let _ = started.send(Ok(CastStarted {
+                node_id,
+                serial,
+                width,
+                height,
+            }));
+        }
+    }
 }
 
 fn cast_thread(
     socket: PathBuf,
     session_path: String,
-    jobs: mpsc::Sender<CastJob>,
-    window: Option<aegis_core::window::WindowId>,
+    jobs: mpsc::SyncSender<CastJob>,
     stop_read: UnixStream,
     started: mpsc::Sender<Result<CastStarted, String>>,
 ) {
-    if let Err(error) = run_cast(&socket, &session_path, &jobs, window, stop_read, &started) {
+    if let Err(error) = run_cast(&socket, &session_path, &jobs, stop_read, &started) {
         log::warn!("portal: cast for {session_path} failed: {error}");
         let _ = started.send(Err(error));
     }
@@ -121,8 +149,7 @@ fn cast_thread(
 fn run_cast(
     socket: &std::path::Path,
     session_path: &str,
-    jobs: &mpsc::Sender<CastJob>,
-    window: Option<aegis_core::window::WindowId>,
+    jobs: &mpsc::SyncSender<CastJob>,
     stop_read: UnixStream,
     started: &mpsc::Sender<Result<CastStarted, String>>,
 ) -> Result<(), String> {
@@ -134,16 +161,20 @@ fn run_cast(
         session: false,
         realm: false,
     };
-    let mut client = Client::connect_scoped(socket, caps, LOCAL_PORTAL_SCOPE)
-        .map_err(|e| format!("compositor IPC connect: {e}"))?;
-    let target = match window {
-        Some(window) => aegis_ipc::StreamTarget::Window { window },
-        None => aegis_ipc::StreamTarget::Output,
-    };
+    let mut client =
+        Client::connect_scoped_with_timeout(socket, caps, LOCAL_PORTAL_SCOPE, IPC_TIMEOUT)
+            .map_err(|e| format!("compositor IPC connect: {e}"))?;
     let stream_info = client
-        .start_output_stream_target(Some(STREAM_FPS), target)
+        .start_output_stream_target(Some(STREAM_FPS), aegis_ipc::StreamTarget::Output)
         .map_err(|e| format!("start output stream: {e}"))?;
     let (width, height) = (stream_info.width, stream_info.height);
+    let expected_frame_len = frame_len(width, height)?;
+    if stream_info.format != aegis_ipc::StreamPixelFormat::Bgra8 {
+        return Err(format!(
+            "unsupported compositor stream format: {:?}",
+            stream_info.format
+        ));
+    }
     log::info!(
         "portal: compositor stream {} for {session_path}: {width}x{height}@{STREAM_FPS}",
         stream_info.stream_id
@@ -154,6 +185,7 @@ fn run_cast(
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
     let core = context.connect_rc(None).map_err(|e| e.to_string())?;
+    let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
     let stream = pw::stream::StreamBox::new(
         &core,
         "xdg-desktop-portal-aegis-screencast",
@@ -167,26 +199,65 @@ fn run_cast(
 
     let latest: LatestFrame = Rc::new(RefCell::new(None));
     let format_pod = format_pod(width, height);
+    let start_state = Rc::new(RefCell::new(StartState {
+        started: Some(started.clone()),
+        paused: None,
+        serials: std::collections::HashMap::new(),
+        completed: false,
+    }));
+    let exit_start_state = Rc::clone(&start_state);
+    let registry_start_state = Rc::clone(&start_state);
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |object| {
+            let Some(serial) = object
+                .props
+                .and_then(|properties| properties.get("object.serial"))
+                .and_then(|serial| serial.parse::<u64>().ok())
+            else {
+                return;
+            };
+            let mut state = registry_start_state.borrow_mut();
+            state.serials.insert(object.id, serial);
+            state.try_complete();
+        })
+        .register();
 
+    let state_loop_weak = mainloop.downgrade();
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             latest: Rc::clone(&latest),
             width,
             height,
-            started: Some(started.clone()),
+            start_state,
         })
-        .state_changed(|stream, data, _old, new| {
+        .state_changed(move |stream, data, _old, new| {
             log::debug!("portal: pipewire stream {new:?}");
-            // Paused is the first state with a valid node id; report the
-            // started parameters exactly once.
-            if new == StreamState::Paused
-                && let Some(started) = data.started.take()
-            {
-                let _ = started.send(Ok(CastStarted {
-                    node_id: stream.node_id(),
-                    width: data.width,
-                    height: data.height,
-                }));
+            if let StreamState::Error(message) = new {
+                if let Some(started) = data.start_state.borrow_mut().started.take() {
+                    let _ = started.send(Err(format!("PipeWire stream error: {message}")));
+                }
+                if let Some(mainloop) = state_loop_weak.upgrade() {
+                    mainloop.quit();
+                }
+                return;
+            }
+            // Paused is the first state with a valid node id. The registry
+            // normally announced its object.serial already; also consult the
+            // stream properties in case this PipeWire version exposes it
+            // there first.
+            if new == StreamState::Paused {
+                let node_id = stream.node_id();
+                let mut state = data.start_state.borrow_mut();
+                if let Some(serial) = stream
+                    .properties()
+                    .get("object.serial")
+                    .and_then(|serial| serial.parse::<u64>().ok())
+                {
+                    state.serials.insert(node_id, serial);
+                }
+                state.paused = Some((node_id, data.width, data.height));
+                state.try_complete();
             }
         })
         .param_changed(|stream, data, id, param| {
@@ -243,16 +314,17 @@ fn run_cast(
                 let message = io.0.borrow_mut().next_stream_message();
                 match message {
                     Ok(StreamMessage::Frame(frame)) => match frame.format {
-                        aegis_ipc::StreamPixelFormat::Bgra8
-                        | aegis_ipc::StreamPixelFormat::Rgba8 => {
-                            if frame.pixels.len() == (width as usize) * (height as usize) * 4 {
+                        aegis_ipc::StreamPixelFormat::Bgra8 => {
+                            if frame.width == width
+                                && frame.height == height
+                                && frame.stride == width * 4
+                                && frame.pixels.len() == expected_frame_len
+                            {
                                 *latest.borrow_mut() = Some(Rc::new(frame.pixels));
                             }
                         }
-                        aegis_ipc::StreamPixelFormat::Dmabuf { .. } => {
-                            if frame.pixels.len() == (width as usize) * (height as usize) * 4 {
-                                *latest.borrow_mut() = Some(Rc::new(frame.pixels));
-                            }
+                        other => {
+                            log::warn!("portal: ignoring unexpected stream frame format {other:?}");
                         }
                     },
                     Ok(StreamMessage::LeaseRenewed) => {}
@@ -269,12 +341,15 @@ fn run_cast(
         },
     );
 
+    let stopped_by_owner = Rc::new(std::cell::Cell::new(false));
+    let stop_flag = Rc::clone(&stopped_by_owner);
     let _stop_source = mainloop.loop_().add_io(
         stop_read,
         spa::support::system::IoFlags::IN | spa::support::system::IoFlags::HUP,
         {
             let loop_weak = mainloop.downgrade();
             move |socket| {
+                stop_flag.set(true);
                 let mut byte = [0u8; 1];
                 use std::io::Read;
                 // EOF (write end dropped) is the only expected readability.
@@ -303,19 +378,42 @@ fn run_cast(
             // expose an output port.
             STREAM_DIRECTION,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            // Portal consumers explicitly target the node returned by
+            // Start/OpenPipeWireRemote. AUTOCONNECT asks session-manager
+            // policy to route this source to an unrelated default target and
+            // can tear the stream down with "no target node available".
+            StreamFlags::MAP_BUFFERS,
             &mut params,
         )
         .map_err(|e| e.to_string())?;
 
     mainloop.run();
+    if exit_start_state.borrow().completed && !stopped_by_owner.get() {
+        let _ = jobs.send(CastJob::SessionEnded {
+            session_path: session_path.to_owned(),
+        });
+    }
     Ok(())
+}
+
+fn frame_len(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(height as usize))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| format!("invalid compositor stream geometry {width}x{height}"))?;
+    if width == 0 || height == 0 || bytes > MAX_FRAME_BYTES {
+        return Err(format!(
+            "compositor stream geometry {width}x{height} exceeds the 256 MiB frame limit"
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Report a compositor-side stream end to the screencast worker and stop
 /// the cast thread's loop.
 fn end_cast(
-    jobs: &mpsc::Sender<CastJob>,
+    jobs: &mpsc::SyncSender<CastJob>,
     session_path: &str,
     loop_weak: &pw::main_loop::MainLoopWeak,
 ) {
@@ -364,8 +462,9 @@ fn format_pod(width: u32, height: u32) -> Vec<u8> {
 }
 
 /// Buffer constraints offered once the format is negotiated: 2–8 shared or
-/// plain buffers of exactly one frame. MemPtr | MemFd = 1 | 2 = 3 (masks of
-/// `enum spa_data_type`).
+/// plain buffers of exactly one frame. `SPA_PARAM_BUFFERS_dataType` is a mask
+/// of enum positions, not the enum values themselves: MemPtr is bit 1 and
+/// MemFd is bit 2, hence `(1 << 1) | (1 << 2) == 6`.
 fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
     let stride = width as i32 * 4;
     let size = stride * height as i32;
@@ -406,8 +505,8 @@ fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
                 value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: 1,
-                        flags: vec![1, 2],
+                        default: (1 << 1) | (1 << 2),
+                        flags: Vec::new(),
                     },
                 ))),
             },
@@ -481,5 +580,18 @@ mod tests {
             })
             .expect("size property");
         assert_eq!(size, 640 * 480 * 4);
+        let data_types = object
+            .properties
+            .iter()
+            .find(|property| property.key == 6)
+            .and_then(|property| match &property.value {
+                pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                    _,
+                    ChoiceEnum::Flags { default, flags },
+                ))) => Some((*default, flags.as_slice())),
+                _ => None,
+            })
+            .expect("dataType flags property");
+        assert_eq!(data_types, (6, &[][..]));
     }
 }

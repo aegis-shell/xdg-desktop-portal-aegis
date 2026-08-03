@@ -22,11 +22,9 @@ use zbus::zvariant::{ObjectPath, Value};
 use crate::files;
 
 const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_ACTIVE_FILE_CHOOSERS: usize = 32;
 const PROMPTER_ENV: &str = "AEGIS_PORTAL_PROMPTER";
-
-/// The served interface version: 3 adds the `current_file` option to
-/// `SaveFile` (2 added `SaveFiles`).
-pub(crate) const FILE_CHOOSER_VERSION: u32 = 3;
 
 /// One file-chooser request handed from the bus methods to the dispatcher.
 /// The request contains the complete portal semantics; no UI policy is
@@ -42,7 +40,7 @@ pub(crate) enum FileChooserJob {
 pub(crate) struct FileChooserIface {
     pub(crate) conn: zbus::Connection,
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
-    pub(crate) jobs: mpsc::Sender<FileChooserJob>,
+    pub(crate) jobs: mpsc::SyncSender<FileChooserJob>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.FileChooser")]
@@ -134,11 +132,6 @@ impl FileChooserIface {
         };
         self.choose(handle, request).await
     }
-
-    #[zbus(property, name = "version")]
-    fn version(&self) -> u32 {
-        FILE_CHOOSER_VERSION
-    }
 }
 
 impl FileChooserIface {
@@ -154,21 +147,30 @@ impl FileChooserIface {
             request.mode
         );
 
+        if let Err(error) = validate_request(&request) {
+            log::warn!("portal: refusing invalid FileChooser request: {error}");
+            return Ok(failed());
+        }
+
         aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
         let (reply, response) = async_channel::bounded(1);
-        if self
-            .jobs
-            .send(FileChooserJob::Choose {
-                request_path: path.clone(),
-                request,
-                reply,
-            })
-            .is_err()
-        {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(zbus::fdo::Error::Failed(
-                "file chooser worker is gone".to_owned(),
-            ));
+        match self.jobs.try_send(FileChooserJob::Choose {
+            request_path: path.clone(),
+            request,
+            reply,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!("portal: refusing FileChooser: worker queue is full");
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(zbus::fdo::Error::Failed(
+                    "file chooser worker is gone".to_owned(),
+                ));
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("file chooser worker dropped its response".to_owned())
@@ -178,6 +180,20 @@ impl FileChooserIface {
     }
 }
 
+/// Validate before enqueueing so a hostile request cannot multiply a large
+/// D-Bus payload across the bounded worker queue.
+fn validate_request(request: &SelectionRequest) -> Result<(), String> {
+    request.validate()?;
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("could not encode FileChooser request: {error}"))?;
+    if encoded.len() > MAX_REQUEST_BYTES {
+        return Err(format!(
+            "FileChooser request exceeds the {MAX_REQUEST_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
 /// Dispatch each request to its own supervised task. A modal chooser belongs
 /// to one calling application and must not block unrelated portal clients or
 /// delay cancellation of a queued request.
@@ -185,21 +201,38 @@ pub(crate) fn file_chooser_worker(
     rx: mpsc::Receiver<FileChooserJob>,
     tracker: Arc<Mutex<RequestTracker>>,
 ) {
+    struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Ok(FileChooserJob::Choose {
         request_path,
         request,
         reply,
     }) = rx.recv()
     {
+        if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_ACTIVE_FILE_CHOOSERS {
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            log::warn!("portal: refusing FileChooser request: concurrency limit reached");
+            let _ = reply.send_blocking(failed());
+            continue;
+        }
         let tracker = Arc::clone(&tracker);
+        let active_guard = ActiveGuard(Arc::clone(&active));
+        let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-file-chooser".to_owned())
             .spawn(move || {
+                let _active = active_guard;
                 let result = run_pick(&tracker, &request_path, request);
                 let _ = reply.send_blocking(result);
             })
         {
             log::error!("portal: could not spawn FileChooser task: {error}");
+            let _ = spawn_failure_reply.send_blocking(failed());
         }
     }
 }
@@ -336,12 +369,16 @@ fn prompter_executable() -> Result<PathBuf, String> {
             return Ok(sibling);
         }
     }
-    let installed = PathBuf::from("/usr/lib/aegis-portal-prompter");
-    if installed.is_file() {
-        return Ok(installed);
+    for installed in [
+        PathBuf::from("/usr/libexec/aegis-portal-prompter"),
+        PathBuf::from("/usr/lib/aegis-portal-prompter"),
+    ] {
+        if installed.is_file() {
+            return Ok(installed);
+        }
     }
     Err(format!(
-        "aegis-portal-prompter was not found; set {PROMPTER_ENV} or install /usr/lib/aegis-portal-prompter"
+        "aegis-portal-prompter was not found beside the backend or in the standard libexec directories; set {PROMPTER_ENV}"
     ))
 }
 
@@ -534,11 +571,6 @@ mod tests {
     }
 
     #[test]
-    fn version_is_3() {
-        assert_eq!(FILE_CHOOSER_VERSION, 3);
-    }
-
-    #[test]
     fn defaults_match_the_portal_contract() {
         let parsed = parse_options(&HashMap::new());
         assert!(parsed.modal);
@@ -613,5 +645,26 @@ mod tests {
             panic!("choices must be an array");
         };
         assert_eq!(choices.len(), 1);
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_enqueue() {
+        let request = SelectionRequest {
+            mode: SelectionMode::OpenFile,
+            app_id: "dev.aegis.Test".into(),
+            title: "x".repeat(MAX_REQUEST_BYTES + 1),
+            accept_label: None,
+            modal: true,
+            parent_window: None,
+            multiple: false,
+            current_folder: None,
+            current_name: None,
+            current_file: None,
+            filters: Vec::new(),
+            current_filter: None,
+            choices: Vec::new(),
+            files: Vec::new(),
+        };
+        assert!(validate_request(&request).is_err());
     }
 }

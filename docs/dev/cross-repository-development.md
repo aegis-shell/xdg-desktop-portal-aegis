@@ -183,10 +183,11 @@ rebase.
 
 ## Coordinate with an unreleased Aegis
 
-Some Portal work is coordinated with an unreleased Aegis IPC protocol (for
-example the FileChooser process-boundary work tracks Aegis IPC protocol 20).
+Some Portal work may be coordinated with an unreleased Aegis IPC protocol.
 That Aegis code lives in the Aegis `aegis-dev` worktree, ahead of the tag
-Portal currently pins. Two clean options exist:
+Portal currently pins. The current FileChooser process boundary is not such
+a change: it uses no private Aegis file-picking operation. Two clean options
+exist when a future change does require unreleased IPC:
 
 1. **Pin-baseline mode (default).** Develop the Portal against the released
    Aegis tag in `../aegis`. Land the Aegis protocol change, cut and tag the

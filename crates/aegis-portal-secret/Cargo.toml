@@ -1,6 +1,6 @@
 [package]
 name = "aegis-portal-secret"
-description = "Encrypted Secret portal and Secret Service implementation for Aegis"
+description = "Encrypted native Secret portal implementation for Aegis"
 readme = "README.md"
 publish = false
 version.workspace = true
@@ -11,16 +11,13 @@ rust-version.workspace = true
 
 [dependencies]
 aegis-portal-runtime.workspace = true
-aes = "0.8"
 async-channel = "2"
 argon2 = "0.5"
-cbc = "0.1"
 chacha20poly1305 = "0.10"
 dirs.workspace = true
 hkdf = "0.12"
 libc.workspace = true
 log.workspace = true
-num-bigint = { version = "0.4", features = ["rand"] }
 rand = "0.8"
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +25,3 @@ sha2 = "0.10"
 thiserror.workspace = true
 zbus.workspace = true
 zeroize = { workspace = true, features = ["derive"] }
-
-[dev-dependencies]
-hmac = "0.12"

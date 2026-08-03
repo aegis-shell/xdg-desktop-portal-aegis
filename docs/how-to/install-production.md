@@ -1,0 +1,104 @@
+# How to Install for Production
+
+## Install Dependencies
+
+Install Rust 1.88 or newer, Meson, Ninja, `pkg-config`, GTK 4.10 or newer,
+PipeWire and SPA development files, `xdg-desktop-portal`,
+`xdg-desktop-portal-gtk`, WirePlumber, and `xdg-email`. Install PAM
+development files only when the optional PAM module is required.
+
+Use the exact Aegis release in the
+[Compatibility Reference](../reference/compatibility.md). Do not package a
+local Cargo path override.
+
+## Build and Install
+
+Run from the repository root:
+
+```bash
+meson setup build --buildtype=release --prefix=/usr -Dpam=false
+meson compile -C build
+meson install -C build
+```
+
+Set `DESTDIR` for a staged distribution package:
+
+```bash
+DESTDIR="$PWD/stage" meson install -C build
+```
+
+Meson installs both private executables under the configured `libexecdir`,
+generates the matching D-Bus service, and installs `aegis.portal` plus
+`aegis-portals.conf` under the configured data directory.
+
+## Enable PAM Unlock
+
+Reconfigure and rebuild with PAM support:
+
+```bash
+meson setup build --reconfigure -Dpam=true
+meson compile -C build
+meson install -C build
+```
+
+Add the following line after the PAM module that establishes the
+authentication token. The exact file is display-manager specific.
+
+```text
+auth optional pam_aegis.so
+```
+
+Keep the control flag `optional`. `pam_aegis.so` never grants or denies
+authentication. A package containing it is GPL-3.0-only because it links the
+`pamsm` dependency; the rest of the workspace is MIT-licensed.
+
+## Restart the Portal Frontend
+
+Restart the user portal after installing or upgrading:
+
+```bash
+systemctl --user restart xdg-desktop-portal.service
+```
+
+Log out and back in when the session does not use the systemd user service.
+Confirm that `XDG_CURRENT_DESKTOP` contains `aegis` before starting the
+session portal.
+
+## Validate the Installation
+
+Confirm the installed files and activate the backend:
+
+```bash
+busctl --user introspect \
+  org.freedesktop.impl.portal.desktop.aegis \
+  /org/freedesktop/portal/desktop
+```
+
+The output must list exactly the native interfaces in the
+[Portal Support Reference](../reference/portal-support.md). Check recent
+activation errors with:
+
+```bash
+journalctl --user \
+  -u xdg-desktop-portal.service \
+  --since today
+```
+
+ScreenCast additionally requires a running PipeWire server and WirePlumber.
+Verify both before diagnosing the backend:
+
+```bash
+pw-dump
+wpctl status
+```
+
+## Back Up or Migrate Secrets
+
+Stop the portal frontend before copying the vault, and copy the entire
+`$XDG_DATA_HOME/aegis/secrets` directory as one unit. Never restore
+`vault.enc` without its matching `vault.key` or `vault.salt`.
+
+The production per-application key derivation rotates the shared value from
+the pre-production `v0.0.1` implementation. Applications that encrypted data
+with that value must recreate the encrypted data after upgrading. The vault
+files themselves stay in place.

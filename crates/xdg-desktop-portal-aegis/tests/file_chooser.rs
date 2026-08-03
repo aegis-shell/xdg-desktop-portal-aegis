@@ -4,16 +4,17 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 use aegis_portal_prompter::{
     BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PrompterRequest, PrompterResponse,
     SelectionMode, SelectionRequest, SelectionResponse,
 };
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 mod common;
-use common::{KillOnDrop, daemon_command, private_bus, temp_dir, wait_for_name};
+use common::{KillOnDrop, daemon_command, e2e_required, private_bus, temp_dir, wait_for_name};
 
 const PORTAL: &str = "org.freedesktop.impl.portal.desktop.aegis";
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -171,11 +172,6 @@ fn file_chooser_end_to_end() {
 
     wait_for_name(&conn, PORTAL);
     let chooser_proxy = chooser(&conn);
-    let version: u32 = chooser_proxy
-        .get_property("version")
-        .expect("version property");
-    assert_eq!(version, 3);
-
     // OpenFile exercises every v3 option whose old compositor picker lost.
     let filters = vec![(
         "Images".to_owned(),
@@ -335,4 +331,170 @@ fn file_chooser_end_to_end() {
     let _ = std::fs::remove_dir_all(data_dir);
     let _ = std::fs::remove_dir_all(runtime_dir);
     let _ = std::fs::remove_dir_all(fixture_dir);
+}
+
+#[test]
+fn public_frontend_routes_file_chooser_and_returns_response() {
+    let frontend = [
+        "/usr/libexec/xdg-desktop-portal",
+        "/usr/lib/xdg-desktop-portal",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file());
+    let Some(frontend) = frontend else {
+        assert!(
+            !e2e_required(),
+            "required xdg-desktop-portal frontend is unavailable"
+        );
+        eprintln!("public frontend test: xdg-desktop-portal is unavailable, skipping");
+        return;
+    };
+    let Some(bus) = private_bus() else {
+        eprintln!("public frontend test: no dbus-daemon, skipping");
+        return;
+    };
+    let conn = bus.connect();
+
+    let root = temp_dir("file-chooser-frontend");
+    let backend_data = root.join("backend-data");
+    let frontend_data = root.join("frontend-data");
+    let portal_data = root.join("portal-data");
+    let config_home = root.join("config");
+    let runtime_dir = root.join("runtime");
+    let fixture_dir = root.join("prompter");
+    let portal_dir = portal_data.join("xdg-desktop-portal/portals");
+    let config_dir = config_home.join("xdg-desktop-portal");
+    for directory in [
+        &backend_data,
+        &frontend_data,
+        &runtime_dir,
+        &fixture_dir,
+        &portal_dir,
+        &config_dir,
+    ] {
+        std::fs::create_dir_all(directory).expect("create frontend fixture directory");
+    }
+    std::fs::write(
+        portal_dir.join("aegis.portal"),
+        include_str!("../../../contrib/xdg-desktop-portal/portals/aegis.portal"),
+    )
+    .expect("stage portal metadata");
+    std::fs::write(
+        // 1.18 only consults the desktop-specific filename when
+        // XDG_CURRENT_DESKTOP is non-empty. Mirror the installed package.
+        config_dir.join("aegis-portals.conf"),
+        "[preferred]\ndefault=aegis\norg.freedesktop.impl.portal.FileChooser=aegis\n",
+    )
+    .expect("stage frontend routing");
+
+    let prompter = fake_prompter(&fixture_dir);
+    write_response(
+        &fixture_dir,
+        1,
+        &SelectionResponse::Selected {
+            paths: vec![BytePath::from_path("/tmp/public-file-chooser.txt")],
+            current_filter: None,
+            choices: Vec::new(),
+        },
+    );
+
+    let backend_log = root.join("backend.log");
+    let mut backend = Command::new(env!("CARGO_BIN_EXE_xdg-desktop-portal-aegis"));
+    backend
+        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
+        .env("XDG_DATA_HOME", &backend_data)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("AEGIS_PORTAL_PROMPTER", &prompter)
+        .env("AEGIS_PROMPTER_FIXTURE", &fixture_dir)
+        .env("RUST_LOG", "debug")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&backend_log).expect("backend log"),
+        ));
+    let _backend = KillOnDrop(backend.spawn().expect("spawn Aegis backend"));
+    wait_for_name(&conn, PORTAL);
+
+    let frontend_log = root.join("frontend.log");
+    let mut frontend_command = Command::new(frontend);
+    frontend_command
+        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
+        .env("XDG_CURRENT_DESKTOP", "aegis")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &frontend_data)
+        // xdg-desktop-portal 1.18 discovers test backends through this
+        // dedicated override rather than XDG_DATA_DIRS.
+        .env("XDG_DESKTOP_PORTAL_DIR", &portal_dir)
+        .env(
+            "XDG_DATA_DIRS",
+            format!("{}:/usr/local/share:/usr/share", portal_data.display()),
+        )
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&frontend_log).expect("frontend log"),
+        ));
+    let _frontend = KillOnDrop(
+        frontend_command
+            .spawn()
+            .expect("spawn xdg-desktop-portal frontend"),
+    );
+    wait_for_name(&conn, "org.freedesktop.portal.Desktop");
+
+    let chooser = Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        DESKTOP_PATH,
+        "org.freedesktop.portal.FileChooser",
+    )
+    .expect("public FileChooser proxy");
+    let token = "aegis_file_chooser_frontend_1";
+    let sender = conn
+        .unique_name()
+        .expect("private bus connection has a unique name")
+        .as_str()
+        .trim_start_matches(':')
+        .replace('.', "_");
+    let expected_handle = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+    let request = Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        expected_handle.as_str(),
+        "org.freedesktop.portal.Request",
+    )
+    .expect("public request proxy");
+    let mut responses = request
+        .receive_signal("Response")
+        .expect("subscribe Response");
+
+    let mut options: HashMap<String, Value<'_>> = HashMap::new();
+    options.insert("handle_token".to_owned(), Value::from(token));
+    options.insert("multiple".to_owned(), Value::from(false));
+    let returned: OwnedObjectPath = chooser
+        .call("OpenFile", &("", "Choose through frontend", options))
+        .unwrap_or_else(|error| {
+            let log = std::fs::read_to_string(&frontend_log).unwrap_or_default();
+            panic!("public OpenFile failed: {error}\nfrontend log:\n{log}")
+        });
+    assert_eq!(returned.as_str(), expected_handle);
+
+    let response = responses.next().expect("portal must emit Response");
+    let (code, results): (u32, HashMap<String, OwnedValue>) =
+        response.body().deserialize().expect("Response body");
+    if code != 0 {
+        let backend_log = std::fs::read_to_string(&backend_log).unwrap_or_default();
+        let frontend_log = std::fs::read_to_string(&frontend_log).unwrap_or_default();
+        panic!(
+            "public OpenFile returned {code}\nbackend log:\n{backend_log}\nfrontend log:\n{frontend_log}"
+        );
+    }
+    assert_eq!(
+        result_uris(&results),
+        ["file:///tmp/public-file-chooser.txt"]
+    );
+    let recorded = read_request(&fixture_dir, 1);
+    assert_eq!(recorded.mode, SelectionMode::OpenFile);
+    assert_eq!(recorded.title, "Choose through frontend");
+
+    std::fs::remove_dir_all(root).ok();
 }

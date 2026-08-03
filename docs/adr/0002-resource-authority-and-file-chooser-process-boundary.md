@@ -1,6 +1,6 @@
 # ADR-0002: Resource authority and FileChooser process boundary
 
-- Status: Accepted
+- Status: Superseded by [ADR-0003](0003-production-interface-boundary.md)
 - Date: 2026-08-02
 - Supersedes: [ADR-0001](0001-repository-and-compatibility-boundary.md)
 

@@ -119,9 +119,6 @@ fn get_user_information(
     wait_for_name(&conn, PORTAL);
 
     let account = Proxy::new(&conn, PORTAL, DESKTOP_PATH, IFACE).expect("account proxy");
-    let version: u32 = account.get_property("version").expect("version property");
-    assert_eq!(version, 1);
-
     let mut options: HashMap<String, Value<'_>> = HashMap::new();
     options.insert(
         "reason".to_string(),

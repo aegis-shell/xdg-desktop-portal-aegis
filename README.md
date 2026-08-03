@@ -4,8 +4,7 @@
 [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)
 backend for the Aegis desktop. It translates freedesktop portal D-Bus
 requests into Aegis's scoped IPC, publishes ScreenCast streams through
-PipeWire, and hosts the encrypted Secret portal and transitional Secret
-Service compatibility API.
+PipeWire, and hosts the encrypted, per-application Secret portal.
 
 The repository builds a D-Bus-activated backend plus a disposable FileChooser
 UI host from a small Cargo workspace:
@@ -15,7 +14,7 @@ UI host from a small Cargo workspace:
 - `aegis-portal-prompter` runs one GTK4 file dialog per request. It owns file
   browsing and never connects to compositor IPC.
 - `aegis-portal-runtime` owns the shared portal Request lifecycle.
-- `aegis-portal-secret` owns the encrypted vault and both Secret APIs.
+- `aegis-portal-secret` owns the encrypted vault and native Secret backend.
 - `aegis-pam` optionally forwards a verified login password for vault
   auto-unlock.
 
@@ -29,18 +28,28 @@ for the authoritative matrix.
 
 ## Build
 
-Install GTK4, PipeWire, SPA, PAM, and `pkg-config` development packages, then
-run:
+Install Meson, GTK 4.10 or newer, PipeWire, SPA, and `pkg-config` development
+packages, then run:
 
 ```bash
 cargo build --locked --release --workspace
 cargo test --locked --workspace
 ```
 
-The backend binary is private and is normally activated by D-Bus. Packaging
-installs it as `/usr/lib/xdg-desktop-portal-aegis`, installs
-`aegis-portal-prompter` as `/usr/lib/aegis-portal-prompter`, and installs the
-files under `contrib/`.
+Build and stage the production installation with:
+
+```bash
+meson setup build --buildtype=release --prefix=/usr -Dpam=false
+meson compile -C build
+DESTDIR="$PWD/stage" meson install -C build
+```
+
+Meson installs both private executables under `libexecdir`, generates the
+D-Bus activation file with that exact path, and installs the portal metadata
+and routing configuration. The optional PAM module is enabled with
+`-Dpam=true`; it requires PAM development files. A production installation
+also requires `xdg-desktop-portal-gtk` for interfaces intentionally delegated
+to the GTK backend. See [How to Install for Production](docs/how-to/install-production.md).
 
 The repository's own source is MIT-licensed. A binary package that includes
 the optional `pam_aegis.so` module must additionally declare GPL-3.0-only
@@ -65,6 +74,8 @@ commits.
 ## Documentation
 
 - [Documentation index](docs/index.md)
+- [Production installation](docs/how-to/install-production.md)
+- [Portal support reference](docs/reference/portal-support.md)
 - [Compatibility reference](docs/reference/compatibility.md)
 - [Architecture decisions](docs/adr/index.md)
 - [Contributor documentation](docs/dev/index.md)

@@ -3,13 +3,12 @@
 //!
 //! Sandboxed applications retrieve a master secret through this interface;
 //! the portal frontend then encrypts per-application secrets with it. The
-//! served secret is derived from the vault master key with HKDF-SHA256
-//! (`info = b"aegis.portal.Secret/v1"`) so the raw vault key never leaves
-//! the process, and it is written to the caller-supplied file descriptor
-//! rather than returned over D-Bus.
+//! served secret is derived from the vault master key and application ID
+//! with HKDF-SHA256 so applications receive stable, mutually isolated keys
+//! and the raw vault key never leaves the process. It is written to the
+//! caller-supplied file descriptor rather than returned over D-Bus.
 //!
-//! This module depends only on `SecretState` and the vault — never on the
-//! transitional `compat` layer, so deleting `compat/` cannot affect it.
+//! This module depends only on `SecretState` and the vault.
 //!
 //! Response codes follow the portal specification: 0 success, 1 cancelled
 //! (the client called `Request.Close` first, or dismissed the unlock
@@ -32,14 +31,17 @@ pub(crate) const SECRET_VERSION: u32 = 1;
 
 /// HKDF-Expand info separating the portal secret from every other use of
 /// the vault master key.
-const PORTAL_SECRET_INFO: &[u8] = b"aegis.portal.Secret/v1";
+const PORTAL_SECRET_INFO: &[u8] = b"aegis.portal.Secret/v1\0";
 
 /// Derive the 32-byte secret handed to the portal frontend. No salt (the
 /// master key is already a uniform key), fixed info for domain separation.
-pub(crate) fn derive_portal_secret(master_key: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn derive_portal_secret(master_key: &[u8; 32], app_id: &str) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, master_key);
     let mut out = [0u8; 32];
-    hk.expand(PORTAL_SECRET_INFO, &mut out)
+    let mut info = Vec::with_capacity(PORTAL_SECRET_INFO.len() + app_id.len());
+    info.extend_from_slice(PORTAL_SECRET_INFO);
+    info.extend_from_slice(app_id.as_bytes());
+    hk.expand(&info, &mut out)
         .expect("a 32-byte HKDF-SHA256 output is always valid");
     out
 }
@@ -70,7 +72,7 @@ impl SecretIface {
         log::info!("portal: RetrieveSecret for '{app_id}' at {path}");
 
         aegis_portal_runtime::register(self.conn.inner(), &self.tracker, &path).await?;
-        let response = self.run(&path, fd).await;
+        let response = self.run(&path, &app_id, fd).await;
         aegis_portal_runtime::finish(self.conn.inner(), &self.tracker, &path).await;
         response
     }
@@ -89,6 +91,7 @@ impl SecretIface {
     async fn run(
         &self,
         path: &str,
+        app_id: &str,
         fd: Fd<'_>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, Value<'static>>)> {
         if self.tracker.lock().unwrap().was_closed(path) {
@@ -97,7 +100,7 @@ impl SecretIface {
         }
 
         if self.state.lock().unwrap().is_unlocked() {
-            return Ok(self.deliver(fd));
+            return Ok(self.deliver(app_id, fd));
         }
 
         // Locked (password-mode vault without a PAM token): hand the fd to
@@ -113,11 +116,13 @@ impl SecretIface {
         let (outcome_tx, outcome_rx) = async_channel::bounded(1);
         super::enqueue_unlock_request(
             &self.state,
-            &self.conn,
             &self.prompter,
-            super::PendingUnlock::PortalRetrieve {
+            super::PendingUnlock {
                 fd: owned_fd,
                 outcome: outcome_tx,
+                tracker: Arc::clone(&self.tracker),
+                request_path: path.to_owned(),
+                app_id: app_id.to_owned(),
             },
         );
         let outcome = outcome_rx
@@ -139,13 +144,13 @@ impl SecretIface {
 
     /// The unlocked fast path: derive the portal secret and stream it into
     /// the caller's fd. The state guard is dropped before any fd I/O.
-    fn deliver(&self, fd: Fd<'_>) -> (u32, HashMap<String, Value<'static>>) {
+    fn deliver(&self, app_id: &str, fd: Fd<'_>) -> (u32, HashMap<String, Value<'static>>) {
         let mut secret = {
             let state = self.state.lock().unwrap();
             let Some(vault) = &state.vault else {
                 return (2, HashMap::new());
             };
-            derive_portal_secret(vault.get_master_key())
+            derive_portal_secret(vault.get_master_key(), app_id)
         };
 
         // The fd passed through the frontend is usually a pipe, not a
@@ -172,9 +177,14 @@ mod tests {
     #[test]
     fn portal_secret_is_deterministic_and_distinct_from_the_master_key() {
         let master_key = [0x5au8; 32];
-        let first = derive_portal_secret(&master_key);
-        let second = derive_portal_secret(&master_key);
+        let first = derive_portal_secret(&master_key, "org.example.One");
+        let second = derive_portal_secret(&master_key, "org.example.One");
         assert_eq!(first, second);
         assert_ne!(first, master_key);
+        assert_ne!(
+            first,
+            derive_portal_secret(&master_key, "org.example.Two"),
+            "different application IDs must not share a portal secret"
+        );
     }
 }

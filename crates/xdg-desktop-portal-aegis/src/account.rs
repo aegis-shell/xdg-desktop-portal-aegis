@@ -21,8 +21,7 @@ use crate::files;
 use crate::ipc::PortalCapture;
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 
-/// The served interface version.
-pub(crate) const ACCOUNT_VERSION: u32 = 1;
+const MAX_REASON_BYTES: usize = 16 * 1024;
 
 /// One account request handed from the bus method to the worker.
 pub(crate) enum AccountJob {
@@ -41,7 +40,7 @@ pub(crate) struct AccountIface {
     /// methods, which already run on zbus's executor (screenshot precedent).
     pub(crate) conn: zbus::Connection,
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
-    pub(crate) jobs: mpsc::Sender<AccountJob>,
+    pub(crate) jobs: mpsc::SyncSender<AccountJob>,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.Account")]
@@ -56,23 +55,35 @@ impl AccountIface {
         let path = handle.as_str().to_string();
         log::info!("portal: GetUserInformation for '{app_id}' at {path}");
 
-        let reason = options
-            .get("reason")
-            .and_then(|value| String::try_from(value).ok());
+        let reason = match account_reason(&options) {
+            Ok(reason) => reason,
+            Err(error) => {
+                log::warn!("portal: refusing Account request: {error}");
+                return Ok((2, HashMap::new()));
+            }
+        };
 
         aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
         let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.send(AccountJob::GetUserInformation {
+        let queued = self.jobs.try_send(AccountJob::GetUserInformation {
             request_path: path.clone(),
             app_id: app_id.to_string(),
             reason,
             reply,
         });
-        if queued.is_err() {
-            aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-            return Err(zbus::fdo::Error::Failed(
-                "account worker is gone".to_string(),
-            ));
+        match queued {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!("portal: refusing Account request: worker queue is full");
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Ok((2, HashMap::new()));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
+                return Err(zbus::fdo::Error::Failed(
+                    "account worker is gone".to_string(),
+                ));
+            }
         }
         let result = response.recv().await.map_err(|_| {
             zbus::fdo::Error::Failed("account worker dropped its response".to_string())
@@ -80,20 +91,36 @@ impl AccountIface {
         aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
         result
     }
-
-    #[zbus(property, name = "version")]
-    fn version(&self) -> u32 {
-        ACCOUNT_VERSION
-    }
 }
 
-/// Worker loop: one consent prompt at a time, serialized like the other
-/// choosers (each blocks on user interaction).
+fn account_reason(options: &HashMap<String, Value<'_>>) -> Result<Option<String>, String> {
+    let reason = options
+        .get("reason")
+        .and_then(|value| String::try_from(value).ok());
+    if reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > MAX_REASON_BYTES)
+    {
+        return Err(format!("reason exceeds the {MAX_REASON_BYTES}-byte limit"));
+    }
+    Ok(reason)
+}
+
+/// Dispatch consent prompts independently so one application leaving a
+/// prompt open cannot head-of-line block every other Account request.
 pub(crate) fn account_worker(
     rx: mpsc::Receiver<AccountJob>,
     tracker: Arc<Mutex<RequestTracker>>,
-    mut capture: PortalCapture,
+    socket: std::path::PathBuf,
 ) {
+    const MAX_ACTIVE_ACCOUNT_REQUESTS: usize = 32;
+    struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Ok(AccountJob::GetUserInformation {
         request_path,
         app_id,
@@ -101,8 +128,29 @@ pub(crate) fn account_worker(
         reply,
     }) = rx.recv()
     {
-        let result = run_request(&mut capture, &tracker, &request_path, &app_id, reason);
-        let _ = reply.send_blocking(result);
+        if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_ACTIVE_ACCOUNT_REQUESTS {
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            log::warn!("portal: refusing Account request: concurrency limit reached");
+            let _ = reply.send_blocking((2, HashMap::new()));
+            continue;
+        }
+        let task_tracker = Arc::clone(&tracker);
+        let task_socket = socket.clone();
+        let active_guard = ActiveGuard(Arc::clone(&active));
+        let spawn_failure_reply = reply.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("aegis-portal-account-task".to_owned())
+            .spawn(move || {
+                let _active = active_guard;
+                let mut capture = PortalCapture::new(task_socket);
+                let result =
+                    run_request(&mut capture, &task_tracker, &request_path, &app_id, reason);
+                let _ = reply.send_blocking(result);
+            })
+        {
+            log::error!("portal: could not spawn Account task: {error}");
+            let _ = spawn_failure_reply.send_blocking((2, HashMap::new()));
+        }
     }
 }
 
@@ -176,26 +224,12 @@ impl Identity {
 /// `(account id, real name)` from `getpwuid`: the GECOS full name up to
 /// the first comma, falling back to the account name.
 fn passwd_identity() -> (String, String) {
-    // SAFETY: getpwuid's returned pointer is valid for the process lifetime
-    // and only read here.
-    let passwd = unsafe { libc::getpwuid(libc::getuid()) };
-    if passwd.is_null() {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let Some((id, gecos)) = passwd_fields(uid) else {
         let fallback = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
         return (fallback.clone(), fallback);
-    }
-    let read = |field: *const std::ffi::c_char| {
-        if field.is_null() {
-            return String::new();
-        }
-        // SAFETY: passwd string fields are NUL-terminated.
-        unsafe { std::ffi::CStr::from_ptr(field) }
-            .to_string_lossy()
-            .into_owned()
     };
-    // SAFETY: the passwd struct outlives these reads.
-    let (pw_name, pw_gecos) = unsafe { ((*passwd).pw_name, (*passwd).pw_gecos) };
-    let id = read(pw_name);
-    let gecos = read(pw_gecos);
     let name = gecos
         .split(',')
         .next()
@@ -204,6 +238,56 @@ fn passwd_identity() -> (String, String) {
         .map(str::to_string)
         .unwrap_or_else(|| id.clone());
     (id, name)
+}
+
+/// Thread-safe passwd lookup. The daemon has D-Bus, capture, chooser, and
+/// PipeWire threads, so the process-global buffer returned by `getpwuid`
+/// would be unsafe here.
+fn passwd_fields(uid: libc::uid_t) -> Option<(String, String)> {
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut size = if suggested > 0 {
+        usize::try_from(suggested).unwrap_or(16 * 1024)
+    } else {
+        16 * 1024
+    }
+    .clamp(1024, 1024 * 1024);
+
+    loop {
+        // SAFETY: `passwd` is a plain C output struct initialized before use.
+        let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; size];
+        // SAFETY: the output pointers and buffer are valid for this call;
+        // strings are copied before `buffer` is dropped.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut passwd,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && size < 1024 * 1024 {
+            size = (size * 2).min(1024 * 1024);
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        let read = |field: *const std::ffi::c_char| {
+            if field.is_null() {
+                String::new()
+            } else {
+                // SAFETY: successful getpwuid_r fields point into its
+                // NUL-terminated caller-owned buffer.
+                unsafe { std::ffi::CStr::from_ptr(field) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        return Some((read(passwd.pw_name), read(passwd.pw_gecos)));
+    }
 }
 
 /// The first existing avatar candidate, in `aegis-avatar`'s precedence:
@@ -229,14 +313,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_is_1() {
-        assert_eq!(ACCOUNT_VERSION, 1);
-    }
-
-    #[test]
     fn identity_is_never_empty() {
         let (id, name) = passwd_identity();
         assert!(!id.is_empty());
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn account_reason_limit_is_bounded() {
+        let accepted = HashMap::from([(
+            "reason".to_owned(),
+            Value::from("x".repeat(MAX_REASON_BYTES)),
+        )]);
+        assert!(account_reason(&accepted).is_ok());
+
+        let refused = HashMap::from([(
+            "reason".to_owned(),
+            Value::from("x".repeat(MAX_REASON_BYTES + 1)),
+        )]);
+        assert!(account_reason(&refused).is_err());
     }
 }
