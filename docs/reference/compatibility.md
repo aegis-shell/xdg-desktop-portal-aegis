@@ -1,19 +1,19 @@
 # Compatibility Reference
 
-Portal and Aegis use independent release sequences. Current Portal
-development implements the required Aegis IPC wire subset inside the
+Portal and Aegis use independent release sequences. Portal `v0.0.4`
+implements the required Aegis IPC wire subset inside the
 Portal-owned `aegis-portal-ipc` crate. Compatibility is defined by the wire
 protocol and verified Aegis protocol schemas; it is not a Cargo source
 dependency.
 
 | Portal line | Aegis runtime | IPC protocol | Aegis build dependency |
 |-------------|---------------|--------------|------------------------|
-| Unreleased | `v0.0.11`, `v0.0.12` | 24 | None |
+| `v0.0.4` | `v0.0.11`, `v0.0.12` | 24 | None |
 | `v0.0.3` | `v0.0.11`, `v0.0.12` | 24 | Exact `v0.0.11` tagged Git crates |
 | `v0.0.2` | `v0.0.11` | 24 | Exact tagged Git crates |
 | `v0.0.1` | `v0.0.9` | Release-specific | Exact tagged Git crates |
 
-The Unreleased line builds and tests without an Aegis checkout. Its committed
+Portal `v0.0.4` builds and tests without an Aegis checkout. Its committed
 `Cargo.lock` contains no package from the Aegis repository. A production
 installation still needs a running Aegis compositor because Settings,
 Screenshot, color and target selection, and ScreenCast consume

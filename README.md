@@ -24,8 +24,8 @@ UI host from a small Cargo workspace:
 
 ## Compatibility
 
-Portal and Aegis releases have independent version sequences. The current
-development line implements Aegis IPC protocol 24; its wire schema is
+Portal and Aegis releases have independent version sequences. Portal `v0.0.4`
+implements Aegis IPC protocol 24; its wire schema is
 verified against Aegis `v0.0.11` and `v0.0.12`. This is a runtime
 compatibility contract, not a source dependency; see the
 [Compatibility Reference](docs/reference/compatibility.md).

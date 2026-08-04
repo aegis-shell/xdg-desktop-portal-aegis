@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-pam"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libc",
  "pamsm",
@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-ipc"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "libc",
  "serde",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-prompter"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "env_logger",
  "gdk4-wayland",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-runtime"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-channel",
  "log",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-secret"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aegis-portal-runtime",
  "argon2",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "xdg-desktop-portal-aegis"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aegis-portal-ipc",
  "aegis-portal-prompter",

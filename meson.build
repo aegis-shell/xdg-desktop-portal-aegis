@@ -1,6 +1,6 @@
 project(
   'xdg-desktop-portal-aegis',
-  version: '0.0.3',
+  version: '0.0.4',
   meson_version: '>=1.3.0',
 )
 
