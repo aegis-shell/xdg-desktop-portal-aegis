@@ -8,7 +8,7 @@ that directory.
 Do not bypass Git hooks.
 
 Local Aegis mode is active when `.cargo/config.toml` contains
-`[patch."https://github.com/ming2k/aegis"]`. In that mode:
+`[patch."https://github.com/aegis-shell/aegis"]`. In that mode:
 
 - Treat `.cargo/config.toml` and the path-resolved `Cargo.lock` as local
   worktree state. They must not be staged or committed.

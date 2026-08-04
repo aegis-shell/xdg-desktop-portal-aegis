@@ -9,6 +9,7 @@ compositor; the production backend receives the same types through
 
 | Portal release | Aegis release | IPC dependency source |
 |----------------|---------------|-----------------------|
+| `v0.0.3` | `v0.0.11` | `https://github.com/aegis-shell/aegis`, tag `v0.0.11` |
 | `v0.0.2` | `v0.0.11` | `https://github.com/ming2k/aegis`, tag `v0.0.11` |
 | `v0.0.1` | `v0.0.9` | `https://github.com/ming2k/aegis`, tag `v0.0.9` |
 
@@ -17,6 +18,7 @@ packages must express an exact dependency on the Aegis version in this
 table. A local path patch is development state and does not change release
 compatibility.
 
-Portal `v0.0.2` uses Aegis `v0.0.11`, whose IPC protocol version is 24. The
-FileChooser process boundary does not add a private Aegis file-picking
-operation: the backend and its one-shot GTK process own that resource flow.
+Portal `v0.0.2` and `v0.0.3` use Aegis `v0.0.11`, whose IPC protocol version
+is 24. The FileChooser process boundary does not add a private Aegis
+file-picking operation: the backend and its one-shot GTK process own that
+resource flow.

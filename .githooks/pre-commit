@@ -2,7 +2,7 @@
 set -eu
 
 config_path=".cargo/config.toml"
-patch_header='[patch."https://github.com/ming2k/aegis"]'
+patch_header='[patch."https://github.com/aegis-shell/aegis"]'
 
 if [ ! -f "$config_path" ] || ! grep -Fqx "$patch_header" "$config_path"; then
     exit 0

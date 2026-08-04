@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-08-04
+
+### Fixed
+
+- Resolve the exact Aegis `v0.0.11` IPC crates from the canonical
+  `aegis-shell/aegis` repository so clean distribution builds do not depend
+  on the retired `ming2k/aegis` remote.
+
 ## [0.0.2] - 2026-08-03
 
 ### Changed
@@ -75,6 +83,7 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.3
 [0.0.2]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.2
 [0.0.1]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.1

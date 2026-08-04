@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -13,14 +13,14 @@ repository = "https://github.com/aegis-shell/xdg-desktop-portal-aegis"
 # The portal is released against one exact Aegis IPC revision. Local joint
 # development uses .cargo/aegis-local.toml without changing this source of
 # truth or the canonical lockfile.
-aegis-authority = { version = "=0.0.11", git = "https://github.com/ming2k/aegis", tag = "v0.0.11" }
-aegis-core = { version = "=0.0.11", git = "https://github.com/ming2k/aegis", tag = "v0.0.11" }
-aegis-ipc = { version = "=0.0.11", git = "https://github.com/ming2k/aegis", tag = "v0.0.11" }
-aegis-logging = { version = "=0.0.11", git = "https://github.com/ming2k/aegis", tag = "v0.0.11" }
+aegis-authority = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
+aegis-core = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
+aegis-ipc = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
+aegis-logging = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
 
-aegis-portal-runtime = { version = "=0.0.2", path = "crates/aegis-portal-runtime" }
-aegis-portal-prompter = { version = "=0.0.2", path = "crates/aegis-portal-prompter" }
-aegis-portal-secret = { version = "=0.0.2", path = "crates/aegis-portal-secret" }
+aegis-portal-runtime = { version = "=0.0.3", path = "crates/aegis-portal-runtime" }
+aegis-portal-prompter = { version = "=0.0.3", path = "crates/aegis-portal-prompter" }
+aegis-portal-secret = { version = "=0.0.3", path = "crates/aegis-portal-secret" }
 
 dirs = "5"
 libc = "0.2"

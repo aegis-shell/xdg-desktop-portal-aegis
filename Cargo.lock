@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "aegis-audit"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "libc",
  "serde",
@@ -27,7 +27,7 @@ dependencies = [
 [[package]]
 name = "aegis-authority"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "aegis-core",
  "getrandom 0.3.4",
@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "aegis-core"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "serde",
  "serde_json",
@@ -47,7 +47,7 @@ dependencies = [
 [[package]]
 name = "aegis-ipc"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "aegis-audit",
  "aegis-authority",
@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "aegis-logging"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "log",
  "tracing",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-pam"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "libc",
  "pamsm",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-prompter"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aegis-logging",
  "gdk4-wayland",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-runtime"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "async-channel",
  "log",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-portal-secret"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aegis-portal-runtime",
  "argon2",
@@ -124,7 +124,7 @@ dependencies = [
 [[package]]
 name = "aegis-semantic"
 version = "0.0.11"
-source = "git+https://github.com/ming2k/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
+source = "git+https://github.com/aegis-shell/aegis?tag=v0.0.11#4c29ee56d5d7f99ef531096e75555999107e1ba1"
 dependencies = [
  "aegis-core",
  "serde",
@@ -2119,7 +2119,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xdg-desktop-portal-aegis"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "aegis-authority",
  "aegis-core",

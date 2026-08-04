@@ -110,7 +110,7 @@ cargo tree -i aegis-authority
 ```
 
 All four trees must show paths below the sibling `aegis` checkout (not the
-`https://github.com/ming2k/aegis` Git source).
+`https://github.com/aegis-shell/aegis` Git source).
 
 ## Daily Development
 
