@@ -1,14 +1,10 @@
 //! End-to-end password-unlock tests for the native Secret portal. A real
-//! backend talks to a fake Aegis compositor over scoped IPC and writes the
-//! derived portal secret to a client-provided pipe.
+//! backend delegates masked input to a Portal-owned prompter and writes the
+//! derived portal secret to a client-provided pipe. No Aegis IPC is involved.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use aegis_ipc::{
-    ActorCapability, ConnectionCapabilities, Handler, JournalSnapshot, Scope, SecretPromptResult,
-    Server,
-};
+use aegis_portal_prompter::{PromptRequest, PrompterResponse, SecretRequest, SecretResponse};
 use argon2::Argon2;
 use argon2::password_hash::SaltString;
 use chacha20poly1305::XChaCha20Poly1305;
@@ -21,8 +17,8 @@ use zbus::zvariant::{Fd, ObjectPath, Value};
 
 mod common;
 use common::{
-    KillOnDrop, pipe_pair, private_bus, read_all_with_timeout, spawn_daemon, temp_dir,
-    wait_for_name,
+    KillOnDrop, daemon_command, fake_prompter, pipe_pair, private_bus, read_all_with_timeout,
+    read_prompter_request, temp_dir, wait_for_name, write_prompter_response,
 };
 
 const PORTAL: &str = "org.freedesktop.impl.portal.desktop.aegis";
@@ -66,105 +62,6 @@ fn write_password_vault(secrets_dir: &std::path::Path) {
         .expect("make vault private");
 }
 
-struct FakeCompositor {
-    answer: SecretPromptResult,
-    grants: std::sync::Mutex<aegis_authority::ResourceGrantRegistry>,
-}
-
-impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> ConnectionCapabilities {
-        ConnectionCapabilities {
-            query: true,
-            control: true,
-            input: false,
-            session: false,
-            interaction_domain: false,
-        }
-    }
-
-    fn issue_resource_grant(
-        &self,
-        session: aegis_authority::ActorSessionId,
-        principal: Option<&str>,
-        resource: aegis_authority::ActorResource,
-        ttl: Duration,
-        uses: u32,
-        _confirm_exact_resource: bool,
-    ) -> Result<aegis_authority::ResourceGrant, String> {
-        let principal = principal
-            .map(aegis_authority::ActorPrincipal::new)
-            .transpose()
-            .map_err(str::to_owned)?;
-        self.grants.lock().unwrap().issue(
-            session,
-            principal,
-            resource.required_capability(),
-            resource,
-            ttl,
-            uses,
-        )
-    }
-
-    fn consume_resource_grant(
-        &self,
-        session: aegis_authority::ActorSessionId,
-        principal: Option<&str>,
-        id: &aegis_authority::ResourceGrantId,
-        resource: &aegis_authority::ActorResource,
-    ) -> Result<aegis_authority::ResourceGrant, String> {
-        let principal = principal
-            .map(aegis_authority::ActorPrincipal::new)
-            .transpose()
-            .map_err(str::to_owned)?;
-        self.grants
-            .lock()
-            .unwrap()
-            .consume(session, principal.as_ref(), id, resource)
-    }
-
-    fn windows(&self) -> Vec<aegis_core::window::Window> {
-        Vec::new()
-    }
-
-    fn workspaces(&self) -> aegis_core::workspace::WorkspaceSnapshot {
-        aegis_core::workspace::WorkspaceSnapshot { outputs: vec![] }
-    }
-
-    fn notifications(&self) -> Vec<aegis_core::notify::Notification> {
-        Vec::new()
-    }
-
-    fn outputs(&self) -> Vec<aegis_core::output::OutputInfo> {
-        Vec::new()
-    }
-
-    fn journal_since(&self, _since: u64) -> JournalSnapshot {
-        JournalSnapshot {
-            entries: vec![],
-            oldest_seq: 1,
-            latest_seq: 0,
-        }
-    }
-
-    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
-
-    fn resolve_scope(&self, name: &str) -> Option<Scope> {
-        (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
-            ops: Some(vec![ActorCapability::PromptSecret]),
-            ..Scope::default()
-        })
-    }
-
-    fn prompt_secret(
-        &self,
-        _conn_id: u64,
-        _title: String,
-        _reason: Option<String>,
-    ) -> Result<SecretPromptResult, String> {
-        Ok(self.answer.clone())
-    }
-}
-
 fn expected_portal_secret_password_mode() -> [u8; 32] {
     let salt = SaltString::from_b64(SALT_B64).expect("parse salt");
     let mut key = [0u8; 32];
@@ -180,20 +77,21 @@ fn expected_portal_secret_password_mode() -> [u8; 32] {
 
 /// Run RetrieveSecret against a locked vault. `None` means dbus-daemon is
 /// unavailable and the caller should skip.
-fn retrieve_secret_while_locked(answer: SecretPromptResult) -> Option<(u32, Vec<u8>)> {
+fn retrieve_secret_while_locked(answer: SecretResponse) -> Option<(u32, Vec<u8>, SecretRequest)> {
     let bus = private_bus()?;
     let conn = bus.connect();
-    let data_dir = temp_dir("data");
+    let data_dir = temp_dir("secret-data");
     write_password_vault(&data_dir.join("aegis/secrets"));
-    let runtime_dir = temp_dir("runtime");
+    let runtime_dir = temp_dir("secret-runtime");
+    let fixture_dir = temp_dir("secret-prompter");
+    let prompter = fake_prompter(&fixture_dir);
+    write_prompter_response(&fixture_dir, 1, &PrompterResponse::secret(answer));
 
-    let fake = Arc::new(FakeCompositor {
-        answer,
-        grants: std::sync::Mutex::new(aegis_authority::ResourceGrantRegistry::default()),
-    });
-    let _server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
-        .expect("bind fake compositor IPC");
-    let _daemon = KillOnDrop(spawn_daemon(&bus, &data_dir, &runtime_dir));
+    let mut command = daemon_command(&bus, &data_dir, &runtime_dir);
+    command
+        .env("AEGIS_PORTAL_PROMPTER", &prompter)
+        .env("AEGIS_PROMPTER_FIXTURE", &fixture_dir);
+    let _daemon = KillOnDrop(command.spawn().expect("spawn portal daemon"));
     wait_for_name(&conn, PORTAL);
 
     let portal = Proxy::new(
@@ -222,15 +120,19 @@ fn retrieve_secret_while_locked(answer: SecretPromptResult) -> Option<(u32, Vec<
         )
         .expect("RetrieveSecret call");
     let bytes = read_all_with_timeout(read_end, Duration::from_secs(5));
+    let PromptRequest::Secret(request) = read_prompter_request(&fixture_dir, 1) else {
+        panic!("Secret must issue a masked-input prompt");
+    };
 
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&runtime_dir);
-    Some((response, bytes))
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    Some((response, bytes, request))
 }
 
 #[test]
 fn retrieve_secret_while_locked_prompts_then_delivers() {
-    let Some((response, bytes)) = retrieve_secret_while_locked(SecretPromptResult::Secret {
+    let Some((response, bytes, prompt)) = retrieve_secret_while_locked(SecretResponse::Secret {
         value: PASSWORD.to_string(),
     }) else {
         eprintln!("retrieve secret locked: no dbus-daemon, skipping");
@@ -238,12 +140,17 @@ fn retrieve_secret_while_locked_prompts_then_delivers() {
     };
     assert_eq!(response, 0, "RetrieveSecret must succeed after unlock");
     assert_eq!(bytes.as_slice(), &expected_portal_secret_password_mode());
+    assert_eq!(prompt.title, "Unlock Keyring");
+    assert!(
+        prompt
+            .reason
+            .is_some_and(|reason| reason.contains("locked"))
+    );
 }
 
 #[test]
 fn retrieve_secret_dismissed_reports_cancelled() {
-    let Some((response, bytes)) = retrieve_secret_while_locked(SecretPromptResult::Cancelled)
-    else {
+    let Some((response, bytes, _)) = retrieve_secret_while_locked(SecretResponse::Cancelled) else {
         eprintln!("retrieve secret dismissed: no dbus-daemon, skipping");
         return;
     };

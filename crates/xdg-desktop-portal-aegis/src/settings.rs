@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use aegis_core::settings::{ColorScheme, Contrast, DesktopPreferences};
+use aegis_portal_ipc::{ColorScheme, Contrast, DesktopPreferences};
 use zbus::zvariant::{OwnedValue, Str, Structure};
 
 pub(crate) const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
@@ -328,9 +328,9 @@ pub(crate) fn spawn_watcher(
 /// Bound the initial IPC query before the D-Bus name is acquired, preventing
 /// the first portal read from racing the subscription thread's first sample.
 pub(crate) fn prime_store(socket: &Path, store: &SettingsStore) {
-    let result = aegis_ipc::Client::connect_with_timeout(
+    let result = aegis_portal_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::ConnectionCapabilities::QUERY,
+        aegis_portal_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )
     .and_then(|mut client| client.settings());
@@ -371,24 +371,24 @@ fn watch_connection(
     socket: &Path,
     store: &SettingsStore,
 ) -> std::io::Result<()> {
-    let mut events = aegis_ipc::Client::connect_with_timeout(
+    let mut events = aegis_portal_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::ConnectionCapabilities::QUERY,
+        aegis_portal_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )?;
     events.subscribe()?;
     events.set_io_timeout(None)?;
 
-    let mut query = aegis_ipc::Client::connect_with_timeout(
+    let mut query = aegis_portal_ipc::Client::connect_with_timeout(
         socket,
-        aegis_ipc::ConnectionCapabilities::QUERY,
+        aegis_portal_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )?;
     update_and_emit(conn, store, query.settings()?.preferences);
     log::info!("portal: subscribed to compositor desktop preferences");
 
     loop {
-        if let aegis_ipc::Event::SettingsChanged { .. } = events.next_event()? {
+        if let aegis_portal_ipc::Event::SettingsChanged { .. } = events.next_event()? {
             update_and_emit(conn, store, query.settings()?.preferences);
         }
     }
@@ -431,7 +431,7 @@ impl SettingsIface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_core::settings::AccentColor;
+    use aegis_portal_ipc::AccentColor;
 
     #[test]
     fn standardized_appearance_values_have_portal_types() {

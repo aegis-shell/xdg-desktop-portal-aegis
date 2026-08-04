@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Remove all Aegis Git crates and sibling-checkout Cargo patches from the
+  source and build graph. The Portal now owns a narrow, independent Aegis IPC
+  protocol-24 client for compositor settings, capture, picking, and streams.
+- Move Account consent and Secret vault password input from compositor IPC to
+  the supervised, one-shot GTK4 Portal prompter used by FileChooser.
+- Remove dormant native implementations for interfaces that are routed to the
+  complete GTK backend.
+
+### Added
+
+- Add literal protocol fixtures and an independent minimal IPC server for
+  media integration tests, so client and server tests do not share the
+  implementation under test.
+
 ## [0.0.3] - 2026-08-04
 
 ### Fixed

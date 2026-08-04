@@ -7,12 +7,11 @@ that directory.
 
 Do not bypass Git hooks.
 
-Local Aegis mode is active when `.cargo/config.toml` contains
-`[patch."https://github.com/aegis-shell/aegis"]`. In that mode:
+Keep the Portal source and build graph independent from the Aegis repository:
 
-- Treat `.cargo/config.toml` and the path-resolved `Cargo.lock` as local
-  worktree state. They must not be staged or committed.
-- Do not use `--no-verify`, force-add either file, or otherwise defeat the
-  pre-commit hook.
-- Update the canonical committed lockfile only after disabling local Aegis
-  mode and resolving the tagged Aegis dependencies.
+- Do not add Aegis internal crates, Aegis Git dependencies, or sibling-path
+  patches.
+- Put compositor integration in the Portal-owned `aegis-portal-ipc` wire
+  projection and keep it limited to compositor-owned resources.
+- Test wire changes with literal protocol fixtures and the independent test
+  server; do not import the compositor's server implementation into tests.

@@ -13,34 +13,80 @@ use std::path::{Component, Path, PathBuf};
 
 /// Version of the private stdin/stdout contract. The backend and prompter
 /// reject mismatches instead of interpreting fields using different schemas.
-pub const PROCESS_CONTRACT_VERSION: u32 = 1;
+pub const PROCESS_CONTRACT_VERSION: u32 = 2;
 
 /// Versioned wire envelope sent to a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrompterRequest {
     pub version: u32,
-    pub selection: SelectionRequest,
+    pub prompt: PromptRequest,
 }
 
 impl PrompterRequest {
     #[must_use]
     pub fn new(selection: SelectionRequest) -> Self {
+        Self::selection(selection)
+    }
+
+    #[must_use]
+    pub fn selection(selection: SelectionRequest) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
-            selection,
+            prompt: PromptRequest::Selection(selection),
         }
     }
 
-    pub fn into_selection(self) -> Result<SelectionRequest, String> {
+    #[must_use]
+    pub fn confirm(confirm: ConfirmRequest) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::Confirm(confirm),
+        }
+    }
+
+    #[must_use]
+    pub fn secret(secret: SecretRequest) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::Secret(secret),
+        }
+    }
+
+    pub fn into_prompt(self) -> Result<PromptRequest, String> {
         if self.version != PROCESS_CONTRACT_VERSION {
             return Err(format!(
                 "unsupported prompter request version {}; expected {}",
                 self.version, PROCESS_CONTRACT_VERSION
             ));
         }
-        self.selection.validate()?;
-        Ok(self.selection)
+        self.prompt.validate()?;
+        Ok(self.prompt)
+    }
+
+    pub fn into_selection(self) -> Result<SelectionRequest, String> {
+        match self.into_prompt()? {
+            PromptRequest::Selection(selection) => Ok(selection),
+            _ => Err("prompter request is not a file selection".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+pub enum PromptRequest {
+    Selection(SelectionRequest),
+    Confirm(ConfirmRequest),
+    Secret(SecretRequest),
+}
+
+impl PromptRequest {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Selection(selection) => selection.validate(),
+            Self::Confirm(confirm) => confirm.validate(),
+            Self::Secret(secret) => secret.validate(),
+        }
     }
 }
 
@@ -49,7 +95,7 @@ impl PrompterRequest {
 #[serde(deny_unknown_fields)]
 pub struct PrompterResponse {
     pub version: u32,
-    pub selection: SelectionResponse,
+    pub result: PromptResult,
 }
 
 impl PrompterResponse {
@@ -57,19 +103,155 @@ impl PrompterResponse {
     pub fn new(selection: SelectionResponse) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
-            selection,
+            result: PromptResult::Selection(selection),
         }
     }
 
-    pub fn into_selection(self) -> Result<SelectionResponse, String> {
+    #[must_use]
+    pub fn confirm(confirm: ConfirmResponse) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::Confirm(confirm),
+        }
+    }
+
+    #[must_use]
+    pub fn secret(secret: SecretResponse) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::Secret(secret),
+        }
+    }
+
+    #[must_use]
+    pub fn failed(message: String) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::Failed { message },
+        }
+    }
+
+    pub fn into_result(self) -> Result<PromptResult, String> {
         if self.version != PROCESS_CONTRACT_VERSION {
             return Err(format!(
                 "unsupported prompter response version {}; expected {}",
                 self.version, PROCESS_CONTRACT_VERSION
             ));
         }
-        Ok(self.selection)
+        Ok(self.result)
     }
+
+    pub fn into_selection(self) -> Result<SelectionResponse, String> {
+        match self.into_result()? {
+            PromptResult::Selection(selection) => Ok(selection),
+            PromptResult::Failed { message } => Err(message),
+            _ => Err("prompter response is not a file selection".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "response", rename_all = "snake_case")]
+pub enum PromptResult {
+    Selection(SelectionResponse),
+    Confirm(ConfirmResponse),
+    Secret(SecretResponse),
+    Failed { message: String },
+}
+
+const MAX_PROMPT_TEXT_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmRequest {
+    pub title: String,
+    pub body: String,
+    pub accept_label: Option<String>,
+    pub modal: bool,
+    pub parent_window: Option<String>,
+}
+
+impl ConfirmRequest {
+    fn validate(&self) -> Result<(), String> {
+        validate_prompt_text("confirmation title", &self.title, false)?;
+        validate_prompt_text("confirmation body", &self.body, false)?;
+        if let Some(label) = self.accept_label.as_deref() {
+            validate_prompt_text("confirmation accept label", label, false)?;
+        }
+        if let Some(parent) = self.parent_window.as_deref() {
+            validate_prompt_text("confirmation parent window", parent, true)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ConfirmResponse {
+    Confirmed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRequest {
+    pub title: String,
+    pub reason: Option<String>,
+}
+
+impl SecretRequest {
+    fn validate(&self) -> Result<(), String> {
+        validate_prompt_text("secret title", &self.title, false)?;
+        if let Some(reason) = self.reason.as_deref() {
+            validate_prompt_text("secret reason", reason, true)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SecretResponse {
+    Secret { value: String },
+    Cancelled,
+}
+
+impl SecretResponse {
+    #[must_use]
+    pub fn take_value(&mut self) -> Option<String> {
+        match self {
+            Self::Secret { value } => Some(std::mem::take(value)),
+            Self::Cancelled => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Secret { .. } => formatter.write_str("SecretResponse::Secret([REDACTED])"),
+            Self::Cancelled => formatter.write_str("SecretResponse::Cancelled"),
+        }
+    }
+}
+
+impl Drop for SecretResponse {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        if let Self::Secret { value } = self {
+            value.zeroize();
+        }
+    }
+}
+
+fn validate_prompt_text(name: &str, value: &str, allow_empty: bool) -> Result<(), String> {
+    if (!allow_empty && value.trim().is_empty())
+        || value.len() > MAX_PROMPT_TEXT_BYTES
+        || value.chars().any(|character| character == '\0')
+    {
+        return Err(format!("{name} is empty, oversized, or contains NUL"));
+    }
+    Ok(())
 }
 
 /// One filesystem path encoded as its native Unix bytes.
@@ -433,14 +615,62 @@ mod tests {
     fn process_contract_rejects_version_mismatches() {
         let envelope = PrompterRequest {
             version: PROCESS_CONTRACT_VERSION + 1,
-            selection: request(SelectionMode::OpenFile),
+            prompt: PromptRequest::Selection(request(SelectionMode::OpenFile)),
         };
         assert!(envelope.into_selection().is_err());
         let envelope = PrompterResponse {
             version: PROCESS_CONTRACT_VERSION + 1,
-            selection: SelectionResponse::Cancelled,
+            result: PromptResult::Selection(SelectionResponse::Cancelled),
         };
         assert!(envelope.into_selection().is_err());
+    }
+
+    #[test]
+    fn typed_prompt_contract_round_trips_without_exposing_secrets() {
+        let confirm = PrompterRequest::confirm(ConfirmRequest {
+            title: "Share".into(),
+            body: "Share account information?".into(),
+            accept_label: Some("_Share".into()),
+            modal: true,
+            parent_window: Some("wayland:parent".into()),
+        });
+        let value = serde_json::to_value(&confirm).unwrap();
+        assert_eq!(value["version"], PROCESS_CONTRACT_VERSION);
+        assert_eq!(value["prompt"]["kind"], "confirm");
+        assert!(matches!(
+            serde_json::from_value::<PrompterRequest>(value)
+                .unwrap()
+                .into_prompt()
+                .unwrap(),
+            PromptRequest::Confirm(_)
+        ));
+
+        let secret = PrompterResponse::secret(SecretResponse::Secret {
+            value: "do-not-log-this".into(),
+        });
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("do-not-log-this"), "{debug}");
+        let encoded = serde_json::to_value(secret).unwrap();
+        assert_eq!(encoded["result"]["kind"], "secret");
+        assert_eq!(encoded["result"]["response"]["status"], "secret");
+    }
+
+    #[test]
+    fn confirmation_and_secret_text_are_bounded() {
+        let empty = PrompterRequest::confirm(ConfirmRequest {
+            title: String::new(),
+            body: "Body".into(),
+            accept_label: None,
+            modal: true,
+            parent_window: None,
+        });
+        assert!(empty.into_prompt().is_err());
+
+        let oversized = PrompterRequest::secret(SecretRequest {
+            title: "Unlock".into(),
+            reason: Some("x".repeat(MAX_PROMPT_TEXT_BYTES + 1)),
+        });
+        assert!(oversized.into_prompt().is_err());
     }
 
     #[test]

@@ -1,31 +1,13 @@
 #!/bin/sh
 set -eu
 
-config_path=".cargo/config.toml"
-patch_header='[patch."https://github.com/aegis-shell/aegis"]'
+added_lines=$(git diff --cached --unified=0 -- Cargo.toml Cargo.lock .cargo ':glob:**/Cargo.toml' |
+    sed -n 's/^+//p')
 
-if [ ! -f "$config_path" ] || ! grep -Fqx "$patch_header" "$config_path"; then
-    exit 0
-fi
-
-excluded=
-
-if ! git diff --cached --quiet -- Cargo.lock; then
-    git restore --staged -- Cargo.lock
-    excluded="Cargo.lock"
-fi
-
-if ! git diff --cached --quiet -- "$config_path"; then
-    git restore --staged -- "$config_path"
-    if [ -n "$excluded" ]; then
-        excluded="$excluded and $config_path"
-    else
-        excluded="$config_path"
-    fi
-fi
-
-if [ -n "$excluded" ]; then
+if printf '%s\n' "$added_lines" |
+    grep -Eq 'aegis-shell/aegis|path[[:space:]]*=[[:space:]]*"\.\./aegis'; then
     printf '%s\n' \
-        "Local Aegis mode: excluded $excluded from this commit." \
-        "Disable $config_path before committing the canonical lockfile."
+        "Portal builds must not depend on the Aegis source repository." \
+        "Use the Portal-owned aegis-portal-ipc wire projection instead."
+    exit 1
 fi

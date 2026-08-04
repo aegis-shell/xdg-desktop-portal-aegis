@@ -10,19 +10,13 @@ rust-version = "1.88"
 repository = "https://github.com/aegis-shell/xdg-desktop-portal-aegis"
 
 [workspace.dependencies]
-# The portal is released against one exact Aegis IPC revision. Local joint
-# development uses .cargo/aegis-local.toml without changing this source of
-# truth or the canonical lockfile.
-aegis-authority = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
-aegis-core = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
-aegis-ipc = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
-aegis-logging = { version = "=0.0.11", git = "https://github.com/aegis-shell/aegis", tag = "v0.0.11" }
-
+aegis-portal-ipc = { version = "=0.0.3", path = "crates/aegis-portal-ipc" }
 aegis-portal-runtime = { version = "=0.0.3", path = "crates/aegis-portal-runtime" }
 aegis-portal-prompter = { version = "=0.0.3", path = "crates/aegis-portal-prompter" }
 aegis-portal-secret = { version = "=0.0.3", path = "crates/aegis-portal-secret" }
 
 dirs = "5"
+env_logger = "0.11"
 libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

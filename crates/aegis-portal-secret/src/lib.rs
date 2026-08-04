@@ -1,8 +1,8 @@
 //! Native `org.freedesktop.impl.portal.Secret` storage for Aegis.
 //!
 //! The public portal secret is derived from a private, encrypted vault key.
-//! Password-mode vaults can unlock from a one-shot PAM token or the
-//! compositor's masked prompt. This crate deliberately does not implement
+//! Password-mode vaults can unlock from a one-shot PAM token or a
+//! Portal-owned masked prompt. This crate deliberately does not implement
 //! `org.freedesktop.secrets`; claiming that separate API without its full
 //! locking, alias, prompt, and collection semantics would be unsafe.
 
@@ -25,7 +25,7 @@ const MAX_PAM_TOKEN_BYTES: u64 = 64 * 1024;
 const MAX_KEYFILE_BYTES: u64 = 1024;
 const MAX_PENDING_UNLOCKS: usize = 64;
 
-/// Result of asking the desktop shell for the vault password.
+/// Result of asking the Portal's UI adapter for the vault password.
 pub enum PromptResponse {
     /// The user confirmed a password. This crate zeroizes it immediately
     /// after it crosses the boundary.
@@ -35,8 +35,14 @@ pub enum PromptResponse {
 }
 
 /// Narrow host capability required to unlock a password-protected vault.
+/// The host must stop its prompt when every waiting request is cancelled.
 pub trait SecretPrompter: Send + Sync + 'static {
-    fn prompt_secret(&self, title: &str, reason: Option<&str>) -> Result<PromptResponse, String>;
+    fn prompt_secret(
+        &self,
+        title: &str,
+        reason: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PromptResponse, String>;
 }
 
 /// Native Secret portal service and its shared unlock coordinator.
@@ -240,7 +246,7 @@ fn unlock_worker(state: Arc<Mutex<SecretState>>, prompter: Arc<dyn SecretPrompte
         let unlocked = if state.lock().unwrap().is_unlocked() {
             true
         } else {
-            match prompt_and_unlock(&state, prompter.as_ref()) {
+            match prompt_and_unlock(&state, prompter.as_ref(), &requests) {
                 Ok(()) => {
                     log::info!("portal: secret vault unlocked via password prompt");
                     true
@@ -258,10 +264,21 @@ fn unlock_worker(state: Arc<Mutex<SecretState>>, prompter: Arc<dyn SecretPrompte
 fn prompt_and_unlock(
     state: &Arc<Mutex<SecretState>>,
     prompter: &dyn SecretPrompter,
+    requests: &[PendingUnlock],
 ) -> Result<(), String> {
+    let cancelled = || {
+        requests.iter().all(|request| {
+            request
+                .tracker
+                .lock()
+                .unwrap()
+                .was_closed(&request.request_path)
+        })
+    };
     let password = match prompter.prompt_secret(
         "Unlock Keyring",
         Some("The secret vault is locked. Enter its password to unlock it."),
+        &cancelled,
     ) {
         Ok(PromptResponse::Secret(value)) => Zeroizing::new(value),
         Ok(PromptResponse::Cancelled) => return Err("prompt dismissed".into()),

@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use aegis_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE, StreamMessage};
+use aegis_portal_ipc::{Client, StreamMessage};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -29,6 +29,7 @@ use pw::spa::pod::{self, Pod};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle};
 use pw::stream::{StreamFlags, StreamState};
 
+use crate::ipc;
 use crate::screencast::CastJob;
 
 /// Frame rate requested from the compositor and offered to PipeWire.
@@ -154,22 +155,14 @@ fn run_cast(
     started: &mpsc::Sender<Result<CastStarted, String>>,
 ) -> Result<(), String> {
     // Inward half first: without frames there is nothing to publish.
-    let caps = ConnectionCapabilities {
-        query: true,
-        control: true,
-        input: false,
-        session: false,
-        interaction_domain: false,
-    };
-    let mut client =
-        Client::connect_scoped_with_timeout(socket, caps, LOCAL_PORTAL_SCOPE, IPC_TIMEOUT)
-            .map_err(|e| format!("compositor IPC connect: {e}"))?;
+    let mut client = ipc::connect_compositor(socket, IPC_TIMEOUT)
+        .map_err(|e| format!("compositor IPC connect: {e}"))?;
     let stream_info = client
-        .start_output_stream_target(Some(STREAM_FPS), aegis_ipc::StreamTarget::Output)
+        .start_output_stream_target(Some(STREAM_FPS), aegis_portal_ipc::StreamTarget::Output)
         .map_err(|e| format!("start output stream: {e}"))?;
     let (width, height) = (stream_info.width, stream_info.height);
     let expected_frame_len = frame_len(width, height)?;
-    if stream_info.format != aegis_ipc::StreamPixelFormat::Bgra8 {
+    if stream_info.format != aegis_portal_ipc::StreamPixelFormat::Bgra8 {
         return Err(format!(
             "unsupported compositor stream format: {:?}",
             stream_info.format
@@ -314,7 +307,7 @@ fn run_cast(
                 let message = io.0.borrow_mut().next_stream_message();
                 match message {
                     Ok(StreamMessage::Frame(frame)) => match frame.format {
-                        aegis_ipc::StreamPixelFormat::Bgra8 => {
+                        aegis_portal_ipc::StreamPixelFormat::Bgra8 => {
                             if frame.width == width
                                 && frame.height == height
                                 && frame.stride == width * 4

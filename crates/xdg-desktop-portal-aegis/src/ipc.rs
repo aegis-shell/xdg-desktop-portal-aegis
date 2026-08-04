@@ -1,19 +1,19 @@
-//! The inward half of the bridge: a scoped aegis-IPC capture client.
+//! The inward half of the bridge: the narrow, Portal-owned Aegis IPC client.
 //!
 //! The portal connects under the built-in owner-only `aegis-portal` scope
-//! (`aegis_ipc::LOCAL_PORTAL_SCOPE`), which the compositor resolves to exactly
-//! the capture, stream, target-picking, and idle-inhibit operations used by
-//! the advertised portal interfaces, with the `control` capability and a
-//! time-bounded lease. The wrapper keeps each connection alive across idle
-//! periods by renewing the lease at half its TTL, and reconnects once on any
-//! failure so a compositor restart or an expired lease self-heals on the
-//! next screenshot instead of killing the D-Bus service.
+//! (`aegis_portal_ipc::LOCAL_PORTAL_SCOPE`) with `control` and a time-bounded
+//! lease. This repository's wire projection admits only capture, stream, and
+//! target-picking operations used by compositor-owned portal interfaces. The
+//! wrapper keeps each connection alive across idle periods by renewing the
+//! lease at half its TTL, and reconnects once on any failure so a compositor
+//! restart or an expired lease self-heals on the next screenshot instead of
+//! killing the D-Bus service.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aegis_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE};
+use aegis_portal_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE};
 
 /// Lease TTL requested at handshake and renewal; matches the reference
 /// client's default (`LeaseRequest::default`).
@@ -24,6 +24,29 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 /// Interactive compositor chrome is itself bounded at five minutes. Leave
 /// a small transport margin so its typed cancellation/error can arrive.
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(305);
+
+/// Open the one privileged runtime boundary used by capture and streaming.
+/// Refuse a handshake that did not grant both scoped control and a renewable
+/// lease instead of waiting for the first sensitive operation to fail.
+pub(crate) fn connect_compositor(socket: &Path, timeout: Duration) -> io::Result<Client> {
+    let requested = ConnectionCapabilities {
+        query: true,
+        control: true,
+        input: false,
+        session: false,
+        interaction_domain: false,
+    };
+    let client =
+        Client::connect_scoped_with_timeout(socket, requested, LOCAL_PORTAL_SCOPE, timeout)?;
+    if !client.caps().control || !client.lease().is_some_and(|lease| lease.renewable) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Aegis did not grant the Portal scope a renewable control lease",
+        ));
+    }
+    client.set_io_timeout(Some(timeout))?;
+    Ok(client)
+}
 
 /// A lazily connected, lease-renewing `CaptureOutput` client. One instance
 /// lives on the capture worker thread; it is not `Sync` by design.
@@ -43,21 +66,7 @@ impl PortalCapture {
     }
 
     fn connect(&self) -> io::Result<Client> {
-        let caps = ConnectionCapabilities {
-            query: true,
-            control: true,
-            input: false,
-            session: false,
-            interaction_domain: false,
-        };
-        let client = Client::connect_scoped_with_timeout(
-            &self.socket,
-            caps,
-            LOCAL_PORTAL_SCOPE,
-            RPC_TIMEOUT,
-        )?;
-        client.set_io_timeout(Some(RPC_TIMEOUT))?;
-        Ok(client)
+        connect_compositor(&self.socket, RPC_TIMEOUT)
     }
 
     /// Hand out a live client, renewing an ageing lease or reconnecting an
@@ -105,7 +114,10 @@ impl PortalCapture {
     /// Capture a region of the focused output as PNG bytes (compositor
     /// logical pixels), with the same reconnect + retry discipline as
     /// [`PortalCapture::capture_png`].
-    pub(crate) fn capture_region_png(&mut self, region: aegis_core::Rect) -> io::Result<Vec<u8>> {
+    pub(crate) fn capture_region_png(
+        &mut self,
+        region: aegis_portal_ipc::Rect,
+    ) -> io::Result<Vec<u8>> {
         match self.client()?.capture_output_region(Some(region)) {
             Ok((_, _, png)) => Ok(png),
             Err(first) => {
@@ -121,7 +133,10 @@ impl PortalCapture {
     /// until the user confirms or cancels, so this can take far longer than
     /// any other call. No automatic retry: a reconnect would orphan the
     /// user-facing picker, and the compositor bounds the wait itself.
-    pub(crate) fn pick(&mut self, kind: aegis_ipc::PickKind) -> io::Result<aegis_ipc::PickResult> {
+    pub(crate) fn pick(
+        &mut self,
+        kind: aegis_portal_ipc::PickKind,
+    ) -> io::Result<aegis_portal_ipc::PickResult> {
         let client = self.client()?;
         client.set_io_timeout(Some(INTERACTION_TIMEOUT))?;
         client.pick_target(kind)
@@ -135,22 +150,9 @@ impl PortalCapture {
         title: String,
         body: String,
         accept_label: Option<String>,
-    ) -> io::Result<aegis_ipc::ConfirmPickResult> {
+    ) -> io::Result<aegis_portal_ipc::ConfirmPickResult> {
         let client = self.client()?;
         client.set_io_timeout(Some(INTERACTION_TIMEOUT))?;
         client.pick_confirm(title, body, accept_label)
-    }
-
-    /// Ask the user for the vault password through the compositor's masked
-    /// secret prompt (the vault unlock's compositor side). Same blocking,
-    /// no-retry discipline as [`PortalCapture::pick`].
-    pub(crate) fn prompt_secret(
-        &mut self,
-        title: String,
-        reason: Option<String>,
-    ) -> io::Result<aegis_ipc::SecretPromptResult> {
-        let client = self.client()?;
-        client.set_io_timeout(Some(INTERACTION_TIMEOUT))?;
-        client.prompt_secret(title, reason)
     }
 }

@@ -1,6 +1,6 @@
 [package]
-name = "aegis-portal-prompter"
-description = "Out-of-process native prompt surfaces for xdg-desktop-portal-aegis"
+name = "aegis-portal-ipc"
+description = "Narrow Aegis IPC v24 client and contract tests for compositor-owned portal resources"
 readme = "README.md"
 publish = false
 version.workspace = true
@@ -10,18 +10,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-env_logger = { workspace = true }
-gdk4-wayland = "0.10.1"
-gtk4 = "0.10.1"
-log = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 
-[lib]
-name = "aegis_portal_prompter"
-path = "src/lib.rs"
+[features]
+test-server = []
 
-[[bin]]
-name = "aegis-portal-prompter"
-path = "src/main.rs"
+[lib]
+name = "aegis_portal_ipc"
+path = "src/lib.rs"

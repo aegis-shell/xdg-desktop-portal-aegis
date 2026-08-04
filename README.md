@@ -3,16 +3,20 @@
 `xdg-desktop-portal-aegis` is the private
 [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)
 backend for the Aegis desktop. It translates freedesktop portal D-Bus
-requests into Aegis's scoped IPC, publishes ScreenCast streams through
-PipeWire, and hosts the encrypted, per-application Secret portal.
+requests into Portal-owned services and, only for compositor resources, a
+narrow projection of Aegis IPC protocol 24. It publishes ScreenCast streams
+through PipeWire and hosts the encrypted, per-application Secret portal.
 
 The repository builds a D-Bus-activated backend plus a disposable FileChooser
 UI host from a small Cargo workspace:
 
 - `xdg-desktop-portal-aegis` assembles the backend interfaces, IPC adapters,
   and workers.
-- `aegis-portal-prompter` runs one GTK4 file dialog per request. It owns file
-  browsing and never connects to compositor IPC.
+- `aegis-portal-ipc` implements the protocol-24 settings, capture, picking,
+  and streaming wire contract without depending on Aegis source crates.
+- `aegis-portal-prompter` runs one GTK4 interaction per request. It owns file
+  browsing, Account consent, and Secret password input and never connects to
+  compositor IPC.
 - `aegis-portal-runtime` owns the shared portal Request lifecycle.
 - `aegis-portal-secret` owns the encrypted vault and native Secret backend.
 - `aegis-pam` optionally forwards a verified login password for vault
@@ -20,11 +24,11 @@ UI host from a small Cargo workspace:
 
 ## Compatibility
 
-Portal and Aegis releases have independent version sequences. Each Portal
-release pins exactly one supported Aegis Git tag because the scoped IPC
-schema and compositor mechanisms evolve together. Portal `v0.0.3` supports
-Aegis `v0.0.11`; see the [Compatibility Reference](docs/reference/compatibility.md)
-for the authoritative matrix.
+Portal and Aegis releases have independent version sequences. The current
+development line implements Aegis IPC protocol 24; its wire schema is
+verified against Aegis `v0.0.11` and `v0.0.12`. This is a runtime
+compatibility contract, not a source dependency; see the
+[Compatibility Reference](docs/reference/compatibility.md).
 
 ## Build
 
@@ -55,21 +59,20 @@ The repository's own source is MIT-licensed. A binary package that includes
 the optional `pam_aegis.so` module must additionally declare GPL-3.0-only
 because that module links the GPL-licensed `pamsm` dependency.
 
-## Joint Development
+## Protocol Development
 
-Canonical builds resolve Aegis from the tagged Git dependency. To work
-against an adjacent Aegis checkout, copy the local patch template and adjust
-its paths when the checkout is not named `aegis`:
+Build and test this repository without an Aegis checkout:
 
 ```bash
-cp .cargo/aegis-local.toml .cargo/config.toml
-git config core.hooksPath .githooks
-cargo test --workspace
+cargo check --locked --workspace
+cargo test --locked --workspace
 ```
 
-The generated `.cargo/config.toml` is ignored. While local Aegis mode is
-active, the pre-commit hook keeps the path-resolved `Cargo.lock` out of
-commits.
+When a compositor wire change is required, update the narrow
+`aegis-portal-ipc` projection and its literal protocol fixtures, then test the
+assembled daemon against the independently implemented test server. Follow
+[Cross-Repository Protocol Development](docs/dev/cross-repository-development.md)
+for release coordination.
 
 ## Documentation
 

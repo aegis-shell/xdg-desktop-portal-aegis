@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -144,6 +145,68 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+/// Write one scripted response consumed by [`fake_prompter`].
+pub fn write_prompter_response(
+    directory: &std::path::Path,
+    index: u32,
+    response: &aegis_portal_prompter::PrompterResponse,
+) {
+    std::fs::write(
+        directory.join(format!("response-{index}.json")),
+        serde_json::to_vec(response).expect("serialize prompter response"),
+    )
+    .expect("write prompter response");
+}
+
+/// Read and validate one request recorded by [`fake_prompter`].
+pub fn read_prompter_request(
+    directory: &std::path::Path,
+    index: u32,
+) -> aegis_portal_prompter::PromptRequest {
+    let request: aegis_portal_prompter::PrompterRequest = serde_json::from_slice(
+        &std::fs::read(directory.join(format!("request-{index}.json")))
+            .expect("read recorded prompter request"),
+    )
+    .expect("decode recorded prompter request");
+    request.into_prompt().expect("validate prompter request")
+}
+
+/// Create a pipe-compatible, one-shot prompter fixture. Each invocation
+/// records its request before returning the correspondingly numbered reply.
+pub fn fake_prompter(directory: &std::path::Path) -> PathBuf {
+    let path = directory.join("fake-prompter");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+fixture="${AEGIS_PROMPTER_FIXTURE:?}"
+count_file="$fixture/count"
+while ! mkdir "$fixture/count-lock" 2>/dev/null; do :; done
+if test -f "$count_file"; then
+    index=$(cat "$count_file")
+else
+    index=0
+fi
+index=$((index + 1))
+printf '%s\n' "$index" > "$count_file"
+rmdir "$fixture/count-lock"
+cat > "$fixture/request-$index.json"
+if test -f "$fixture/response-$index.json"; then
+    cat "$fixture/response-$index.json"
+else
+    exec sleep 30
+fi
+"#,
+    )
+    .expect("write fake prompter");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("fake prompter metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions).expect("make fake prompter executable");
+    path
 }
 
 /// Wait until the daemon owns `name` (10 s bound).

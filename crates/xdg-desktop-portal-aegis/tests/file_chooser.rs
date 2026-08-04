@@ -2,19 +2,21 @@
 //! a pipe-compatible fake prompter. No compositor or display participates.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use aegis_portal_prompter::{
-    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PrompterRequest, PrompterResponse,
+    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PromptRequest, PrompterResponse,
     SelectionMode, SelectionRequest, SelectionResponse,
 };
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 mod common;
-use common::{KillOnDrop, daemon_command, e2e_required, private_bus, temp_dir, wait_for_name};
+use common::{
+    KillOnDrop, daemon_command, e2e_required, fake_prompter, private_bus, read_prompter_request,
+    temp_dir, wait_for_name, write_prompter_response,
+};
 
 const PORTAL: &str = "org.freedesktop.impl.portal.desktop.aegis";
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -49,51 +51,14 @@ fn result_uris(results: &HashMap<String, OwnedValue>) -> Vec<String> {
 }
 
 fn write_response(directory: &Path, index: u32, response: &SelectionResponse) {
-    std::fs::write(
-        directory.join(format!("response-{index}.json")),
-        serde_json::to_vec(&PrompterResponse::new(response.clone())).unwrap(),
-    )
-    .unwrap();
+    write_prompter_response(directory, index, &PrompterResponse::new(response.clone()));
 }
 
 fn read_request(directory: &Path, index: u32) -> SelectionRequest {
-    let request: PrompterRequest = serde_json::from_slice(
-        &std::fs::read(directory.join(format!("request-{index}.json"))).unwrap(),
-    )
-    .unwrap();
-    request.into_selection().unwrap()
-}
-
-fn fake_prompter(directory: &Path) -> std::path::PathBuf {
-    let path = directory.join("fake-prompter");
-    std::fs::write(
-        &path,
-        r#"#!/bin/sh
-set -eu
-fixture="${AEGIS_PROMPTER_FIXTURE:?}"
-count_file="$fixture/count"
-while ! mkdir "$fixture/count-lock" 2>/dev/null; do :; done
-if test -f "$count_file"; then
-    index=$(cat "$count_file")
-else
-    index=0
-fi
-index=$((index + 1))
-printf '%s\n' "$index" > "$count_file"
-rmdir "$fixture/count-lock"
-cat > "$fixture/request-$index.json"
-if test -f "$fixture/response-$index.json"; then
-    cat "$fixture/response-$index.json"
-else
-    exec sleep 30
-fi
-"#,
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&path, permissions).unwrap();
-    path
+    let PromptRequest::Selection(request) = read_prompter_request(directory, index) else {
+        panic!("FileChooser must issue a selection prompt");
+    };
+    request
 }
 
 #[test]

@@ -1,24 +1,31 @@
 # Compatibility Reference
 
-Portal and Aegis use independent version sequences. A Portal release
-supports the exact Aegis Git tag pinned by the `aegis-authority`,
-`aegis-core`, `aegis-ipc`, and `aegis-logging` dependencies in the workspace
-`Cargo.toml`. `aegis-authority` is used directly by the integration-test
-compositor; the production backend receives the same types through
-`aegis-ipc`.
+Portal and Aegis use independent release sequences. Current Portal
+development implements the required Aegis IPC wire subset inside the
+Portal-owned `aegis-portal-ipc` crate. Compatibility is defined by the wire
+protocol and verified Aegis protocol schemas; it is not a Cargo source
+dependency.
 
-| Portal release | Aegis release | IPC dependency source |
-|----------------|---------------|-----------------------|
-| `v0.0.3` | `v0.0.11` | `https://github.com/aegis-shell/aegis`, tag `v0.0.11` |
-| `v0.0.2` | `v0.0.11` | `https://github.com/ming2k/aegis`, tag `v0.0.11` |
-| `v0.0.1` | `v0.0.9` | `https://github.com/ming2k/aegis`, tag `v0.0.9` |
+| Portal line | Aegis runtime | IPC protocol | Aegis build dependency |
+|-------------|---------------|--------------|------------------------|
+| Unreleased | `v0.0.11`, `v0.0.12` | 24 | None |
+| `v0.0.3` | `v0.0.11`, `v0.0.12` | 24 | Exact `v0.0.11` tagged Git crates |
+| `v0.0.2` | `v0.0.11` | 24 | Exact tagged Git crates |
+| `v0.0.1` | `v0.0.9` | Release-specific | Exact tagged Git crates |
 
-The committed `Cargo.lock` resolves that tagged source. Distribution
-packages must express an exact dependency on the Aegis version in this
-table. A local path patch is development state and does not change release
-compatibility.
+The Unreleased line builds and tests without an Aegis checkout. Its committed
+`Cargo.lock` contains no package from the Aegis repository. A production
+installation still needs a running Aegis compositor because Settings,
+Screenshot, color and target selection, and ScreenCast consume
+compositor-owned resources.
 
-Portal `v0.0.2` and `v0.0.3` use Aegis `v0.0.11`, whose IPC protocol version
-is 24. The FileChooser process boundary does not add a private Aegis
-file-picking operation: the backend and its one-shot GTK process own that
-resource flow.
+Protocol 24 is verified against the `v0.0.11` and `v0.0.12` schemas. The
+Portal projection rejects every other protocol version at handshake. A future
+Aegis release is compatible only when it preserves protocol 24 and the
+operations listed in
+[ADR-0004](../adr/0004-portal-ownership-and-runtime-ipc-boundary.md), or after
+the Portal adds and tests the new protocol explicitly.
+
+FileChooser, Account, Secret, Email, and Lockdown do not require compositor
+IPC. FileChooser, Account confirmation, and Secret password input use the
+versioned one-shot Portal prompter contract.

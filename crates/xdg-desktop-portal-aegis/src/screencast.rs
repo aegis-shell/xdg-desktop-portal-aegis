@@ -463,8 +463,8 @@ fn pick_source(
         format!("Allow {app_id} to view the current monitor?"),
         Some("Share".to_string()),
     ) {
-        Ok(aegis_ipc::ConfirmPickResult::Confirmed) => Ok(CastSource::Monitor),
-        Ok(aegis_ipc::ConfirmPickResult::Cancelled) => Err(1),
+        Ok(aegis_portal_ipc::ConfirmPickResult::Confirmed) => Ok(CastSource::Monitor),
+        Ok(aegis_portal_ipc::ConfirmPickResult::Cancelled) => Err(1),
         Err(error) => {
             log::warn!("portal: monitor sharing confirmation failed: {error}");
             Err(2)

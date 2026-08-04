@@ -15,13 +15,12 @@
 //! encrypted at-rest vault. FileChooser launches one portal-owned GTK4
 //! prompter process; no file data crosses compositor IPC. For
 //! compositor-owned resources the backend is an ordinary scoped IPC client:
-//! pixels come from
-//! `Request::CaptureOutput` under the built-in
+//! pixels come from `CaptureOutput` under the built-in
 //! `aegis-portal` named scope with a sealed-memfd blob transfer
 //! transport, screencast frames arrive through the same scope's output-frame
-//! stream and are republished as a PipeWire producer stream, and password-mode
-//! vaults ask the compositor for an unlock secret. No Wayland capture protocol
-//! is added anywhere.
+//! stream and are republished as a PipeWire producer stream. Account consent,
+//! file selection, and password-mode vault unlock are Portal-owned UI and do
+//! not cross compositor IPC. No Wayland capture protocol is added anywhere.
 //!
 //! The process uses zbus's blocking API on the session bus and plain
 //! `std::thread` workers without an async runtime. Method dispatch runs on
@@ -38,6 +37,7 @@ mod file_chooser;
 mod files;
 mod ipc;
 mod lockdown;
+mod prompter;
 mod screencast;
 mod screenshot;
 mod session;
@@ -45,9 +45,9 @@ mod settings;
 
 use std::sync::{Arc, Mutex, mpsc};
 
+use aegis_portal_prompter::{PromptResult, PrompterRequest, SecretRequest};
 use aegis_portal_runtime::RequestTracker;
 use aegis_portal_secret::{PromptResponse, SecretError, SecretPrompter, SecretService};
-use ipc::PortalCapture;
 use screencast::{CastJob, ScreenCastIface};
 use screenshot::{CaptureJob, ScreenshotIface};
 use session::SessionRegistry;
@@ -79,26 +79,31 @@ pub enum PortalError {
     Worker(#[source] std::io::Error),
 }
 
-/// Transport adapter kept at the composition root: the Secret component
-/// asks for a password without depending on Aegis IPC itself.
-struct IpcSecretPrompter {
-    socket: std::path::PathBuf,
-}
+/// Process adapter kept at the composition root so Secret storage depends on
+/// only a narrow prompt capability, not GTK or compositor IPC.
+struct PortalSecretPrompter;
 
-impl SecretPrompter for IpcSecretPrompter {
-    fn prompt_secret(&self, title: &str, reason: Option<&str>) -> Result<PromptResponse, String> {
-        let mut capture = PortalCapture::new(self.socket.clone());
-        let mut result = capture
-            .prompt_secret(
-                title.to_string(),
-                reason.map(std::string::ToString::to_string),
-            )
-            .map_err(|error| error.to_string())?;
-        match &mut result {
-            aegis_ipc::SecretPromptResult::Secret { value } => {
-                Ok(PromptResponse::Secret(std::mem::take(value)))
-            }
-            aegis_ipc::SecretPromptResult::Cancelled => Ok(PromptResponse::Cancelled),
+impl SecretPrompter for PortalSecretPrompter {
+    fn prompt_secret(
+        &self,
+        title: &str,
+        reason: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PromptResponse, String> {
+        let result = prompter::invoke(
+            PrompterRequest::secret(SecretRequest {
+                title: title.to_owned(),
+                reason: reason.map(str::to_owned),
+            }),
+            Some(cancelled),
+        )
+        .map_err(|error| error.to_string())?;
+        match result {
+            PromptResult::Secret(mut response) => match response.take_value() {
+                Some(value) => Ok(PromptResponse::Secret(value)),
+                None => Ok(PromptResponse::Cancelled),
+            },
+            _ => Err("secret prompter returned the wrong response kind".to_owned()),
         }
     }
 }
@@ -132,9 +137,7 @@ pub fn run() -> Result<(), PortalError> {
     // Secret is declared in aegis.portal, so its storage is part of the
     // service's startup contract. Never acquire the bus name with that
     // advertised interface missing.
-    let secret_service = SecretService::initialize(Arc::new(IpcSecretPrompter {
-        socket: socket.clone(),
-    }))?;
+    let secret_service = SecretService::initialize(Arc::new(PortalSecretPrompter))?;
 
     // Serve before requesting the name so no call can arrive at a name we own
     // but do not serve yet (same ordering as the SNI tray watcher).
@@ -231,10 +234,9 @@ pub fn run() -> Result<(), PortalError> {
         })?;
 
     let account_tracker = Arc::clone(&tracker);
-    let account_socket = socket.clone();
     std::thread::Builder::new()
         .name("aegis-portal-account".to_string())
-        .spawn(move || account::account_worker(account_rx, account_tracker, account_socket))
+        .spawn(move || account::account_worker(account_rx, account_tracker))
         .map_err(|e| {
             PortalError::Bus(zbus::Error::Failure(format!("spawn account worker: {e}")))
         })?;

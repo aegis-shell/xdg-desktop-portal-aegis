@@ -1,8 +1,8 @@
 //! `org.freedesktop.impl.portal.Account` v1: user identity sharing.
 //!
 //! `GetUserInformation` never answers silently: the request parks on a
-//! worker while the compositor's yes/no confirmation dialog (`PickConfirm`
-//! IPC, version 16) asks the user whether to share their name and avatar
+//! worker while a Portal-owned, one-shot GTK confirmation dialog asks the
+//! user whether to share their name and avatar
 //! with the calling application. Only an affirmative answer releases the
 //! identity: the account name and GECOS real name from `getpwuid`, plus the
 //! first existing avatar from the canonical candidates
@@ -15,10 +15,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptResult, PrompterRequest};
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
-use crate::ipc::PortalCapture;
+use crate::prompter::{self, InvokeError};
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 
 const MAX_REASON_BYTES: usize = 16 * 1024;
@@ -28,6 +29,7 @@ pub(crate) enum AccountJob {
     GetUserInformation {
         request_path: String,
         app_id: String,
+        parent_window: Option<String>,
         reason: Option<String>,
         reply: ResponseSender,
     },
@@ -49,7 +51,7 @@ impl AccountIface {
         &self,
         handle: ObjectPath<'_>,
         app_id: &str,
-        _window: &str,
+        window: &str,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let path = handle.as_str().to_string();
@@ -68,6 +70,7 @@ impl AccountIface {
         let queued = self.jobs.try_send(AccountJob::GetUserInformation {
             request_path: path.clone(),
             app_id: app_id.to_string(),
+            parent_window: (!window.is_empty()).then(|| window.to_owned()),
             reason,
             reply,
         });
@@ -108,11 +111,7 @@ fn account_reason(options: &HashMap<String, Value<'_>>) -> Result<Option<String>
 
 /// Dispatch consent prompts independently so one application leaving a
 /// prompt open cannot head-of-line block every other Account request.
-pub(crate) fn account_worker(
-    rx: mpsc::Receiver<AccountJob>,
-    tracker: Arc<Mutex<RequestTracker>>,
-    socket: std::path::PathBuf,
-) {
+pub(crate) fn account_worker(rx: mpsc::Receiver<AccountJob>, tracker: Arc<Mutex<RequestTracker>>) {
     const MAX_ACTIVE_ACCOUNT_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -124,6 +123,7 @@ pub(crate) fn account_worker(
     while let Ok(AccountJob::GetUserInformation {
         request_path,
         app_id,
+        parent_window,
         reason,
         reply,
     }) = rx.recv()
@@ -135,16 +135,14 @@ pub(crate) fn account_worker(
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
-        let task_socket = socket.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-account-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let mut capture = PortalCapture::new(task_socket);
                 let result =
-                    run_request(&mut capture, &task_tracker, &request_path, &app_id, reason);
+                    run_request(&task_tracker, &request_path, &app_id, parent_window, reason);
                 let _ = reply.send_blocking(result);
             })
         {
@@ -156,10 +154,10 @@ pub(crate) fn account_worker(
 
 /// Execute one request: prompt for consent, then release the identity.
 fn run_request(
-    capture: &mut PortalCapture,
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
     app_id: &str,
+    parent_window: Option<String>,
     reason: Option<String>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if tracker.lock().unwrap().was_closed(request_path) {
@@ -174,15 +172,27 @@ fn run_request(
         body.push(' ');
         body.push_str(&reason);
     }
-    let confirmed = capture.pick_confirm(
-        "Share Personal Information".to_string(),
-        body,
-        Some("Share".to_string()),
+    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let confirmed = prompter::invoke(
+        PrompterRequest::confirm(ConfirmRequest {
+            title: "Share Personal Information".to_string(),
+            body,
+            accept_label: Some("_Share".to_string()),
+            modal: true,
+            parent_window,
+        }),
+        Some(&cancelled),
     );
     match confirmed {
-        Ok(aegis_ipc::ConfirmPickResult::Confirmed) => {}
-        Ok(aegis_ipc::ConfirmPickResult::Cancelled) => return (1, HashMap::new()),
-        Err(error) => {
+        Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => {}
+        Ok(PromptResult::Confirm(ConfirmResponse::Cancelled)) | Err(InvokeError::Cancelled) => {
+            return (1, HashMap::new());
+        }
+        Ok(_) => {
+            log::warn!("portal: Account prompter returned the wrong response kind");
+            return (2, HashMap::new());
+        }
+        Err(InvokeError::Failed(error)) => {
             log::warn!("portal: GetUserInformation consent for '{app_id}' failed: {error}");
             return (2, HashMap::new());
         }

@@ -1,122 +1,50 @@
-//! End-to-end exercise of the Account backend: the real `xdg-desktop-portal-aegis`
-//! daemon on a private session bus (see `tests/common/`), plus a fake
-//! compositor answering `PickConfirm`. An affirmative answer releases the
-//! identity; a declined one answers 1.
-//!
-//! ```sh
-//! cargo test -p xdg-desktop-portal-aegis --test account
-//! ```
-//!
-//! Without `dbus-daemon` available the test skips cleanly.
+//! End-to-end Account backend exercise. The real daemon runs on a private
+//! session bus and delegates consent to a pipe-compatible Portal prompter;
+//! no compositor socket participates.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
-use aegis_ipc::{
-    ActorCapability, ConfirmPickResult, ConnectionCapabilities, Handler, JournalSnapshot, Scope,
-    Server,
-};
+use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptRequest, PrompterResponse};
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 mod common;
-use common::{KillOnDrop, private_bus, spawn_daemon, temp_dir, wait_for_name};
+use common::{
+    KillOnDrop, daemon_command, fake_prompter, private_bus, read_prompter_request, temp_dir,
+    wait_for_name, write_prompter_response,
+};
 
 const PORTAL: &str = "org.freedesktop.impl.portal.desktop.aegis";
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const IFACE: &str = "org.freedesktop.impl.portal.Account";
 
-/// A fake compositor: records every `PickConfirm` request and answers with
-/// a scripted outcome.
-struct FakeCompositor {
-    prompts: Mutex<Vec<(String, String)>>,
-    answer: ConfirmPickResult,
-}
-
-impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> ConnectionCapabilities {
-        ConnectionCapabilities {
-            query: true,
-            control: true,
-            input: false,
-            session: false,
-            interaction_domain: false,
-        }
-    }
-
-    fn windows(&self) -> Vec<aegis_core::window::Window> {
-        Vec::new()
-    }
-
-    fn workspaces(&self) -> aegis_core::workspace::WorkspaceSnapshot {
-        aegis_core::workspace::WorkspaceSnapshot { outputs: vec![] }
-    }
-
-    fn notifications(&self) -> Vec<aegis_core::notify::Notification> {
-        Vec::new()
-    }
-
-    fn outputs(&self) -> Vec<aegis_core::output::OutputInfo> {
-        Vec::new()
-    }
-
-    fn journal_since(&self, _since: u64) -> JournalSnapshot {
-        JournalSnapshot {
-            entries: vec![],
-            oldest_seq: 1,
-            latest_seq: 0,
-        }
-    }
-
-    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
-
-    fn resolve_scope(&self, name: &str) -> Option<Scope> {
-        (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
-            ops: Some(vec![ActorCapability::PickConfirm]),
-            ..Scope::default()
-        })
-    }
-
-    fn pick_confirm(
-        &self,
-        _conn_id: u64,
-        title: String,
-        body: String,
-        _accept_label: Option<String>,
-    ) -> Result<ConfirmPickResult, String> {
-        self.prompts.lock().unwrap().push((title, body));
-        Ok(self.answer)
-    }
-}
-
-/// Run one GetUserInformation against the scripted answer, returning the
-/// `(response, results)` pair.
+/// Run one GetUserInformation against a scripted Portal prompt.
 fn get_user_information(
-    answer: ConfirmPickResult,
+    answer: ConfirmResponse,
     with_avatar: bool,
-) -> Option<(u32, HashMap<String, OwnedValue>, Arc<FakeCompositor>)> {
+) -> Option<(u32, HashMap<String, OwnedValue>, ConfirmRequest)> {
     let Some(bus) = private_bus() else {
         eprintln!("account: no dbus-daemon, skipping");
         return None;
     };
     let conn = bus.connect();
 
-    let data_dir = temp_dir("data");
-    let runtime_dir = temp_dir("runtime");
+    let data_dir = temp_dir("account-data");
+    let runtime_dir = temp_dir("account-runtime");
+    let fixture_dir = temp_dir("account-prompter");
     if with_avatar {
         let avatars = data_dir.join("aegis/avatars");
         std::fs::create_dir_all(&avatars).expect("avatar dir");
         std::fs::write(avatars.join("face.png"), b"png").expect("avatar fixture");
     }
+    let prompter = fake_prompter(&fixture_dir);
+    write_prompter_response(&fixture_dir, 1, &PrompterResponse::confirm(answer));
 
-    let fake = Arc::new(FakeCompositor {
-        prompts: Mutex::new(Vec::new()),
-        answer,
-    });
-    let _server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
-        .expect("bind fake compositor IPC");
-
-    let _daemon = KillOnDrop(spawn_daemon(&bus, &data_dir, &runtime_dir));
+    let mut command = daemon_command(&bus, &data_dir, &runtime_dir);
+    command
+        .env("AEGIS_PORTAL_PROMPTER", &prompter)
+        .env("AEGIS_PROMPTER_FIXTURE", &fixture_dir);
+    let _daemon = KillOnDrop(command.spawn().expect("spawn portal daemon"));
     wait_for_name(&conn, PORTAL);
 
     let account = Proxy::new(&conn, PORTAL, DESKTOP_PATH, IFACE).expect("account proxy");
@@ -130,18 +58,23 @@ fn get_user_information(
     let (response, results): (u32, HashMap<String, OwnedValue>) = account
         .call(
             "GetUserInformation",
-            &(handle, "dev.aegis.smoke", "", options),
+            &(handle, "dev.aegis.smoke", "wayland:account-parent", options),
         )
         .expect("GetUserInformation");
-    let result = (response, results, fake);
+    let PromptRequest::Confirm(request) = read_prompter_request(&fixture_dir, 1) else {
+        panic!("Account must issue a confirmation prompt");
+    };
+
+    let result = (response, results, request);
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&runtime_dir);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
     Some(result)
 }
 
 #[test]
 fn consent_shares_the_identity_with_avatar() {
-    let Some((response, results, fake)) = get_user_information(ConfirmPickResult::Confirmed, true)
+    let Some((response, results, prompt)) = get_user_information(ConfirmResponse::Confirmed, true)
     else {
         return;
     };
@@ -154,19 +87,22 @@ fn consent_shares_the_identity_with_avatar() {
         image.starts_with("file://") && image.contains("aegis/avatars/face.png"),
         "the avatar URI must point at the canonical location: {image}"
     );
-    let prompts = fake.prompts.lock().unwrap();
-    let (title, body) = prompts.first().expect("a consent prompt ran");
-    assert_eq!(title, "Share Personal Information");
-    assert!(body.contains("dev.aegis.smoke"), "{body}");
+    assert_eq!(prompt.title, "Share Personal Information");
+    assert!(prompt.body.contains("dev.aegis.smoke"), "{}", prompt.body);
     assert!(
-        body.contains("recipes"),
-        "the reason reaches the dialog: {body}"
+        prompt.body.contains("recipes"),
+        "the reason reaches the dialog: {}",
+        prompt.body
+    );
+    assert_eq!(
+        prompt.parent_window.as_deref(),
+        Some("wayland:account-parent")
     );
 }
 
 #[test]
 fn a_declined_consent_releases_nothing() {
-    let Some((response, results, _)) = get_user_information(ConfirmPickResult::Cancelled, false)
+    let Some((response, results, _)) = get_user_information(ConfirmResponse::Cancelled, false)
     else {
         return;
     };

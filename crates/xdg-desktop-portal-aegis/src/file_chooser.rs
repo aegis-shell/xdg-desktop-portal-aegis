@@ -6,25 +6,19 @@
 //! compositor IPC, and closing the portal request terminates the child.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
 
 use aegis_portal_prompter::{
-    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PrompterRequest, PrompterResponse,
+    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PromptResult, PrompterRequest,
     SelectionMode, SelectionRequest, SelectionResponse,
 };
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 use zbus::zvariant::{ObjectPath, Value};
 
-use crate::files;
+use crate::{files, prompter};
 
-const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVE_FILE_CHOOSERS: usize = 32;
-const PROMPTER_ENV: &str = "AEGIS_PORTAL_PROMPTER";
 
 /// One file-chooser request handed from the bus methods to the dispatcher.
 /// The request contains the complete portal semantics; no UI policy is
@@ -286,100 +280,16 @@ fn invoke_prompter(
     request_path: &str,
     request: &SelectionRequest,
 ) -> Result<SelectionResponse, String> {
-    let executable = prompter_executable()?;
-    let mut child = Command::new(&executable)
-        // A file chooser implementing the portal must never recursively call
-        // the portal it is serving.
-        .env("GTK_USE_PORTAL", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("could not start {}: {error}", executable.display()))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "prompter stdin was not piped".to_owned())?;
-    let send_result = serde_json::to_writer(&mut stdin, &PrompterRequest::new(request.clone()))
-        .map_err(|error| error.to_string())
-        .and_then(|()| stdin.write_all(b"\n").map_err(|error| error.to_string()));
-    if let Err(error) = send_result {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("could not send prompter request: {error}"));
+    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    match prompter::invoke(
+        PrompterRequest::selection(request.clone()),
+        Some(&cancelled),
+    ) {
+        Ok(PromptResult::Selection(response)) => Ok(response),
+        Ok(_) => Err("prompter returned the wrong response kind".into()),
+        Err(prompter::InvokeError::Cancelled) => Ok(SelectionResponse::Cancelled),
+        Err(prompter::InvokeError::Failed(message)) => Err(message),
     }
-    drop(stdin);
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "prompter stdout was not piped".to_owned())?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_MESSAGE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-
-    let status = loop {
-        if tracker.lock().unwrap().was_closed(request_path) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            return Ok(SelectionResponse::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return Err(format!("could not wait for prompter: {error}"));
-            }
-        }
-    };
-    let bytes = reader
-        .join()
-        .map_err(|_| "prompter response reader panicked".to_owned())?
-        .map_err(|error| format!("could not read prompter response: {error}"))?;
-    if bytes.len() as u64 > MAX_MESSAGE_BYTES {
-        return Err("prompter response exceeds the 8 MiB process-contract limit".into());
-    }
-    if bytes.is_empty() {
-        return Err(format!("prompter exited with {status} and no response"));
-    }
-    let response: PrompterResponse = serde_json::from_slice(&bytes).map_err(|error| {
-        format!("prompter exited with {status} and returned invalid JSON: {error}")
-    })?;
-    response.into_selection()
-}
-
-fn prompter_executable() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os(PROMPTER_ENV).filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(current) = std::env::current_exe()
-        && let Some(directory) = current.parent()
-    {
-        let sibling = directory.join("aegis-portal-prompter");
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-    }
-    for installed in [
-        PathBuf::from("/usr/libexec/aegis-portal-prompter"),
-        PathBuf::from("/usr/lib/aegis-portal-prompter"),
-    ] {
-        if installed.is_file() {
-            return Ok(installed);
-        }
-    }
-    Err(format!(
-        "aegis-portal-prompter was not found beside the backend or in the standard libexec directories; set {PROMPTER_ENV}"
-    ))
 }
 
 fn build_results(
@@ -561,6 +471,8 @@ fn filter_to_wire(filter: FileFilter) -> (String, Vec<(u32, String)>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn options(pairs: &[(&str, Value<'static>)]) -> HashMap<String, Value<'static>> {

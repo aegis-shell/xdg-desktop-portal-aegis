@@ -2,13 +2,11 @@
 
 ## Canonical Dependency State
 
-1. Remove the ignored `.cargo/config.toml` local Aegis patch without staging
-   it.
-2. Resolve the exact tagged Aegis dependencies from the workspace
-   `Cargo.toml`.
-3. Review and commit the canonical `Cargo.lock` only after the tagged graph
-   resolves.
-4. Confirm that the release mapping matches the
+1. Resolve the workspace with `--locked` from a clean checkout.
+2. Confirm that `Cargo.lock` and `cargo tree --workspace` contain no Aegis Git
+   source or internal Aegis crate.
+3. Run the independent IPC fixtures and daemon-level media tests.
+4. Confirm that the runtime protocol mapping matches the
    [Compatibility Reference](../reference/compatibility.md).
 
 ## Verification
@@ -56,5 +54,6 @@ distribution license before publishing artifacts.
 1. Move the `CHANGELOG.md` Unreleased entries into the release version and
    date.
 2. Update the workspace and Meson project versions together.
-3. Update the compatibility table if the Aegis tag changes.
+3. Update the compatibility table when the verified Aegis runtime set or IPC
+   protocol changes.
 4. Tag only the reviewed canonical-lockfile commit.

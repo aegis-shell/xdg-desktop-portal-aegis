@@ -1,6 +1,6 @@
 # ADR-0003: Production interface and secret boundary
 
-- Status: Accepted
+- Status: Superseded by [ADR-0004](0004-portal-ownership-and-runtime-ipc-boundary.md)
 - Date: 2026-08-03
 - Supersedes: [ADR-0002](0002-resource-authority-and-file-chooser-process-boundary.md)
 

@@ -7,11 +7,11 @@
 | `org.freedesktop.impl.portal.Settings` | Version 1 | Compositor-owned appearance and input settings |
 | `org.freedesktop.impl.portal.Screenshot` | Version 3 | Area target, color picking, and consent-checked legacy output capture |
 | `org.freedesktop.impl.portal.ScreenCast` | Version 6 | One monitor stream, hidden cursor, stable `pipewire-serial` |
-| `org.freedesktop.impl.portal.Secret` | Version 1 | Stable per-application secret from the encrypted vault |
+| `org.freedesktop.impl.portal.Secret` | Version 1 | Stable per-application secret from the encrypted vault; Portal-owned masked unlock prompt |
 | `org.freedesktop.impl.portal.Lockdown` | Current seven-property ABI | All properties are read-write and process-resident |
 | `org.freedesktop.impl.portal.FileChooser` | Current backend ABI | Open, save, directory, and multiple-file flows through a one-shot GTK4 process |
 | `org.freedesktop.impl.portal.Email` | Current backend ABI | `xdg-email` handoff, attachment URI validation, activation token forwarding |
-| `org.freedesktop.impl.portal.Account` | Current backend ABI | Name and optional avatar after explicit compositor confirmation |
+| `org.freedesktop.impl.portal.Account` | Current backend ABI | Name and optional avatar after explicit Portal-owned confirmation |
 
 `FileChooser`, `Email`, and `Account` do not define a backend `version`
 property. The backend does not add one.
@@ -34,10 +34,10 @@ interface.
 
 | Component | Purpose |
 |-----------|---------|
-| Aegis `v0.0.11` | Scoped IPC protocol 24 and compositor consent chrome |
+| Aegis IPC protocol 24 | Compositor settings, screenshot capture and selection, capture consent, and ScreenCast frames |
 | `xdg-desktop-portal` | Public portal frontend |
 | `xdg-desktop-portal-gtk` | Complete fallback interfaces |
-| GTK 4.10 or newer | One-shot FileChooser process |
+| GTK 4.10 or newer | One-shot FileChooser, Account, and Secret prompter process |
 | PipeWire and WirePlumber | ScreenCast transport and routing |
 | `xdg-email` | Email handoff |
 | PAM | Optional login-time vault unlock only |
@@ -53,6 +53,9 @@ Meson enforces GTK 4.10 or newer, `libpipewire-0.3` 0.3 or newer, and the
 SPA 0.2 development ABI. The Ubuntu baseline is tested with Rust 1.88, the
 minimum supported Rust version. Compatible newer releases remain supported
 through their stable ABIs.
+
+See the [Compatibility Reference](compatibility.md) for the Aegis releases
+whose protocol-24 wire schemas are verified by the current Portal line.
 
 ## Persistent State
 

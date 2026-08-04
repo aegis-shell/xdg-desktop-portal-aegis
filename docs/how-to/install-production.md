@@ -7,9 +7,9 @@ PipeWire and SPA development files, `xdg-desktop-portal`,
 `xdg-desktop-portal-gtk`, WirePlumber, and `xdg-email`. Install PAM
 development files only when the optional PAM module is required.
 
-Use the exact Aegis release in the
-[Compatibility Reference](../reference/compatibility.md). Do not package a
-local Cargo path override.
+Install an Aegis runtime that implements the protocol version in the
+[Compatibility Reference](../reference/compatibility.md). The Portal build
+does not require an Aegis source checkout, Cargo package, or path override.
 
 ## Build and Install
 

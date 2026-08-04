@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use aegis_portal_prompter::{
-    BytePath, FileFilter, FilterRuleKind, PrompterRequest, PrompterResponse, SelectionMode,
+    BytePath, ConfirmRequest, ConfirmResponse, FileFilter, FilterRuleKind, PromptRequest,
+    PromptResult, PrompterRequest, PrompterResponse, SecretRequest, SecretResponse, SelectionMode,
     SelectionRequest, SelectionResponse,
 };
 use gtk::gio;
@@ -16,15 +17,15 @@ use gtk4 as gtk;
 const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
-    aegis_logging::init("info");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let response = match read_request().and_then(run_dialog) {
         Ok(response) => response,
         Err(message) => {
             log::error!("prompter: {message}");
-            SelectionResponse::Failed { message }
+            PrompterResponse::failed(message)
         }
     };
-    match write_response(&PrompterResponse::new(response)) {
+    match write_response(&response) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log::error!("prompter: could not write response: {error}");
@@ -33,7 +34,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_request() -> Result<SelectionRequest, String> {
+fn read_request() -> Result<PromptRequest, String> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .take(MAX_MESSAGE_BYTES + 1)
@@ -44,7 +45,7 @@ fn read_request() -> Result<SelectionRequest, String> {
     }
     let request: PrompterRequest =
         serde_json::from_slice(&bytes).map_err(|error| format!("invalid request JSON: {error}"))?;
-    request.into_selection()
+    request.into_prompt()
 }
 
 fn write_response(response: &PrompterResponse) -> Result<(), String> {
@@ -57,11 +58,25 @@ fn write_response(response: &PrompterResponse) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_dialog(request: SelectionRequest) -> Result<SelectionResponse, String> {
+fn run_dialog(request: PromptRequest) -> Result<PrompterResponse, String> {
     gtk::init().map_err(|error| format!("GTK initialization failed: {error}"))?;
     gtk::glib::set_prgname(Some("aegis-portal-prompter"));
     gtk::glib::set_application_name("Aegis Portal Prompter");
 
+    let result = match request {
+        PromptRequest::Selection(request) => {
+            PromptResult::Selection(run_selection_dialog(request)?)
+        }
+        PromptRequest::Confirm(request) => PromptResult::Confirm(run_confirm_dialog(request)?),
+        PromptRequest::Secret(request) => PromptResult::Secret(run_secret_dialog(request)?),
+    };
+    Ok(PrompterResponse {
+        version: aegis_portal_prompter::PROCESS_CONTRACT_VERSION,
+        result,
+    })
+}
+
+fn run_selection_dialog(request: SelectionRequest) -> Result<SelectionResponse, String> {
     let action = match request.mode {
         SelectionMode::OpenFile => gtk::FileChooserAction::Open,
         SelectionMode::OpenDirectory | SelectionMode::SaveFiles => {
@@ -149,6 +164,110 @@ fn run_dialog(request: SelectionRequest) -> Result<SelectionResponse, String> {
         .borrow_mut()
         .take()
         .ok_or_else(|| "dialog closed without producing a response".into())
+}
+
+fn run_confirm_dialog(request: ConfirmRequest) -> Result<ConfirmResponse, String> {
+    let dialog = gtk::MessageDialog::builder()
+        .text(&request.title)
+        .secondary_text(&request.body)
+        .message_type(gtk::MessageType::Question)
+        .buttons(gtk::ButtonsType::None)
+        .modal(request.modal)
+        .build();
+    dialog.add_button("_Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button(
+        request.accept_label.as_deref().unwrap_or("_Continue"),
+        gtk::ResponseType::Accept,
+    );
+    dialog.set_default_response(gtk::ResponseType::Cancel);
+    if let Some(accept) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+        accept.add_css_class("suggested-action");
+    }
+    gtk::prelude::WidgetExt::realize(&dialog);
+    if let Some(parent) = request.parent_window.as_deref()
+        && !parent.is_empty()
+        && let Err(error) = attach_parent(&dialog, parent)
+    {
+        log::warn!("prompter: could not attach parent {parent:?}: {error}");
+    }
+
+    let result = Rc::new(RefCell::new(None));
+    let main_loop = gtk::glib::MainLoop::new(None, false);
+    let response_slot = Rc::clone(&result);
+    let response_loop = main_loop.clone();
+    dialog.connect_response(move |dialog, response| {
+        *response_slot.borrow_mut() = Some(if response == gtk::ResponseType::Accept {
+            ConfirmResponse::Confirmed
+        } else {
+            ConfirmResponse::Cancelled
+        });
+        dialog.destroy();
+        response_loop.quit();
+    });
+    dialog.present();
+    main_loop.run();
+    result
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| "confirmation dialog closed without a response".into())
+}
+
+fn run_secret_dialog(request: SecretRequest) -> Result<SecretResponse, String> {
+    let dialog = gtk::Dialog::builder()
+        .title(&request.title)
+        .modal(true)
+        .build();
+    dialog.add_button("_Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("_Unlock", gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    if let Some(accept) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+        accept.add_css_class("suggested-action");
+    }
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    if let Some(reason) = request
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+    {
+        let label = gtk::Label::new(Some(reason));
+        label.set_wrap(true);
+        label.set_xalign(0.0);
+        content.append(&label);
+    }
+    let password = gtk::PasswordEntry::new();
+    password.set_show_peek_icon(true);
+    password.set_activates_default(true);
+    password.set_hexpand(true);
+    content.append(&password);
+
+    let result = Rc::new(RefCell::new(None));
+    let main_loop = gtk::glib::MainLoop::new(None, false);
+    let response_slot = Rc::clone(&result);
+    let response_loop = main_loop.clone();
+    let response_password = password.clone();
+    dialog.connect_response(move |dialog, response| {
+        *response_slot.borrow_mut() = Some(if response == gtk::ResponseType::Accept {
+            SecretResponse::Secret {
+                value: response_password.text().to_string(),
+            }
+        } else {
+            SecretResponse::Cancelled
+        });
+        dialog.destroy();
+        response_loop.quit();
+    });
+    dialog.present();
+    password.grab_focus();
+    main_loop.run();
+    result
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| "secret dialog closed without a response".into())
 }
 
 fn default_title(mode: SelectionMode, multiple: bool) -> &'static str {
@@ -300,8 +419,9 @@ fn collect_selection(
     })
 }
 
-fn attach_parent(dialog: &gtk::FileChooserDialog, identifier: &str) -> Result<(), String> {
-    let surface = dialog
+fn attach_parent(dialog: &impl IsA<gtk::Window>, identifier: &str) -> Result<(), String> {
+    let window: &gtk::Window = dialog.as_ref();
+    let surface = window
         .surface()
         .ok_or_else(|| "dialog has no realized GDK surface".to_owned())?;
     if let Some(handle) = identifier.strip_prefix("wayland:") {

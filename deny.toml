@@ -28,7 +28,7 @@ ignore = false
 multiple-versions = "warn"
 # Every inherited dependency is pinned by the workspace table. cargo-deny
 # 0.19 diagnoses `workspace = true` as a wildcard even when that entry has an
-# exact version, Git tag, or path, so the source-of-truth entries are audited
+# exact version or path, so the source-of-truth entries are audited
 # instead of rejecting their inherited uses.
 wildcards = "allow"
 highlight = "all"
@@ -43,7 +43,7 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/aegis-shell/aegis"]
+allow-git = []
 
 [sources.allow-org]
 github = []

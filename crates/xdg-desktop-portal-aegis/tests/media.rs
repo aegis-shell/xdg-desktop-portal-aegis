@@ -8,11 +8,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aegis_ipc::{
-    ActorCapability, CaptureOutputPayload, ConfirmPickResult, ConnectionCapabilities, Handler,
-    JournalSnapshot, PickKind, PickResult, Scope, Server, StreamFramePayload, StreamInfo,
-    StreamPixelFormat, StreamTarget,
+use aegis_portal_ipc::testing::{
+    CaptureOutputPayload, Handler, Server, StreamFramePayload, StreamInfo,
 };
+use aegis_portal_ipc::{ConfirmPickResult, PickKind, PickResult, StreamPixelFormat, StreamTarget};
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
@@ -34,7 +33,7 @@ const PNG: &[u8] = &[
 
 #[derive(Default)]
 struct FakeCompositor {
-    captures: Mutex<Vec<Option<aegis_core::Rect>>>,
+    captures: Mutex<Vec<Option<aegis_portal_ipc::Rect>>>,
     picks: Mutex<Vec<PickKind>>,
     confirms: Mutex<Vec<(String, String)>>,
     stream_starts: Mutex<Vec<(Option<u32>, StreamTarget)>>,
@@ -43,57 +42,9 @@ struct FakeCompositor {
 }
 
 impl Handler for FakeCompositor {
-    fn policy_caps(&self) -> ConnectionCapabilities {
-        ConnectionCapabilities {
-            query: true,
-            control: true,
-            input: false,
-            session: false,
-            interaction_domain: false,
-        }
-    }
-
-    fn windows(&self) -> Vec<aegis_core::window::Window> {
-        Vec::new()
-    }
-
-    fn workspaces(&self) -> aegis_core::workspace::WorkspaceSnapshot {
-        aegis_core::workspace::WorkspaceSnapshot { outputs: vec![] }
-    }
-
-    fn notifications(&self) -> Vec<aegis_core::notify::Notification> {
-        Vec::new()
-    }
-
-    fn outputs(&self) -> Vec<aegis_core::output::OutputInfo> {
-        Vec::new()
-    }
-
-    fn journal_since(&self, _since: u64) -> JournalSnapshot {
-        JournalSnapshot {
-            entries: vec![],
-            oldest_seq: 1,
-            latest_seq: 0,
-        }
-    }
-
-    fn command(&self, _conn_id: u64, _subject: Option<&str>, _cmd: aegis_ipc::Command) {}
-
-    fn resolve_scope(&self, name: &str) -> Option<Scope> {
-        (name == aegis_ipc::LOCAL_PORTAL_SCOPE).then(|| Scope {
-            ops: Some(vec![
-                ActorCapability::CaptureOutput,
-                ActorCapability::PickTarget,
-                ActorCapability::PickConfirm,
-                ActorCapability::StreamOutput,
-            ]),
-            ..Scope::default()
-        })
-    }
-
     fn capture_output(
         &self,
-        region: Option<aegis_core::Rect>,
+        region: Option<aegis_portal_ipc::Rect>,
     ) -> Result<CaptureOutputPayload, String> {
         self.captures.lock().unwrap().push(region);
         Ok(CaptureOutputPayload {
@@ -107,10 +58,10 @@ impl Handler for FakeCompositor {
         self.picks.lock().unwrap().push(kind);
         Ok(match kind {
             PickKind::Region => PickResult::Region {
-                rect: aegis_core::Rect::new(10, 20, 30, 40),
+                rect: aegis_portal_ipc::Rect::new(10, 20, 30, 40),
             },
             PickKind::Pixel => PickResult::Pixel {
-                point: aegis_core::Point { x: 4, y: 8 },
+                point: aegis_portal_ipc::Point { x: 4, y: 8 },
                 rgb: [255, 128, 0],
             },
             PickKind::Window => PickResult::Cancelled,
@@ -207,7 +158,7 @@ fn screenshot_and_color_cross_real_daemon_and_scoped_ipc() {
     );
     assert_eq!(
         fake.captures.lock().unwrap().as_slice(),
-        &[Some(aegis_core::Rect::new(10, 20, 30, 40))]
+        &[Some(aegis_portal_ipc::Rect::new(10, 20, 30, 40))]
     );
 
     let (code, results): (u32, HashMap<String, OwnedValue>) = screenshot
@@ -527,7 +478,7 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
         height: 2,
         stride: 8,
         format: StreamPixelFormat::Bgra8,
-        damage: vec![aegis_core::Rect::new(0, 0, 2, 2)],
+        damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
         dropped: 0,
         pixels,
     }));

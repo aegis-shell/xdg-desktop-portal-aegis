@@ -319,9 +319,9 @@ fn run_job(
             // capture. A dismissed picker answers 1 (cancelled),
             // exactly like a client Close.
             let region = if *interactive || *target == Some(ScreenshotTarget::Area) {
-                match capture.pick(aegis_ipc::PickKind::Region) {
-                    Ok(aegis_ipc::PickResult::Region { rect }) => Some(rect),
-                    Ok(aegis_ipc::PickResult::Cancelled) => return (1, HashMap::new()),
+                match capture.pick(aegis_portal_ipc::PickKind::Region) {
+                    Ok(aegis_portal_ipc::PickResult::Region { rect }) => Some(rect),
+                    Ok(aegis_portal_ipc::PickResult::Cancelled) => return (1, HashMap::new()),
                     Ok(other) => {
                         log::warn!("portal: region pick answered with {other:?}");
                         return (2, HashMap::new());
@@ -346,8 +346,8 @@ fn run_job(
                     format!("Allow {app_id} to capture the current monitor?"),
                     Some("Capture".to_string()),
                 ) {
-                    Ok(aegis_ipc::ConfirmPickResult::Confirmed) => {}
-                    Ok(aegis_ipc::ConfirmPickResult::Cancelled) => {
+                    Ok(aegis_portal_ipc::ConfirmPickResult::Confirmed) => {}
+                    Ok(aegis_portal_ipc::ConfirmPickResult::Cancelled) => {
                         return (1, HashMap::new());
                     }
                     Err(error) => {
@@ -384,8 +384,8 @@ fn run_job(
             if tracker.lock().unwrap().was_closed(request_path) {
                 return (1, HashMap::new());
             }
-            match capture.pick(aegis_ipc::PickKind::Pixel) {
-                Ok(aegis_ipc::PickResult::Pixel { rgb, .. }) => {
+            match capture.pick(aegis_portal_ipc::PickKind::Pixel) {
+                Ok(aegis_portal_ipc::PickResult::Pixel { rgb, .. }) => {
                     if tracker.lock().unwrap().was_closed(request_path) {
                         return (1, HashMap::new());
                     }
@@ -397,7 +397,7 @@ fn run_job(
                     );
                     (0, HashMap::from([("color".to_string(), color_value(rgb))]))
                 }
-                Ok(aegis_ipc::PickResult::Cancelled) => (1, HashMap::new()),
+                Ok(aegis_portal_ipc::PickResult::Cancelled) => (1, HashMap::new()),
                 Ok(other) => {
                     log::warn!("portal: pixel pick answered with {other:?}");
                     (2, HashMap::new())
@@ -426,7 +426,7 @@ fn color_value(rgb: [u8; 3]) -> Value<'static> {
 fn capture_and_write(
     capture: &mut PortalCapture,
     token: &str,
-    region: Option<aegis_core::Rect>,
+    region: Option<aegis_portal_ipc::Rect>,
 ) -> std::io::Result<String> {
     let dir = files::cache_dir().ok_or_else(|| {
         std::io::Error::new(
