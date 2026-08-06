@@ -8,7 +8,10 @@
 //! asynchronously await the backend `(response, results)` tuple.
 //!
 //! This backend advertises monitor sources only, one stream per session, and
-//! cursor mode Hidden. Selection always requires an explicit compositor
+//! cursor mode Hidden. Client source-type masks that offer window alongside
+//! monitor (OBS's unified screen capture sends both bits) are accepted and
+//! served as monitor, per the `types`-as-acceptable-set contract. Selection
+//! always requires an explicit compositor
 //! confirmation identifying the requesting application. Aegis IPC's legacy window stream is deliberately not
 //! reachable here because it crops the composed output and can therefore
 //! contain pixels from an occluding window. Persistence requests are accepted
@@ -95,9 +98,12 @@ pub(crate) fn parse_select_options(options: &HashMap<String, Value<'_>>) -> Sele
 }
 
 /// Why a `SelectSources` option set cannot be served, as a D-Bus message.
+/// `types` is the set the client accepts; the backend may serve any subset,
+/// so the mask only needs to intersect what we offer (monitor). OBS's unified
+/// screen-capture source always offers monitor|window and breaks on a strict
+/// equality check.
 fn validate_select(options: &SelectOptions) -> Result<(), String> {
-    let supported_sources = SOURCE_TYPE_MONITOR;
-    if options.source_types == 0 || options.source_types & !supported_sources != 0 {
+    if options.source_types & SOURCE_TYPE_MONITOR == 0 {
         return Err("only monitor sources are supported".to_string());
     }
     if options.cursor_mode != CURSOR_MODES {
@@ -455,7 +461,7 @@ fn pick_source(
     source_types: u32,
     app_id: &str,
 ) -> Result<CastSource, u32> {
-    if source_types != SOURCE_TYPE_MONITOR {
+    if source_types & SOURCE_TYPE_MONITOR == 0 {
         return Err(2);
     }
     match picker.pick_confirm(
@@ -646,9 +652,11 @@ mod tests {
     }
 
     #[test]
-    fn select_options_refuse_monitor_and_window_mix() {
+    fn select_options_accept_monitor_and_window_mix() {
+        // Clients such as OBS's unified screen capture offer every type they
+        // can take; serving the monitor subset is the contract.
         let parsed = parse_select_options(&options(&[("types", Value::from(0b11u32))]));
-        assert!(validate_select(&parsed).is_err());
+        assert!(validate_select(&parsed).is_ok());
     }
 
     #[test]

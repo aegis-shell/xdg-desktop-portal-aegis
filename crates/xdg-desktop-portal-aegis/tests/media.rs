@@ -420,6 +420,35 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
         .expect("SelectSources");
     assert_eq!(code, 0);
 
+    // Regression: OBS's unified "Screen Capture (PipeWire)" source offers
+    // monitor|window (0b11); the backend must accept the mask and serve its
+    // monitor subset instead of rejecting the mixed offer.
+    let mix_session_path = "/org/freedesktop/portal/desktop/session/1/cast_mix";
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "CreateSession",
+            &(
+                handle("/org/freedesktop/portal/desktop/request/1/create_mix"),
+                handle(mix_session_path),
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("CreateSession (mixed types)");
+    assert_eq!(code, 0);
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "SelectSources",
+            &(
+                handle("/org/freedesktop/portal/desktop/request/1/select_mix"),
+                handle(mix_session_path),
+                "",
+                HashMap::from([("types".to_string(), Value::from(0b11_u32))]),
+            ),
+        )
+        .expect("SelectSources (mixed types)");
+    assert_eq!(code, 0, "monitor|window offer must be served as monitor");
+
     let (code, results): (u32, HashMap<String, OwnedValue>) = screencast
         .call(
             "Start",

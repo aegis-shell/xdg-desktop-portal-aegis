@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept ScreenCast `SelectSources` source-type masks that offer window
+  alongside monitor and serve the monitor subset, instead of rejecting the
+  mixed offer. OBS's unified "Screen Capture (PipeWire)" source always sends
+  `types = monitor|window` and aborted with a backend error, which made
+  screen recording impossible.
+- Fix ScreenCast frame pacing and stutter for PipeWire consumers such as
+  Flatpak OBS. The stream now advertises the fixed `30/1` framerate it
+  produces, pushes each compositor frame exactly once via
+  `pw_stream_trigger_process`, and avoids re-copying stale frames into later
+  process cycles.
+
 ## [0.0.4] - 2026-08-04
 
 ### Changed

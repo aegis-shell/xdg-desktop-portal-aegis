@@ -2,10 +2,16 @@
 //!
 //! Each cast runs on its own thread: a scoped IPC connection receives the
 //! compositor's output-frame stream and a PipeWire `Output`
-//! stream republishes every frame as raw `BGRx` video. The PipeWire main
-//! loop is also the IPC event loop — the IPC socket, the stop socket, and
-//! the lease-renewal timer are ordinary loop sources, so the thread never
-//! blocks anywhere but in `poll`.
+//! stream republishes every new frame as raw `BGRx` video at a fixed
+//! framerate. The PipeWire main loop is also the IPC event loop — the IPC
+//! socket, the stop socket, and the lease-renewal timer are ordinary loop
+//! sources, so the thread never blocks anywhere but in `poll`.
+//!
+//! The portal is producer-driven: when a compositor frame arrives the IPC
+//! source stores it, marks it pending, and calls `pw_stream_trigger_process`
+//! so PipeWire pulls exactly that frame on its next cycle. Stale frames are
+//! not copied again, which prevents duplicate frames from confusing the
+//! consumer's pacing and causing stutter or latency.
 //!
 //! Teardown is single-path: closing the write end of the stop socket (or a
 //! compositor-side `StreamEnded`, or any read error) quits the loop, after
@@ -98,6 +104,9 @@ struct StreamData {
     width: u32,
     height: u32,
     start_state: Rc<RefCell<StartState>>,
+    /// Set when a new IPC frame has arrived but not yet been pushed to
+    /// PipeWire. Cleared by the `process` callback after copying the frame.
+    pending: Rc<std::cell::Cell<bool>>,
 }
 
 /// PipeWire reports the node id through the stream state callback and the
@@ -179,8 +188,10 @@ fn run_cast(
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
     let core = context.connect_rc(None).map_err(|e| e.to_string())?;
     let registry = core.get_registry_rc().map_err(|e| e.to_string())?;
-    let stream = pw::stream::StreamBox::new(
-        &core,
+    // Use a reference-counted stream so the IPC source can wake the PipeWire
+    // side with trigger_process when a new compositor frame arrives.
+    let stream = pw::stream::StreamRc::new(
+        core.clone(),
         "xdg-desktop-portal-aegis-screencast",
         properties! {
             *pw::keys::MEDIA_TYPE => "Video",
@@ -192,6 +203,7 @@ fn run_cast(
 
     let latest: LatestFrame = Rc::new(RefCell::new(None));
     let format_pod = format_pod(width, height);
+    let pending = Rc::new(std::cell::Cell::new(false));
     let start_state = Rc::new(RefCell::new(StartState {
         started: Some(started.clone()),
         paused: None,
@@ -223,6 +235,7 @@ fn run_cast(
             width,
             height,
             start_state,
+            pending: Rc::clone(&pending),
         })
         .state_changed(move |stream, data, _old, new| {
             log::debug!("portal: pipewire stream {new:?}");
@@ -262,8 +275,8 @@ fn run_cast(
                 }
             }
         })
-        .process(|stream, data| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+        .process(|_stream, data| {
+            let Some(mut buffer) = _stream.dequeue_buffer() else {
                 return;
             };
             let datas = buffer.datas_mut();
@@ -272,19 +285,24 @@ fn run_cast(
             }
             let data_ref = &mut datas[0];
             let stride = data.width as usize * 4;
-            let frame = data.latest.borrow();
-            // Copy the latest compositor frame into the buffer. A missing or
-            // oversized frame yields a zero-sized chunk, which PipeWire
-            // treats as "no new content" instead of corrupt pixels.
-            let size = match frame.as_ref() {
-                Some(frame) => match data_ref.data() {
-                    Some(dest) if dest.len() >= frame.len() => {
-                        dest[..frame.len()].copy_from_slice(frame);
-                        frame.len()
-                    }
-                    _ => 0,
-                },
-                None => 0,
+            // Only publish frames the compositor has produced since the last
+            // process cycle. Copying stale frames makes OBS/GStreamer see
+            // duplicate frames and can cause the consumer's pacing logic to
+            // stall or misreport the real rate.
+            let size = if data.pending.replace(false) {
+                let frame = data.latest.borrow();
+                match frame.as_ref() {
+                    Some(frame) => match data_ref.data() {
+                        Some(dest) if dest.len() >= frame.len() => {
+                            dest[..frame.len()].copy_from_slice(frame);
+                            frame.len()
+                        }
+                        _ => 0,
+                    },
+                    None => 0,
+                }
+            } else {
+                0
             };
             let chunk = data_ref.chunk_mut();
             *chunk.offset_mut() = 0;
@@ -297,6 +315,7 @@ fn run_cast(
     // IPC frames arrive as a loop source; the lease timer keeps the scoped
     // connection alive across quiet periods.
     let loop_weak = mainloop.downgrade();
+    let stream_weak = stream.downgrade();
     let _ipc_source = mainloop.loop_().add_io(
         IpcFd(Rc::clone(&client)),
         spa::support::system::IoFlags::IN | spa::support::system::IoFlags::ERR,
@@ -314,6 +333,12 @@ fn run_cast(
                                 && frame.pixels.len() == expected_frame_len
                             {
                                 *latest.borrow_mut() = Some(Rc::new(frame.pixels));
+                                pending.set(true);
+                                if let Some(stream) = stream_weak.upgrade()
+                                    && let Err(error) = stream.trigger_process()
+                                {
+                                    log::debug!("portal: trigger_process failed: {error}");
+                                }
                             }
                         }
                         other => {
@@ -418,9 +443,9 @@ fn end_cast(
     }
 }
 
-/// Offered video format: raw BGRx at the output's geometry, variable
-/// framerate. The compositor's stream format is BGRA with opaque alpha,
-/// which is exactly `BGRx` semantics.
+/// Offered video format: raw BGRx at the output's geometry and a fixed
+/// framerate matching the compositor stream. The compositor's stream format
+/// is BGRA with opaque alpha, which is exactly `BGRx` semantics.
 fn format_pod(width: u32, height: u32) -> Vec<u8> {
     let object = pod::object! {
         spa::utils::SpaTypes::ObjectParamFormat,
@@ -448,7 +473,7 @@ fn format_pod(width: u32, height: u32) -> Vec<u8> {
         pod::property!(
             spa::param::format::FormatProperties::VideoFramerate,
             Fraction,
-            Fraction { num: 0, denom: 1 }
+            Fraction { num: STREAM_FPS, denom: 1 }
         ),
     };
     serialize(&pod::Value::Object(object))
@@ -548,6 +573,20 @@ mod tests {
             panic!("expected an object pod");
         };
         assert_eq!(object.properties.len(), 5);
+        // The advertised framerate must be fixed and match the compositor
+        // stream so consumers like OBS/GStreamer can pace correctly instead of
+        // guessing from a variable 0/1 rate.
+        let framerate = object
+            .properties
+            .iter()
+            .find(|p| p.key == spa::param::format::FormatProperties::VideoFramerate.as_raw())
+            .and_then(|p| match p.value {
+                pod::Value::Fraction(fraction) => Some(fraction),
+                _ => None,
+            })
+            .expect("framerate property");
+        assert_eq!(framerate.num, STREAM_FPS);
+        assert_eq!(framerate.denom, 1);
     }
 
     #[test]

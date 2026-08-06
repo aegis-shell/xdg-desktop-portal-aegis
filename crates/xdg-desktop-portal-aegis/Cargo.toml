@@ -25,7 +25,10 @@ zeroize = { workspace = true }
 # ScreenCast delivery: a PipeWire producer stream fed from the compositor's
 # scoped IPC frame stream. Rust binding over the system
 # libpipewire (rust-version 1.80, within the workspace MSRV); no tokio.
-pipewire = "0.10"
+# v0_3_34 enables pw_stream_trigger_process so the portal can push compositor
+# frames to PipeWire as they arrive instead of letting the consumer over-read
+# stale frames.
+pipewire = { version = "0.10", features = ["v0_3_34"] }
 dirs = { workspace = true }
 rand = "0.8"
 serde_json.workspace = true
