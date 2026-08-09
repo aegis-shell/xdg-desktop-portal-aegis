@@ -47,7 +47,7 @@ compositor can avoid entirely.
    modifier-bearing format: a consumer that fixates one expects
    `SPA_DATA_DmaBuf` buffers, which per-frame descriptors cannot populate.
 
-2. **Protocol 25 (planned): the slot protocol.** The compositor exports a
+2. **Protocol 25: the slot protocol.** The compositor exports a
    fixed set of dmabuf slots once per stream; their descriptors cross at
    setup, and each frame then references a slot by index. The Portal
    patches PipeWire pool buffers onto the slot descriptors at allocation
@@ -77,9 +77,11 @@ compositor can avoid entirely.
 - Slot lifetimes couple the consumer's pace to the compositor's renderer:
   a stalled consumer exhausts the slot set, and the compositor drops
   frames instead of applying backpressure to the desktop.
-- The wire additions (slot advertisement, per-frame slot references, slot
-  release) get literal fixtures and independent test-server coverage in
-  this repository before either side ships, per
-  [ADR-0004](0004-portal-ownership-and-runtime-ipc-boundary.md).
+- The wire additions (slot table on `StreamOutputStarted`, per-frame slot
+  references, `StreamBufferRelease`) have literal fixtures and independent
+  test-server coverage in this repository, per
+  [ADR-0004](0004-portal-ownership-and-runtime-ipc-boundary.md), and the
+  end-to-end test drives a real PipeWire consumer through zero-copy slot
+  delivery and release.
 - `docs/reference/portal-support.md` records which transport a running
   system negotiates.

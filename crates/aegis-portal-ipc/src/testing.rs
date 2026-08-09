@@ -25,12 +25,23 @@ pub struct CaptureOutputPayload {
     pub png: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct StreamInfo {
     pub stream_id: u64,
     pub width: u32,
     pub height: u32,
     pub format: StreamPixelFormat,
+    /// dmabuf slot table (protocol 25): each fd is sent to the client after
+    /// the reply, in slot order. A memfd stands in for a GPU buffer in
+    /// tests.
+    pub slots: Option<Vec<StreamSlotInfo>>,
+}
+
+#[derive(Debug)]
+pub struct StreamSlotInfo {
+    pub fd: std::os::fd::RawFd,
+    pub stride: u32,
+    pub byte_len: u64,
 }
 
 pub struct StreamFramePayload {
@@ -90,11 +101,15 @@ pub trait Handler: Send + Sync + 'static {
         _connection: u64,
         _max_fps: Option<u32>,
         _target: StreamTarget,
+        _dmabuf: Option<bool>,
     ) -> Result<StreamInfo, String> {
         Err("streaming is not implemented by this test server".into())
     }
 
     fn stream_output_stop(&self, _stream_id: u64) {}
+
+    /// Protocol-25 slot release from the client.
+    fn stream_buffer_release(&self, _stream_id: u64, _slot: u32) {}
 
     fn streams_disconnected(&self, _connection: u64) {}
 }
@@ -111,7 +126,25 @@ pub struct Server {
 }
 
 impl Server {
+    /// Start a server that speaks the newest protocol and negotiates older
+    /// clients down, like the current compositor.
     pub fn start<H>(path: &Path, handler: Arc<H>) -> io::Result<Self>
+    where
+        H: Handler,
+    {
+        Self::start_inner(path, handler, None)
+    }
+
+    /// Start a server that only accepts exactly `version`, like a
+    /// compositor from before protocol down-negotiation.
+    pub fn start_legacy<H>(path: &Path, handler: Arc<H>, version: u32) -> io::Result<Self>
+    where
+        H: Handler,
+    {
+        Self::start_inner(path, handler, Some(version))
+    }
+
+    fn start_inner<H>(path: &Path, handler: Arc<H>, exact_version: Option<u32>) -> io::Result<Self>
     where
         H: Handler,
     {
@@ -151,6 +184,7 @@ impl Server {
                                         connection,
                                         connection_handler,
                                         connection_streams,
+                                        exact_version,
                                     );
                                 });
                         }
@@ -203,9 +237,42 @@ impl Server {
                 damage: frame.damage,
                 dropped: frame.dropped,
                 byte_len: blob.len(),
+                slot: None,
             },
         )
         .and_then(|()| blob.send(&writer))
+        .is_ok()
+    }
+
+    /// Push a protocol-25 slot frame: the header carries `slot` and no
+    /// descriptor follows.
+    #[must_use]
+    pub fn push_stream_frame_slot(&self, frame: StreamFrameFdPayload, slot: u32) -> bool {
+        let writer = self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&frame.stream_id)
+            .map(|(_, writer)| Arc::clone(writer));
+        let Some(writer) = writer else {
+            return false;
+        };
+        let mut writer = writer.lock().unwrap();
+        write_msg(
+            &mut *writer,
+            &Event::StreamFrame {
+                stream_id: frame.stream_id,
+                sequence: frame.sequence,
+                width: frame.width,
+                height: frame.height,
+                stride: frame.stride,
+                format: frame.format,
+                damage: frame.damage,
+                dropped: frame.dropped,
+                byte_len: frame.byte_len,
+                slot: Some(slot),
+            },
+        )
         .is_ok()
     }
 
@@ -239,6 +306,7 @@ impl Server {
                 damage: frame.damage,
                 dropped: frame.dropped,
                 byte_len: frame.byte_len,
+                slot: None,
             },
         )
         .and_then(|()| crate::blob::send_fd(&writer, fd))
@@ -265,6 +333,7 @@ fn serve_connection(
     connection: u64,
     handler: Arc<dyn Handler>,
     streams: Streams,
+    exact_version: Option<u32>,
 ) {
     let Ok(mut reader) = stream.try_clone() else {
         return;
@@ -279,7 +348,11 @@ fn serve_connection(
                 scope,
                 lease,
             } if !handshaken => {
-                if version != PROTOCOL_VERSION {
+                let accepted = match exact_version {
+                    Some(exact) => version == exact,
+                    None => version <= PROTOCOL_VERSION,
+                };
+                if !accepted {
                     send_error(&writer, format!("unsupported protocol version {version}"))
                 } else if scope
                     .as_deref()
@@ -295,7 +368,7 @@ fn serve_connection(
                     send(
                         &writer,
                         &Response::Hello {
-                            version,
+                            version: version.min(PROTOCOL_VERSION),
                             caps,
                             lease: lease.map(|request| LeaseGrant {
                                 id: connection,
@@ -355,25 +428,62 @@ fn serve_connection(
                 Ok(result) => send(&writer, &Response::ConfirmPicked { result }),
                 Err(message) => send_error(&writer, message),
             },
-            Request::StreamOutputStart { max_fps, target } => {
-                match handler.stream_output_start(connection, max_fps, target) {
+            Request::StreamOutputStart {
+                max_fps,
+                target,
+                dmabuf,
+            } => {
+                match handler.stream_output_start(connection, max_fps, target, dmabuf) {
                     Ok(info) => {
-                        streams
-                            .lock()
-                            .unwrap()
-                            .insert(info.stream_id, (connection, Arc::clone(&writer)));
-                        send(
-                            &writer,
-                            &Response::StreamOutputStarted {
-                                stream_id: info.stream_id,
-                                width: info.width,
-                                height: info.height,
-                                format: info.format,
-                            },
-                        )
+                        let (slots, slot_stride, slot_bytes) = match info.slots.as_ref() {
+                            Some(table) if !table.is_empty() => (
+                                Some(table.len() as u32),
+                                Some(table[0].stride),
+                                Some(table[0].byte_len),
+                            ),
+                            _ => (None, None, None),
+                        };
+                        // Reply and slot descriptors must land contiguously:
+                        // hold the writer for the whole sequence and
+                        // register the delivery lane only afterwards, so a
+                        // concurrently pushed frame cannot interleave.
+                        let result = {
+                            let mut guard = writer.lock().unwrap();
+                            write_msg(
+                                &mut *guard,
+                                &Response::StreamOutputStarted {
+                                    stream_id: info.stream_id,
+                                    width: info.width,
+                                    height: info.height,
+                                    format: info.format,
+                                    slots,
+                                    slot_stride,
+                                    slot_bytes,
+                                },
+                            )
+                            .and_then(|()| {
+                                if let Some(table) = info.slots {
+                                    for slot in table {
+                                        crate::blob::send_fd(&guard, slot.fd)?;
+                                    }
+                                }
+                                Ok(())
+                            })
+                        };
+                        if result.is_ok() {
+                            streams
+                                .lock()
+                                .unwrap()
+                                .insert(info.stream_id, (connection, Arc::clone(&writer)));
+                        }
+                        result
                     }
                     Err(message) => send_error(&writer, message),
                 }
+            }
+            Request::StreamBufferRelease { stream_id, slot } => {
+                handler.stream_buffer_release(stream_id, slot);
+                send(&writer, &Response::StreamBufferReleased { stream_id, slot })
             }
             Request::StreamOutputStop { stream_id } => {
                 streams.lock().unwrap().remove(&stream_id);

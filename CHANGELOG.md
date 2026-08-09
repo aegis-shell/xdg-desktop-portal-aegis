@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Zero-copy ScreenCast over the protocol-25 dmabuf slot transport. The
+  compositor transfers a fixed set of dmabuf slot descriptors once at
+  stream start; frames reference slots by index; the Portal binds each
+  PipeWire pool buffer to a slot descriptor at registration and releases
+  slots back to the compositor when the consumer returns them. Consumers
+  that cannot import the stream's DRM modifier keep the shared-memory
+  copy path. The handshake negotiates down to protocol 24 against older
+  compositors, which keeps the previous transports working.
+
 ### Changed
 
 - Raise the ScreenCast frame-rate ceiling from 30 to 60 fps and offer

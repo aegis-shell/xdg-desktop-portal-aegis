@@ -7,20 +7,27 @@
 //! stop socket, and the lease-renewal timer are ordinary loop sources, so
 //! the thread never blocks anywhere but in `poll`.
 //!
-//! Frames arrive as descriptors behind each `StreamFrame` header: sealed
-//! memfds for SHM captures, single-plane dmabufs when the compositor
-//! exports GPU buffers. Either way the frame is memory-mapped and copied
-//! into a PipeWire pool buffer exactly once. PipeWire fixes each pool
-//! buffer's descriptor at allocation time, so per-frame dmabuf descriptors
-//! cannot be forwarded through `pw_stream`; zero-copy delivery uses the
-//! slot protocol (see ADR-0005), and this copy path remains the universal
-//! fallback.
+//! Two frame transports exist (see ADR-0005):
 //!
-//! The portal is producer-driven: when a compositor frame arrives the IPC
-//! source stores it, marks it pending, and calls `pw_stream_trigger_process`
-//! so PipeWire pulls exactly that frame on its next cycle. Stale frames are
-//! not republished, which prevents duplicate frames from confusing the
-//! consumer's pacing and causing stutter or latency.
+//! - **Slot streaming (protocol 25)**: the compositor transfers a fixed set
+//!   of dmabuf slot descriptors once at start, and each frame references a
+//!   slot by index. The stream connects with `ALLOC_BUFFERS`, so every pool
+//!   buffer's data slot is filled in the `add_buffer` event — bound to a
+//!   compositor slot (`SPA_DATA_DmaBuf`) when the consumer negotiated the
+//!   modifier-bearing format, or given a Portal-owned memfd otherwise.
+//!   PipeWire fixes buffer descriptors at registration, which is why this
+//!   is the only zero-copy shape that works; per-frame descriptors cannot
+//!   be forwarded. A slot comes back when the consumer returns its buffer,
+//!   and only then is its release reported to the compositor.
+//! - **Per-frame descriptors**: every frame carries a sealed memfd or a
+//!   single-plane dmabuf behind its header. The frame is memory-mapped and
+//!   copied into a pool buffer exactly once — the universal fallback.
+//!
+//! The stream is a PipeWire DRIVER fed by `pw_stream_trigger_process` when
+//! a compositor frame arrives, so graph cycles run only when there is a new
+//! frame. The latest frame is republished on the Streaming transition: an
+//! early trigger fails with EIO before the link is up, and a pause flushes
+//! queued buffers back to the producer.
 //!
 //! Teardown is single-path: closing the write end of the stop socket (or a
 //! compositor-side `StreamEnded`, or any read error) quits the loop, after
@@ -28,9 +35,10 @@
 //! disconnect cleanup stops the stream with no extra round-trip.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -68,7 +76,8 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 /// `SPA_PARAM_BUFFERS_dataType` is a mask of `1 << SPA_DATA_*`: MemPtr is
 /// bit 1, MemFd is bit 2, and DmaBuf is bit 3.
-const ALL_DATA_TYPES: u32 = (1 << 1) | (1 << 2) | (1 << 3);
+const DMABUF_DATA_TYPE_BIT: u32 = 1 << 3;
+const ALL_DATA_TYPES: u32 = (1 << 1) | (1 << 2) | DMABUF_DATA_TYPE_BIT;
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
@@ -194,16 +203,109 @@ fn spa_format_for_drm(drm_format: u32) -> Option<spa::param::video::VideoFormat>
     })
 }
 
-/// A received compositor frame: the payload descriptor plus the plane
-/// stride from the frame header.
-struct FramePayload {
-    file: File,
-    stride: u32,
+/// A received compositor frame.
+enum FramePayload {
+    /// A frame carrying its own descriptor (sealed memfd or dmabuf blob),
+    /// plus the plane stride from the frame header.
+    Descriptor { file: File, stride: u32 },
+    /// A protocol-25 frame referencing a slot transferred at start.
+    Slot(u32),
+}
+
+/// How the fixated PipeWire format makes frames reach the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryMode {
+    /// Copy every frame into the shared memory pool.
+    Shm,
+    /// The consumer fixated the modifier-bearing format: slot buffers may
+    /// go out as `SPA_DATA_DmaBuf`.
+    Dmabuf,
+}
+
+/// Live negotiation state. `param_changed` callbacks update it; the
+/// `process` callback reads it for every frame.
+#[derive(Debug)]
+struct Negotiation {
+    mode: DeliveryMode,
+    /// The consumer's accepted `SPA_PARAM_BUFFERS_dataType` mask, when the
+    /// peer's Buffers param has been observed. A consumer that fixates a
+    /// modifier-bearing format is expected to accept DmaBuf buffers, so an
+    /// unknown mask does not block forwarding; an observed mask without the
+    /// DmaBuf bit does.
+    consumer_data_types: Option<u32>,
+}
+
+impl Negotiation {
+    fn forwarding_eligible(&self) -> bool {
+        self.mode == DeliveryMode::Dmabuf
+            && self
+                .consumer_data_types
+                .is_none_or(|mask| mask & DMABUF_DATA_TYPE_BIT != 0)
+    }
+}
+
+/// One protocol-25 slot's binding to a PipeWire pool buffer.
+#[derive(Debug)]
+struct SlotBinding {
+    /// The pool buffer patched onto this slot's descriptor at `add_buffer`.
+    pool: Option<*mut pw_sys::pw_buffer>,
+    /// The slot's buffer is with the consumer; the compositor must not
+    /// reuse the slot until the release goes out.
+    in_flight: bool,
 }
 
 /// Latest frame shared between the IPC source (writer) and the PipeWire
 /// `process` callback (reader). `None` until the first frame arrives.
 type LatestFrame = Rc<RefCell<Option<FramePayload>>>;
+
+/// Portal-owned backing for one copy-path pool buffer: a memfd the
+/// consumer maps, plus our own mapping of it.
+struct PoolMem {
+    file: File,
+    map: *mut u8,
+    len: usize,
+}
+
+impl PoolMem {
+    fn new(len: usize) -> io::Result<PoolMem> {
+        // SAFETY: the name is static and NUL-terminated; the fd is checked
+        // before ownership is constructed.
+        let fd = unsafe { libc::memfd_create(c"aegis-portal-pool".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a new owned descriptor from memfd_create.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(len as u64)?;
+        // SAFETY: the file is `len` bytes and outlives the mapping (owned by
+        // the returned value).
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PoolMem {
+            file,
+            map: map.cast::<u8>(),
+            len,
+        })
+    }
+}
+
+impl Drop for PoolMem {
+    fn drop(&mut self) {
+        // SAFETY: `map`/`len` name the live mapping created in `new`.
+        unsafe { libc::munmap(self.map.cast(), self.len) };
+    }
+}
 
 /// Stream-listener user data.
 struct StreamData {
@@ -214,14 +316,48 @@ struct StreamData {
     width: u32,
     height: u32,
     announced: AnnouncedFormat,
-    /// Pool buffers dequeued in earlier cycles; the copy path fills them.
+    /// Slot descriptors and their pool bindings (protocol 25); empty on a
+    /// per-frame transport. The bindings are shared with the cast thread's
+    /// teardown so abandoned slots are released.
+    slot_files: Vec<aegis_portal_ipc::StreamSlot>,
+    slot_bindings: Rc<RefCell<Vec<SlotBinding>>>,
+    negotiation: RefCell<Negotiation>,
+    /// Unbound pool buffers dequeued in earlier cycles; the copy path
+    /// fills them.
     pool: RefCell<Vec<*mut pw_sys::pw_buffer>>,
+    /// Portal-owned memfd backing for copy-path pool buffers, keyed by
+    /// `pw_buffer` pointer. With `ALLOC_BUFFERS` the producer supplies the
+    /// pool memory; entries are unmapped at `remove_buffer` and teardown.
+    pool_mem: Rc<RefCell<HashMap<usize, PoolMem>>>,
+    /// The IPC client, for sending slot releases from the process callback.
+    client: Rc<RefCell<Client>>,
+    stream_id: u64,
     start_state: Rc<RefCell<StartState>>,
     /// Portal-side frame drops (unmappable dmabuf, pool starvation),
     /// counted for the stream's lifetime.
     dropped_frames: Cell<u64>,
     /// Rate-limit the unmappable-dmabuf warning to once per stream.
     warned_unmappable: Cell<bool>,
+}
+
+impl StreamData {
+    /// Tell the compositor a slot is reusable. Best-effort: the stream's
+    /// teardown cleans up regardless.
+    fn release_slot(&self, slot: u32) {
+        if self.slot_files.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .client
+            .borrow_mut()
+            .release_stream_buffer(self.stream_id, slot)
+        {
+            log::debug!(
+                "portal: slot release for stream {} failed: {error}",
+                self.stream_id
+            );
+        }
+    }
 }
 
 /// PipeWire reports the node id through the stream state callback and the
@@ -276,6 +412,7 @@ fn validate_frame(
     width: u32,
     height: u32,
     announced: AnnouncedFormat,
+    slot_count: usize,
 ) -> Result<FramePayload, String> {
     if frame.width != width || frame.height != height {
         return Err(format!(
@@ -286,6 +423,20 @@ fn validate_frame(
     let row_bytes = width as u64 * 4;
     if u64::from(frame.stride) < row_bytes || frame.stride > i32::MAX as u32 {
         return Err(format!("invalid frame stride {}", frame.stride));
+    }
+    if let Some(slot) = frame.slot {
+        if slot_count == 0 {
+            return Err("slot frame on a stream without a slot table".to_string());
+        }
+        if slot as usize >= slot_count {
+            return Err(format!(
+                "slot {slot} is outside the {slot_count}-slot table"
+            ));
+        }
+        if !matches!(frame.payload, StreamPayload::Slot) {
+            return Err("slot frame carried a descriptor".to_string());
+        }
+        return Ok(FramePayload::Slot(slot));
     }
     match (announced, frame.format, frame.payload) {
         (
@@ -300,7 +451,7 @@ fn validate_frame(
                     frame.stride
                 ));
             }
-            Ok(FramePayload {
+            Ok(FramePayload::Descriptor {
                 file,
                 stride: frame.stride,
             })
@@ -316,18 +467,21 @@ fn validate_frame(
                 modifier: frame_modifier,
             },
             StreamPayload::Dmabuf(file),
-        ) if frame_drm == drm_format && frame_modifier == modifier => Ok(FramePayload {
-            file,
-            stride: frame.stride,
-        }),
+        ) if frame_drm == drm_format && frame_modifier == modifier => {
+            Ok(FramePayload::Descriptor {
+                file,
+                stride: frame.stride,
+            })
+        }
         (announced, wire, _) => Err(format!(
             "frame format {wire:?} does not match the announced {announced:?}"
         )),
     }
 }
 
-/// Reclaim every buffer PipeWire returns to the producer into the copy
-/// path's stash.
+/// Reclaim every buffer PipeWire returns to the producer. A buffer bound to
+/// a compositor slot triggers the slot's release; unbound buffers go to the
+/// copy path's stash.
 fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
     loop {
         // SAFETY: called from the stream's own thread inside `process`.
@@ -335,7 +489,29 @@ fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
         let Some(raw) = NonNull::new(raw) else {
             break;
         };
-        data.pool.borrow_mut().push(raw.as_ptr());
+        let mut bindings = data.slot_bindings.borrow_mut();
+        let bound = bindings
+            .iter_mut()
+            .enumerate()
+            .find(|(_, binding)| binding.pool == Some(raw.as_ptr()));
+        if let Some((slot, binding)) = bound {
+            if binding.in_flight {
+                binding.in_flight = false;
+                let client = Rc::clone(&data.client);
+                let stream_id = data.stream_id;
+                let has_slots = !data.slot_files.is_empty();
+                drop(bindings);
+                if has_slots
+                    && let Err(error) =
+                        client.borrow_mut().release_stream_buffer(stream_id, slot as u32)
+                {
+                    log::debug!("portal: slot release failed: {error}");
+                }
+            }
+        } else {
+            drop(bindings);
+            data.pool.borrow_mut().push(raw.as_ptr());
+        }
     }
 }
 
@@ -346,20 +522,61 @@ fn process_frame(stream: &pw::stream::Stream, data: &mut StreamData) {
     if !data.pending.replace(false) {
         return;
     }
-    let Some(frame) = data.latest.borrow_mut().take() else {
+    // The latest frame stays stored after publishing: a consumer that
+    // (re)activates later gets it republished on the Streaming transition,
+    // since queued buffers are flushed back on pause.
+    let frame = data.latest.borrow();
+    let Some(frame) = &*frame else {
         return;
     };
-    copy_into_pool(stream, data, &frame);
+    match frame {
+        FramePayload::Descriptor { file, stride } => copy_into_pool(stream, data, file, *stride),
+        FramePayload::Slot(slot) => publish_slot(stream, data, *slot),
+    }
 }
 
-/// Map the frame's descriptor and copy the pixels into a shared-pool
-/// buffer. Sealed memfds and mappable dmabufs take the same path.
-fn copy_into_pool(stream: &pw::stream::Stream, data: &mut StreamData, frame: &FramePayload) {
+/// Publish a protocol-25 slot frame: queue the pool buffer bound to the
+/// slot when the consumer takes dmabufs, or copy the slot's pixels into a
+/// free pool buffer (and release the slot immediately) otherwise.
+fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
+    let mut bindings = data.slot_bindings.borrow_mut();
+    let Some(binding) = bindings.get_mut(slot as usize) else {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        log::warn!("portal: frame for unknown slot {slot}; dropping");
+        return;
+    };
+    if binding.in_flight {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        log::warn!("portal: compositor reused slot {slot} before its release; dropping frame");
+        return;
+    }
+    let forward = data.negotiation.borrow().forwarding_eligible();
+    match (forward, binding.pool) {
+        (true, Some(pool_raw)) => {
+            binding.in_flight = true;
+            drop(bindings);
+            // SAFETY: `pool_raw` is a live pool buffer of this stream bound
+            // to this slot, dequeued earlier and not referenced elsewhere.
+            unsafe { stream.queue_raw_buffer(pool_raw) };
+        }
+        _ => {
+            let file = &data.slot_files[slot as usize].file;
+            let stride = data.slot_files[slot as usize].stride;
+            drop(bindings);
+            copy_into_pool(stream, data, file, stride);
+            data.release_slot(slot);
+        }
+    }
+}
+
+/// Map a frame descriptor and copy the pixels into a shared-pool buffer.
+/// Sealed memfds and mappable dmabufs take the same path.
+fn copy_into_pool(stream: &pw::stream::Stream, data: &StreamData, file: &File, stride: u32) {
     let height = data.height as usize;
     let row_bytes = data.width as usize * 4;
-    let stride = frame.stride as usize;
+    let stride = stride as usize;
 
-    let Ok(src_len) = frame.file.metadata().map(|meta| meta.len() as usize) else {
+    let Ok(src_len) = file.metadata().map(|meta| meta.len() as usize) else {
         data.dropped_frames.set(data.dropped_frames.get() + 1);
         log::debug!("portal: could not stat the frame descriptor");
         return;
@@ -372,15 +589,14 @@ fn copy_into_pool(stream: &pw::stream::Stream, data: &mut StreamData, frame: &Fr
         );
         return;
     }
-    // SAFETY: the descriptor outlives the mapping; it is owned by `frame`,
-    // which outlives this call.
+    // SAFETY: the descriptor outlives the mapping; the caller owns it.
     let map = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             src_len,
             libc::PROT_READ,
             libc::MAP_SHARED,
-            frame.file.as_raw_fd(),
+            file.as_raw_fd(),
             0,
         )
     };
@@ -469,16 +685,35 @@ fn run_cast(
     let mut client = ipc::connect_compositor(socket, IPC_TIMEOUT)
         .map_err(|e| format!("compositor IPC connect: {e}"))?;
     let stream_info = client
-        .start_output_stream_target(Some(STREAM_MAX_FPS), aegis_portal_ipc::StreamTarget::Output)
+        .start_output_stream(
+            Some(STREAM_MAX_FPS),
+            aegis_portal_ipc::StreamTarget::Output,
+            true,
+        )
         .map_err(|e| format!("start output stream: {e}"))?;
     let (width, height) = (stream_info.width, stream_info.height);
     frame_len(width, height)?;
     let announced = announced_format(stream_info.format)?;
+    let slot_files = stream_info.slots.unwrap_or_default();
+    let slot_bindings: Rc<RefCell<Vec<SlotBinding>>> = Rc::new(RefCell::new(
+        slot_files
+            .iter()
+            .map(|_| SlotBinding {
+                pool: None,
+                in_flight: false,
+            })
+            .collect(),
+    ));
+    let teardown_in_flight = Rc::clone(&slot_bindings);
+    let teardown_pool_mem: Rc<RefCell<HashMap<usize, PoolMem>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     log::info!(
-        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}",
-        stream_info.stream_id
+        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}, {} slots",
+        stream_info.stream_id,
+        slot_files.len()
     );
     let client = Rc::new(RefCell::new(client));
+    let teardown_client = Rc::clone(&client);
 
     // Outward half: PipeWire producer.
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
@@ -499,7 +734,8 @@ fn run_cast(
     .map_err(|e| e.to_string())?;
 
     let latest: LatestFrame = Rc::new(RefCell::new(None));
-    let format_bytes = format_pod(width, height, announced.spa_format());
+    let format_bytes = format_pods(width, height, announced, !slot_files.is_empty());
+    let slot_count = slot_files.len();
     let pending = Rc::new(Cell::new(false));
     let start_state = Rc::new(RefCell::new(StartState {
         started: Some(started.clone()),
@@ -533,7 +769,16 @@ fn run_cast(
             width,
             height,
             announced,
+            slot_bindings,
+            negotiation: RefCell::new(Negotiation {
+                mode: DeliveryMode::Shm,
+                consumer_data_types: None,
+            }),
             pool: RefCell::new(Vec::new()),
+            pool_mem: Rc::clone(&teardown_pool_mem),
+            client: Rc::clone(&client),
+            stream_id: stream_info.stream_id,
+            slot_files,
             start_state,
             dropped_frames: Cell::new(0),
             warned_unmappable: Cell::new(false),
@@ -566,6 +811,17 @@ fn run_cast(
                 state.paused = Some((node_id, data.width, data.height));
                 state.try_complete();
             }
+            // A DRIVER stream only runs cycles when triggered, and a
+            // trigger before the link is up fails with EIO. Once the stream
+            // (re)reaches Streaming, republish the latest frame: early
+            // frames were never delivered, and a pause flushed queued
+            // buffers back to us.
+            if new == StreamState::Streaming && data.latest.borrow().is_some() {
+                data.pending.set(true);
+                if let Err(error) = stream.trigger_process() {
+                    log::debug!("portal: trigger_process failed: {error}");
+                }
+            }
         })
         .param_changed(|stream, data, id, param| {
             let Some(param) = param else {
@@ -573,14 +829,123 @@ fn run_cast(
             };
             if id == spa::param::ParamType::Format.as_raw() {
                 match parse_format_param(param) {
-                    Some(fixated) => data.check_fixated_format(&fixated),
+                    Some(fixated) => data.apply_fixated_format(&fixated),
                     None => log::warn!("portal: could not parse the fixated PipeWire format"),
                 }
-                let buffers = buffers_pod(data.width, data.height);
+                let buffers = buffers_pod(data.width, data.height, data.slot_files.len());
                 let mut params = [Pod::from_bytes(&buffers).expect("buffers pod")];
                 if let Err(error) = stream.update_params(&mut params) {
                     log::warn!("portal: pipewire update_params failed: {error}");
                 }
+            } else if id == spa::param::ParamType::Buffers.as_raw()
+                && let Some(mask) = parse_buffers_data_types(param)
+            {
+                log::debug!("portal: consumer accepts buffer data types {mask:#05b}");
+                data.negotiation.borrow_mut().consumer_data_types = Some(mask);
+            }
+        })
+        .add_buffer(|_stream, data, buffer| {
+            // With ALLOC_BUFFERS the producer fills each pool buffer's data
+            // slot here, before the buffer registers with the consumer. A
+            // dmabuf-negotiated slot stream binds the next compositor slot;
+            // everything else gets a Portal-owned memfd for the copy path.
+            let bind = if data.negotiation.borrow().forwarding_eligible() {
+                let mut bindings = data.slot_bindings.borrow_mut();
+                bindings
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, binding)| binding.pool.is_none())
+                    .map(|(index, binding)| {
+                        binding.pool = Some(buffer);
+                        index
+                    })
+            } else {
+                None
+            };
+            let Some(datas) = (unsafe {
+                // SAFETY: `buffer` is a live pool buffer handed to this
+                // stream by the add_buffer event; its spa_buffer is valid.
+                let datas = (*(*buffer).buffer).datas;
+                if datas.is_null() || (*datas).chunk.is_null() {
+                    None
+                } else {
+                    Some(datas)
+                }
+            }) else {
+                log::warn!("portal: pool buffer without data or chunk slots");
+                return;
+            };
+            if let Some(index) = bind {
+                let slot = &data.slot_files[index];
+                // SAFETY: `datas`/`chunk` are live pool slots patched here
+                // before any use; they stay patched until remove_buffer.
+                unsafe {
+                    let chunk = (*datas).chunk;
+                    (*datas).type_ = spa_sys::SPA_DATA_DmaBuf;
+                    (*datas).flags = spa::buffer::DataFlags::READABLE.bits();
+                    (*datas).fd = slot.file.as_raw_fd() as i64;
+                    (*datas).mapoffset = 0;
+                    (*datas).maxsize = slot.byte_len as u32;
+                    (*datas).data = std::ptr::null_mut();
+                    (*chunk).offset = 0;
+                    (*chunk).size = slot.byte_len as u32;
+                    (*chunk).stride = slot.stride as i32;
+                    (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
+                }
+                log::debug!("portal: bound compositor slot {index} to a pool buffer");
+                return;
+            }
+            let frame_bytes = data.width as usize * data.height as usize * 4;
+            match PoolMem::new(frame_bytes) {
+                Ok(mem) => {
+                    // SAFETY: as above; the memfd stays owned by
+                    // `pool_mem` until remove_buffer/teardown, and `map`
+                    // points at its pages.
+                    unsafe {
+                        let chunk = (*datas).chunk;
+                        (*datas).type_ = spa_sys::SPA_DATA_MemFd;
+                        (*datas).flags =
+                            spa_sys::SPA_DATA_FLAG_READABLE | spa_sys::SPA_DATA_FLAG_MAPPABLE;
+                        (*datas).fd = mem.file.as_raw_fd() as i64;
+                        (*datas).mapoffset = 0;
+                        (*datas).maxsize = mem.len as u32;
+                        (*datas).data = mem.map.cast();
+                        (*chunk).offset = 0;
+                        (*chunk).size = 0;
+                        (*chunk).stride = (data.width * 4) as i32;
+                        (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
+                    }
+                    data.pool_mem.borrow_mut().insert(buffer as usize, mem);
+                }
+                Err(error) => {
+                    log::warn!("portal: could not allocate a pool buffer: {error}");
+                }
+            }
+        })
+        .remove_buffer(|_stream, data, buffer| {
+            // The pool is being torn down (renegotiation or stop): drop the
+            // binding and release any in-flight slot the consumer abandoned.
+            data.pool_mem.borrow_mut().remove(&(buffer as usize));
+            data.pool.borrow_mut().retain(|pooled| *pooled != buffer);
+            let mut bindings = data.slot_bindings.borrow_mut();
+            let Some((slot, binding)) = bindings
+                .iter_mut()
+                .enumerate()
+                .find(|(_, binding)| binding.pool == Some(buffer))
+            else {
+                return;
+            };
+            binding.pool = None;
+            let was_in_flight = std::mem::replace(&mut binding.in_flight, false);
+            let client = Rc::clone(&data.client);
+            let stream_id = data.stream_id;
+            let has_slots = !data.slot_files.is_empty();
+            drop(bindings);
+            if was_in_flight
+                && has_slots
+                && let Err(error) = client.borrow_mut().release_stream_buffer(stream_id, slot as u32)
+            {
+                log::debug!("portal: slot release failed: {error}");
             }
         })
         .process(process_frame)
@@ -610,7 +975,7 @@ fn run_cast(
                             );
                             compositor_dropped.set(frame.dropped);
                         }
-                        match validate_frame(frame, width, height, announced) {
+                        match validate_frame(frame, width, height, announced, slot_count) {
                             Ok(payload) => {
                                 *latest.borrow_mut() = Some(payload);
                                 pending.set(true);
@@ -667,7 +1032,10 @@ fn run_cast(
     let half_ttl = Duration::from_millis(LEASE_TTL_MS / 2);
     lease_timer.update_timer(Some(half_ttl), Some(half_ttl));
 
-    let mut format_refs = [Pod::from_bytes(&format_bytes).expect("format pod")];
+    let mut format_refs: Vec<&Pod> = format_bytes
+        .iter()
+        .map(|bytes| Pod::from_bytes(bytes).expect("format pod"))
+        .collect();
     stream
         .connect(
             // This stream publishes compositor frames. `Input` describes a
@@ -680,12 +1048,31 @@ fn run_cast(
             // Start/OpenPipeWireRemote. AUTOCONNECT asks session-manager
             // policy to route this source to an unrelated default target and
             // can tear the stream down with "no target node available".
-            StreamFlags::MAP_BUFFERS,
+            // ALLOC_BUFFERS lets the producer attach each pool buffer's
+            // memory in the add_buffer event (the only way a consumer ever
+            // sees a dmabuf descriptor: buffer contents are fixed at
+            // registration), and DRIVER pairs it with trigger_process so
+            // cycles run only when a compositor frame arrives.
+            StreamFlags::MAP_BUFFERS | StreamFlags::ALLOC_BUFFERS | StreamFlags::DRIVER,
             &mut format_refs,
         )
         .map_err(|e| e.to_string())?;
 
     mainloop.run();
+    // Teardown: unmap pool backing, then release slots the consumer still
+    // holds so the compositor can reuse them without waiting for the
+    // disconnect cleanup.
+    teardown_pool_mem.borrow_mut().clear();
+    for (slot, binding) in teardown_in_flight.borrow().iter().enumerate() {
+        let in_flight = &binding.in_flight;
+        if *in_flight
+            && let Err(error) = teardown_client
+                .borrow_mut()
+                .release_stream_buffer(stream_info.stream_id, slot as u32)
+        {
+            log::debug!("portal: teardown slot release failed: {error}");
+        }
+    }
     if exit_start_state.borrow().completed && !stopped_by_owner.get() {
         let _ = jobs.send(CastJob::SessionEnded {
             session_path: session_path.to_owned(),
@@ -695,9 +1082,12 @@ fn run_cast(
 }
 
 impl StreamData {
-    /// Check the fixated format against what was offered. Consumers can
-    /// renegotiate mid-stream, so this runs on every `Format` param change.
-    fn check_fixated_format(&self, fixated: &FixatedFormat) {
+    /// Record the fixated format: verify it against what was offered and
+    /// derive the delivery mode from the presence of the announced
+    /// modifier. Consumers can renegotiate mid-stream (OBS removes an
+    /// unimportable modifier and retries), so this runs on every `Format`
+    /// param change.
+    fn apply_fixated_format(&self, fixated: &FixatedFormat) {
         let expected = self.announced.spa_format();
         if fixated.spa_format != expected.as_raw() {
             log::warn!(
@@ -715,15 +1105,48 @@ impl StreamData {
                 self.height
             );
         }
+        let mode = match (self.announced, fixated.modifier) {
+            (AnnouncedFormat::Dmabuf { modifier, .. }, Some(fixated_modifier))
+                if fixated_modifier == modifier && !self.slot_files.is_empty() =>
+            {
+                DeliveryMode::Dmabuf
+            }
+            (AnnouncedFormat::Dmabuf { modifier, .. }, Some(fixated_modifier))
+                if !self.slot_files.is_empty() =>
+            {
+                log::warn!(
+                    "portal: consumer fixated modifier {fixated_modifier:#x} but the compositor                      streams {modifier:#x}; falling back to SHM delivery"
+                );
+                DeliveryMode::Shm
+            }
+            _ => DeliveryMode::Shm,
+        };
+        let mut negotiation = self.negotiation.borrow_mut();
+        if negotiation.mode != mode {
+            match mode {
+                DeliveryMode::Dmabuf => log::info!(
+                    "portal: pipewire consumer negotiated zero-copy dmabuf capture ({}x{})",
+                    self.width,
+                    self.height
+                ),
+                DeliveryMode::Shm => log::info!(
+                    "portal: pipewire consumer negotiated shared-memory capture ({}x{})",
+                    self.width,
+                    self.height
+                ),
+            }
+            negotiation.mode = mode;
+        }
     }
 }
 
-/// The fixated `SPA_PARAM_Format`, reduced to what sanity checks need.
+/// The fixated `SPA_PARAM_Format`, reduced to what delivery needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FixatedFormat {
     spa_format: u32,
     width: u32,
     height: u32,
+    modifier: Option<u64>,
 }
 
 /// The default of a SPA choice; fixation may leave any choice kind behind.
@@ -764,18 +1187,55 @@ fn parse_format_param(param: &Pod) -> Option<FixatedFormat> {
     };
     let mut format = None;
     let mut size = None;
+    let mut modifier = None;
     for property in &object.properties {
         if property.key == spa::param::format::FormatProperties::VideoFormat.as_raw() {
             format = pod_value_id(&property.value);
         } else if property.key == spa::param::format::FormatProperties::VideoSize.as_raw() {
             size = pod_value_rectangle(&property.value);
+        } else if property.key == spa::param::format::FormatProperties::VideoModifier.as_raw() {
+            modifier = pod_value_long(&property.value).map(|raw| raw as u64);
         }
     }
     Some(FixatedFormat {
         spa_format: format?,
         width: size?.width,
         height: size?.height,
+        modifier,
     })
+}
+
+fn pod_value_long(value: &pod::Value) -> Option<i64> {
+    match value {
+        pod::Value::Long(long) => Some(*long),
+        pod::Value::Choice(pod::ChoiceValue::Long(choice)) => Some(choice_default(choice)),
+        _ => None,
+    }
+}
+
+/// Extract the accepted `SPA_PARAM_BUFFERS_dataType` mask from a fixated
+/// Buffers param.
+fn parse_buffers_data_types(param: &Pod) -> Option<u32> {
+    let value = pod::deserialize::PodDeserializer::deserialize_from::<pod::Value>(param.as_bytes())
+        .ok()?
+        .1;
+    let pod::Value::Object(object) = value else {
+        return None;
+    };
+    for property in &object.properties {
+        if property.key != 6 {
+            // SPA_PARAM_BUFFERS_dataType
+            continue;
+        }
+        return match &property.value {
+            pod::Value::Int(mask) => Some(*mask as u32),
+            pod::Value::Choice(pod::ChoiceValue::Int(choice)) => {
+                Some(choice_default(choice) as u32)
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 fn frame_len(width: u32, height: u32) -> Result<usize, String> {
@@ -812,8 +1272,13 @@ fn end_cast(
 /// range because the compositor is damage-driven: frames arrive when the
 /// screen changes, bounded by its vertical sync, and each consumer picks
 /// the rate its pipeline wants.
-fn format_pod(width: u32, height: u32, spa_format: spa::param::video::VideoFormat) -> Vec<u8> {
-    let properties = vec![
+fn format_pod(
+    width: u32,
+    height: u32,
+    spa_format: spa::param::video::VideoFormat,
+    modifier: Option<u64>,
+) -> Vec<u8> {
+    let mut properties = vec![
         pod::Property {
             key: spa::param::format::FormatProperties::MediaType.as_raw(),
             flags: pod::PropertyFlags::empty(),
@@ -833,6 +1298,24 @@ fn format_pod(width: u32, height: u32, spa_format: spa::param::video::VideoForma
             flags: pod::PropertyFlags::empty(),
             value: pod::Value::Id(spa::utils::Id(spa_format.as_raw())),
         },
+    ];
+    if let Some(modifier) = modifier {
+        // The Long choice Enum carries exactly one modifier: the one the
+        // compositor's slots have. `property!`'s Choice arms do not compile
+        // for Long, so the property is built by hand.
+        properties.push(pod::Property {
+            key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: modifier as i64,
+                    alternatives: Vec::new(),
+                },
+            ))),
+        });
+    }
+    properties.extend([
         pod::Property {
             key: spa::param::format::FormatProperties::VideoSize.as_raw(),
             flags: pod::PropertyFlags::empty(),
@@ -850,7 +1333,7 @@ fn format_pod(width: u32, height: u32, spa_format: spa::param::video::VideoForma
                 },
             ))),
         },
-    ];
+    ]);
     let object = pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -859,9 +1342,38 @@ fn format_pod(width: u32, height: u32, spa_format: spa::param::video::VideoForma
     serialize(&pod::Value::Object(object))
 }
 
-/// Buffer constraints offered once the format is negotiated: 2–8 shared,
-/// plain, or dmabuf buffers of exactly one frame.
-fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
+/// The format set offered at connect time. A slot stream offers its
+/// modifier entry first (preferred by GPU consumers) and an equivalent
+/// plain entry as the universal fallback; everything else offers only the
+/// plain entry, because per-frame descriptors cannot populate DmaBuf pool
+/// buffers (see the module docs).
+fn format_pods(
+    width: u32,
+    height: u32,
+    announced: AnnouncedFormat,
+    has_slots: bool,
+) -> Vec<Vec<u8>> {
+    let mut pods = Vec::new();
+    if let AnnouncedFormat::Dmabuf {
+        spa_format,
+        modifier,
+        ..
+    } = announced
+        && has_slots
+    {
+        pods.push(format_pod(width, height, spa_format, Some(modifier)));
+        pods.push(format_pod(width, height, spa_format, None));
+        return pods;
+    }
+    pods.push(format_pod(width, height, announced.spa_format(), None));
+    pods
+}
+
+/// Buffer constraints offered once the format is negotiated: shared, plain,
+/// or dmabuf buffers of exactly one frame, defaulting to the slot count on
+/// slot streams.
+fn buffers_pod(width: u32, height: u32, slots: usize) -> Vec<u8> {
+    let default = u32::try_from(slots).unwrap_or(0).clamp(2, 8);
     let stride = width as i32 * 4;
     let size = stride * height as i32;
     let object = pod::Object {
@@ -874,7 +1386,7 @@ fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
                 value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Range {
-                        default: 4,
+                        default: default as i32,
                         min: 2,
                         max: 8,
                     },
@@ -961,6 +1473,7 @@ mod tests {
             format,
             damage: Vec::new(),
             dropped: 0,
+            slot: None,
             payload: StreamPayload::Memfd(unsealed_memfd(&[0; 16])),
         }
     }
@@ -991,7 +1504,7 @@ mod tests {
 
     #[test]
     fn format_pod_is_a_parseable_video_format_with_a_framerate_range() {
-        let bytes = format_pod(1920, 1080, spa::param::video::VideoFormat::BGRx);
+        let bytes = format_pod(1920, 1080, spa::param::video::VideoFormat::BGRx, None);
         assert!(Pod::from_bytes(&bytes).is_some(), "pod parses");
         let words = pod_words(&bytes);
         // Pod header: body size, then SPA_TYPE_Object; the object body
@@ -1022,7 +1535,7 @@ mod tests {
 
     #[test]
     fn buffers_pod_covers_one_frame_and_every_data_type() {
-        let bytes = buffers_pod(640, 480);
+        let bytes = buffers_pod(640, 480, 0);
         let object = parse_pod(&bytes);
         assert_eq!(
             object.type_,
@@ -1056,8 +1569,13 @@ mod tests {
     #[test]
     fn format_param_parsing_tolerates_plain_and_choice_values() {
         let fixated = parse_format_param(
-            Pod::from_bytes(&format_pod(640, 480, spa::param::video::VideoFormat::BGRx))
-                .expect("pod"),
+            Pod::from_bytes(&format_pod(
+                640,
+                480,
+                spa::param::video::VideoFormat::BGRx,
+                None,
+            ))
+            .expect("pod"),
         )
         .expect("parseable format pod");
         assert_eq!(
@@ -1066,6 +1584,7 @@ mod tests {
                 spa_format: spa::param::video::VideoFormat::BGRx.as_raw(),
                 width: 640,
                 height: 480,
+                modifier: None,
             }
         );
     }
@@ -1074,14 +1593,14 @@ mod tests {
     fn shm_frames_validate_against_the_announced_geometry() {
         let announced = announced_format(aegis_portal_ipc::StreamPixelFormat::Bgra8).unwrap();
         let frame = frame_for_test(aegis_portal_ipc::StreamPixelFormat::Bgra8);
-        assert!(validate_frame(frame, 2, 2, announced).is_ok());
+        assert!(validate_frame(frame, 2, 2, announced, 0).is_ok());
 
         let wrong_geometry = StreamFrame {
             width: 4,
             payload: StreamPayload::Memfd(unsealed_memfd(&[0; 32])),
             ..frame_for_test(aegis_portal_ipc::StreamPixelFormat::Bgra8)
         };
-        assert!(validate_frame(wrong_geometry, 2, 2, announced).is_err());
+        assert!(validate_frame(wrong_geometry, 2, 2, announced, 0).is_err());
     }
 
     #[test]
@@ -1100,15 +1619,15 @@ mod tests {
             })
         };
         assert!(matches!(
-            validate_frame(frame, 2, 2, announced),
-            Ok(FramePayload { stride: 16, .. })
+            validate_frame(frame, 2, 2, announced, 0),
+            Ok(FramePayload::Descriptor { stride: 16, .. })
         ));
 
         let wrong_modifier = frame_for_test(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
             drm_format: fourcc(b'X', b'R', b'2', b'4'),
             modifier: 4,
         });
-        assert!(validate_frame(wrong_modifier, 2, 2, announced).is_err());
+        assert!(validate_frame(wrong_modifier, 2, 2, announced, 0).is_err());
     }
 
     #[test]

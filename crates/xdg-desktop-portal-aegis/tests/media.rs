@@ -42,6 +42,13 @@ struct FakeCompositor {
     /// Per-stream announced formats, consumed in start order; streams start
     /// as Bgra8 when the queue is empty.
     stream_formats: Mutex<Vec<StreamPixelFormat>>,
+    /// Offer a protocol-25 slot table on dmabuf-opted-in streams.
+    offer_slots: Mutex<bool>,
+    /// The slot files handed out, kept writable so tests control the slot
+    /// contents between frames.
+    slot_files: Mutex<Vec<std::fs::File>>,
+    /// Slot releases received from the portal (protocol 25).
+    releases: Mutex<Vec<(u64, u32)>>,
 }
 
 impl Handler for FakeCompositor {
@@ -87,6 +94,7 @@ impl Handler for FakeCompositor {
         _conn_id: u64,
         max_fps: Option<u32>,
         target: StreamTarget,
+        dmabuf: Option<bool>,
     ) -> Result<StreamInfo, String> {
         self.stream_starts.lock().unwrap().push((max_fps, target));
         let format = {
@@ -97,12 +105,37 @@ impl Handler for FakeCompositor {
                 queue.remove(0)
             }
         };
+        let mut slots = None;
+        if dmabuf == Some(true)
+            && matches!(format, StreamPixelFormat::Dmabuf { .. })
+            && *self.offer_slots.lock().unwrap()
+        {
+            use std::os::fd::AsRawFd;
+            let mut files = Vec::new();
+            let mut infos = Vec::new();
+            for _ in 0..3 {
+                let file = unsealed_memfd(&[0_u8; 16]);
+                infos.push(aegis_portal_ipc::testing::StreamSlotInfo {
+                    fd: file.as_raw_fd(),
+                    stride: 8,
+                    byte_len: 16,
+                });
+                files.push(file);
+            }
+            *self.slot_files.lock().unwrap() = files;
+            slots = Some(infos);
+        }
         Ok(StreamInfo {
             stream_id: 1,
             width: 2,
             height: 2,
             format,
+            slots,
         })
+    }
+
+    fn stream_buffer_release(&self, stream_id: u64, slot: u32) {
+        self.releases.lock().unwrap().push((stream_id, slot));
     }
 
     fn stream_output_stop(&self, stream_id: u64) {
@@ -646,6 +679,7 @@ fn unsealed_memfd(bytes: &[u8]) -> std::fs::File {
 /// fake compositor, and daemon, with one started session. Guards drop in
 /// declaration order when the fixture goes away.
 struct DmabufCastFixture {
+    fake: Arc<FakeCompositor>,
     server: Server,
     runtime_dir: std::path::PathBuf,
     data_dir: std::path::PathBuf,
@@ -725,7 +759,7 @@ fn start_cast_session(
     stream_details(&results)
 }
 
-fn dmabuf_cast_fixture(tag: &str) -> Option<DmabufCastFixture> {
+fn dmabuf_cast_fixture(tag: &str, offer_slots: bool) -> Option<DmabufCastFixture> {
     let Some(bus) = private_bus() else {
         if pipewire_e2e_required() {
             panic!("dbus-daemon unavailable");
@@ -744,6 +778,7 @@ fn dmabuf_cast_fixture(tag: &str) -> Option<DmabufCastFixture> {
         return None;
     };
     let fake = Arc::new(FakeCompositor::default());
+    *fake.offer_slots.lock().unwrap() = offer_slots;
     fake.stream_formats
         .lock()
         .unwrap()
@@ -767,6 +802,7 @@ fn dmabuf_cast_fixture(tag: &str) -> Option<DmabufCastFixture> {
         &[(Some(60), StreamTarget::Output)]
     );
     Some(DmabufCastFixture {
+        fake,
         server,
         runtime_dir,
         data_dir,
@@ -796,6 +832,27 @@ fn push_dmabuf_frame(fixture: &DmabufCastFixture, pixels: &[u8]) {
             byte_len: pixels.len() as u64,
         },
         std::os::fd::AsRawFd::as_raw_fd(&frame_fd),
+    ));
+}
+
+/// Push one protocol-25 slot frame through the fixture's compositor.
+fn push_slot_frame(fixture: &DmabufCastFixture, slot: u32) {
+    assert!(fixture.server.push_stream_frame_slot(
+        aegis_portal_ipc::testing::StreamFrameFdPayload {
+            stream_id: 1,
+            sequence: 1,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: StreamPixelFormat::Dmabuf {
+                drm_format: DRM_FORMAT_XRGB8888,
+                modifier: DRM_FORMAT_MOD_LINEAR,
+            },
+            damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
+            dropped: 0,
+            byte_len: 16,
+        },
+        slot,
     ));
 }
 
@@ -831,7 +888,7 @@ fn drive_one_frame(
 /// each dmabuf frame (the universal fallback path).
 #[test]
 fn screencast_maps_dmabuf_frames_for_shm_consumers() {
-    let Some(fixture) = dmabuf_cast_fixture("shm") else {
+    let Some(fixture) = dmabuf_cast_fixture("shm", false) else {
         return;
     };
     let pixels = [0xa5_u8; 16];
@@ -846,10 +903,68 @@ fn screencast_maps_dmabuf_frames_for_shm_consumers() {
 /// delivery needs the slot protocol tracked in ADR-0005.
 #[test]
 fn screencast_cannot_forward_per_frame_descriptors() {
-    let Some(fixture) = dmabuf_cast_fixture("fwd") else {
+    let Some(fixture) = dmabuf_cast_fixture("fwd", false) else {
         return;
     };
     let pixels = [0x5a_u8; 16];
     let received = drive_one_frame(&fixture, true, &pixels).expect("frame delivery");
     assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+}
+
+/// The protocol-25 slot path: the compositor transfers slot descriptors
+/// once, frames reference them by index, the consumer receives a real
+/// `SPA_DATA_DmaBuf` buffer, and the release flows back to the compositor.
+#[test]
+fn screencast_forwards_slot_frames_zero_copy() {
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(fixture) = dmabuf_cast_fixture("slots", true) else {
+        return;
+    };
+    assert_eq!(fixture.fake.slot_files.lock().unwrap().len(), 3);
+
+    let socket = fixture.runtime_dir.join("pipewire-0");
+    let node_id = fixture.node_id;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame(
+            &socket,
+            node_id,
+            2,
+            2,
+            true,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+
+    // The compositor rendered into slot 1: rewrite its stand-in's contents
+    // and announce the frame.
+    let pixels = [0x3c_u8; 16];
+    {
+        let mut files = fixture.fake.slot_files.lock().unwrap();
+        let file = &mut files[1];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&pixels).unwrap();
+    }
+    push_slot_frame(&fixture, 1);
+
+    let received = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery");
+    assert_eq!(received, Received::DmaBuf(pixels.to_vec()));
+
+    // The consumer returned the buffer, so the portal must have released
+    // slot 1 back to the compositor.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.fake.releases.lock().unwrap().contains(&(1, 1)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slot release never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -6,7 +6,7 @@
 |-------------------|----------------|----------------|
 | `org.freedesktop.impl.portal.Settings` | Version 1 | Compositor-owned appearance and input settings |
 | `org.freedesktop.impl.portal.Screenshot` | Version 3 | Area target, color picking, and consent-checked legacy output capture |
-| `org.freedesktop.impl.portal.ScreenCast` | Version 6 | One monitor stream, hidden cursor, stable `pipewire-serial`, 60 fps ceiling, dmabuf frames served through a shared-memory copy until the [slot protocol](../adr/0005-screencast-dmabuf-slot-protocol.md) |
+| `org.freedesktop.impl.portal.ScreenCast` | Version 6 | One monitor stream, hidden cursor, stable `pipewire-serial`, 60 fps ceiling, zero-copy dmabuf delivery over the protocol-25 [slot protocol](../adr/0005-screencast-dmabuf-slot-protocol.md) with a shared-memory fallback |
 | `org.freedesktop.impl.portal.Secret` | Version 1 | Stable per-application secret from the encrypted vault; Portal-owned masked unlock prompt |
 | `org.freedesktop.impl.portal.Lockdown` | Current seven-property ABI | All properties are read-write and process-resident |
 | `org.freedesktop.impl.portal.FileChooser` | Current backend ABI | Open, save, directory, and multiple-file flows through a one-shot GTK4 process |

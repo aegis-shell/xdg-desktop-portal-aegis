@@ -10,16 +10,28 @@ use crate::blob;
 use crate::codec::{read_msg, write_msg};
 use crate::schema::{LeaseRequest, Request, Response};
 use crate::{
-    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, PROTOCOL_VERSION, PickKind,
-    PickResult, Rect, SettingsSnapshot, StreamPixelFormat, StreamTarget,
+    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
+    StreamTarget,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct StreamStarted {
     pub stream_id: u64,
     pub width: u32,
     pub height: u32,
     pub format: StreamPixelFormat,
+    /// dmabuf slot descriptors (protocol 25), transferred once at start.
+    pub slots: Option<Vec<StreamSlot>>,
+}
+
+/// One dmabuf slot of a protocol-25 stream: a fixed-size descriptor the
+/// compositor renders into until the consumer releases it.
+#[derive(Debug)]
+pub struct StreamSlot {
+    pub file: std::fs::File,
+    pub stride: u32,
+    pub byte_len: u64,
 }
 
 /// Frame payload descriptor received behind a `StreamFrame` header. The
@@ -32,6 +44,9 @@ pub enum StreamPayload {
     /// Single-plane dmabuf of `byte_len` bytes; the plane stride travels in
     /// the frame header.
     Dmabuf(std::fs::File),
+    /// A frame in a dmabuf slot transferred at start (protocol 25); the
+    /// frame header's `slot` names it and no descriptor follows.
+    Slot,
 }
 
 #[derive(Debug)]
@@ -44,6 +59,9 @@ pub struct StreamFrame {
     pub format: StreamPixelFormat,
     pub damage: Vec<Rect>,
     pub dropped: u64,
+    /// The dmabuf slot this frame occupies (protocol 25); `payload` is
+    /// [`StreamPayload::Slot`] then.
+    pub slot: Option<u32>,
     pub payload: StreamPayload,
 }
 
@@ -58,6 +76,8 @@ pub struct Client {
     stream: UnixStream,
     caps: ConnectionCapabilities,
     lease: Option<LeaseGrant>,
+    /// The protocol version both ends speak after the handshake.
+    version: u32,
 }
 
 impl Client {
@@ -84,44 +104,74 @@ impl Client {
         scope: Option<String>,
         timeout: Duration,
     ) -> io::Result<Self> {
+        let mut version = PROTOCOL_VERSION;
+        loop {
+            match Self::handshake(path, requested, scope.as_deref(), version, timeout)? {
+                Ok(client) => return Ok(client),
+                Err(_) if version > MIN_PROTOCOL_VERSION => {
+                    // A refused or failed handshake at the newest version
+                    // retries one step older; the final attempt surfaces
+                    // the real error.
+                    version -= 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Attempt the handshake once at `version`. `Ok(Err(..))` is a clean
+    /// server-side refusal (version or scope); `Err(..)` is a transport or
+    /// framing failure.
+    fn handshake(
+        path: &Path,
+        requested: ConnectionCapabilities,
+        scope: Option<&str>,
+        version: u32,
+        timeout: Duration,
+    ) -> io::Result<Result<Self, io::Error>> {
         let mut stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         write_msg(
             &mut stream,
             &Request::Hello {
-                version: PROTOCOL_VERSION,
+                version,
                 caps: requested,
-                scope,
+                scope: scope.map(str::to_string),
                 lease: requested.privileged().then(LeaseRequest::default),
             },
         )?;
-        match read_msg::<_, Response>(&mut stream)? {
+        Ok(match read_msg::<_, Response>(&mut stream)? {
             Response::Hello {
-                version,
+                version: replied,
                 caps,
                 lease,
-            } if version == PROTOCOL_VERSION => Ok(Self {
+            } if replied <= version => Ok(Self {
                 stream,
                 caps,
                 lease,
+                version: replied,
             }),
-            Response::Hello { version, .. } => Err(io::Error::new(
+            Response::Hello { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!(
-                    "Aegis IPC protocol mismatch: server replied {version}, Portal requires {PROTOCOL_VERSION}"
-                ),
+                format!("Aegis IPC server replied a newer protocol than offered ({version})"),
             )),
             Response::Error { message } => {
                 Err(io::Error::new(io::ErrorKind::ConnectionRefused, message))
             }
             other => Err(unexpected("Hello", &other)),
-        }
+        })
     }
 
     #[must_use]
     pub fn caps(&self) -> ConnectionCapabilities {
         self.caps
+    }
+
+    /// The protocol version negotiated at the handshake.
+    #[must_use]
+    pub fn protocol_version(&self) -> u32 {
+        self.version
     }
 
     #[must_use]
@@ -231,9 +281,27 @@ impl Client {
         max_fps: Option<u32>,
         target: StreamTarget,
     ) -> io::Result<StreamStarted> {
+        self.start_output_stream(max_fps, target, false)
+    }
+
+    /// Start an output stream, optionally opting into the protocol-25
+    /// dmabuf slot transport. The opt-in is honored only when the
+    /// negotiated protocol is 25 or newer; an older server answers with the
+    /// SHM stream as if the flag were absent.
+    pub fn start_output_stream(
+        &mut self,
+        max_fps: Option<u32>,
+        target: StreamTarget,
+        dmabuf: bool,
+    ) -> io::Result<StreamStarted> {
+        let dmabuf = dmabuf && self.version >= 25;
         write_msg(
             &mut self.stream,
-            &Request::StreamOutputStart { max_fps, target },
+            &Request::StreamOutputStart {
+                max_fps,
+                target,
+                dmabuf: dmabuf.then_some(true),
+            },
         )?;
         match read_msg::<_, Response>(&mut self.stream)? {
             Response::StreamOutputStarted {
@@ -241,15 +309,63 @@ impl Client {
                 width,
                 height,
                 format,
-            } => Ok(StreamStarted {
-                stream_id,
-                width,
-                height,
-                format,
-            }),
+                slots,
+                slot_stride,
+                slot_bytes,
+            } => {
+                let slots = match (format, slots, slot_stride, slot_bytes) {
+                    // Protocol 25: the slot table follows the reply.
+                    (StreamPixelFormat::Dmabuf { .. }, Some(count), Some(stride), Some(bytes)) => {
+                        let mut table = Vec::with_capacity(count as usize);
+                        for _ in 0..count {
+                            let file = blob::receive_dmabuf_file(&self.stream, bytes)?;
+                            table.push(StreamSlot {
+                                file,
+                                stride,
+                                byte_len: bytes,
+                            });
+                        }
+                        Some(table)
+                    }
+                    // A dmabuf announcement without slot metadata is the
+                    // per-frame transport: each frame carries its own
+                    // descriptor.
+                    (StreamPixelFormat::Dmabuf { .. }, None, None, None) => None,
+                    (StreamPixelFormat::Dmabuf { .. }, ..) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "dmabuf stream announcement with a partial slot table",
+                        ));
+                    }
+                    (_, None, None, None) => None,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "SHM stream announcement carried partial slot metadata",
+                        ));
+                    }
+                };
+                Ok(StreamStarted {
+                    stream_id,
+                    width,
+                    height,
+                    format,
+                    slots,
+                })
+            }
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(unexpected("StreamOutputStarted", &other)),
         }
+    }
+
+    /// Release a dmabuf stream slot (protocol 25) after the PipeWire
+    /// consumer returned its buffer. The reply arrives on the read side and
+    /// is skipped like any interleaved response.
+    pub fn release_stream_buffer(&mut self, stream_id: u64, slot: u32) -> io::Result<()> {
+        write_msg(
+            &mut self.stream,
+            &Request::StreamBufferRelease { stream_id, slot },
+        )
     }
 
     pub fn stop_output_stream(&mut self, stream_id: u64) -> io::Result<()> {
@@ -281,17 +397,24 @@ impl Client {
                         damage,
                         dropped,
                         byte_len,
+                        slot,
                     } = event
                     else {
                         unreachable!();
                     };
-                    let payload = match format {
-                        StreamPixelFormat::Bgra8 | StreamPixelFormat::Rgba8 => {
-                            StreamPayload::Memfd(blob::receive_memfd_file(&self.stream, byte_len)?)
-                        }
-                        StreamPixelFormat::Dmabuf { .. } => StreamPayload::Dmabuf(
-                            blob::receive_dmabuf_file(&self.stream, byte_len)?,
-                        ),
+                    let payload = match slot {
+                        Some(_) => StreamPayload::Slot,
+                        None => match format {
+                            StreamPixelFormat::Bgra8 | StreamPixelFormat::Rgba8 => {
+                                StreamPayload::Memfd(blob::receive_memfd_file(
+                                    &self.stream,
+                                    byte_len,
+                                )?)
+                            }
+                            StreamPixelFormat::Dmabuf { .. } => StreamPayload::Dmabuf(
+                                blob::receive_dmabuf_file(&self.stream, byte_len)?,
+                            ),
+                        },
                     };
                     return Ok(StreamMessage::Frame(StreamFrame {
                         stream_id,
@@ -302,6 +425,7 @@ impl Client {
                         format,
                         damage,
                         dropped,
+                        slot,
                         payload,
                     }));
                 }

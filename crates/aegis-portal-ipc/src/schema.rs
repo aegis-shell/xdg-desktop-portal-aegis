@@ -6,7 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 24;
+/// Newest protocol version this projection speaks. The handshake asks for
+/// this version and accepts a downgrade to [`MIN_PROTOCOL_VERSION`] when the
+/// compositor is older (version-gated features, such as dmabuf slot
+/// streaming at 25, key off the negotiated version).
+pub const PROTOCOL_VERSION: u32 = 25;
+/// Oldest protocol version this projection can negotiate down to.
+pub const MIN_PROTOCOL_VERSION: u32 = 24;
 pub const LOCAL_PORTAL_SCOPE: &str = "aegis-portal";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +229,9 @@ pub enum Event {
         damage: Vec<Rect>,
         dropped: u64,
         byte_len: u64,
+        /// dmabuf slot index (protocol 25); no blob follows such frames.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot: Option<u32>,
     },
     StreamEnded {
         stream_id: u64,
@@ -257,6 +266,16 @@ pub(crate) enum Request {
         max_fps: Option<u32>,
         #[serde(default, skip_serializing_if = "StreamTarget::is_output")]
         target: StreamTarget,
+        /// Opt in to a zero-copy dmabuf slot stream (protocol 25). A client
+        /// that does not opt in never receives a dmabuf announcement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dmabuf: Option<bool>,
+    },
+    /// Release a dmabuf stream slot (protocol 25) after the PipeWire
+    /// consumer returned the buffer bound to it.
+    StreamBufferRelease {
+        stream_id: u64,
+        slot: u32,
     },
     StreamOutputStop {
         stream_id: u64,
@@ -295,6 +314,19 @@ pub(crate) enum Response {
         width: u32,
         height: u32,
         format: StreamPixelFormat,
+        /// dmabuf slot count (protocol 25); the reply is followed by this
+        /// many slot descriptors on the blob channel, in slot order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slots: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot_stride: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slot_bytes: Option<u64>,
+    },
+    /// Reply to [`Request::StreamBufferRelease`] (protocol 25).
+    StreamBufferReleased {
+        stream_id: u64,
+        slot: u32,
     },
     StreamOutputStopped {
         stream_id: u64,
@@ -376,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_matches_the_v24_wire_shape() {
+    fn hello_matches_the_v25_wire_shape() {
         let request = Request::Hello {
             version: PROTOCOL_VERSION,
             caps: ConnectionCapabilities::QUERY,
@@ -387,7 +419,7 @@ mod tests {
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
                 "type": "Hello",
-                "version": 24,
+                "version": 25,
                 "caps": {
                     "query": true,
                     "control": false,
@@ -445,10 +477,34 @@ mod tests {
                 Request::StreamOutputStart {
                     max_fps: Some(30),
                     target: StreamTarget::Output,
+                    dmabuf: None,
                 },
                 serde_json::json!({
                     "type": "StreamOutputStart",
                     "max_fps": 30
+                }),
+            ),
+            (
+                Request::StreamOutputStart {
+                    max_fps: Some(60),
+                    target: StreamTarget::Output,
+                    dmabuf: Some(true),
+                },
+                serde_json::json!({
+                    "type": "StreamOutputStart",
+                    "max_fps": 60,
+                    "dmabuf": true
+                }),
+            ),
+            (
+                Request::StreamBufferRelease {
+                    stream_id: 7,
+                    slot: 2,
+                },
+                serde_json::json!({
+                    "type": "StreamBufferRelease",
+                    "stream_id": 7,
+                    "slot": 2
                 }),
             ),
             (
@@ -490,7 +546,7 @@ mod tests {
         else {
             panic!("hello response");
         };
-        assert_eq!(version, PROTOCOL_VERSION);
+        assert_eq!(version, MIN_PROTOCOL_VERSION);
         assert!(caps.control);
         assert_eq!(lease.unwrap().id, 9);
     }
