@@ -968,3 +968,55 @@ fn screencast_forwards_slot_frames_zero_copy() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A slot-mode consumer that cannot import dmabufs gets a shared-memory
+/// copy of each frame, and the slot is released right after the copy so
+/// the compositor can reuse it.
+#[test]
+fn screencast_copies_slot_frames_for_shm_consumers() {
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(fixture) = dmabuf_cast_fixture("slotshm", true) else {
+        return;
+    };
+    let socket = fixture.runtime_dir.join("pipewire-0");
+    let node_id = fixture.node_id;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame(
+            &socket,
+            node_id,
+            2,
+            2,
+            false,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+
+    let pixels = [0x77_u8; 16];
+    {
+        let mut files = fixture.fake.slot_files.lock().unwrap();
+        let file = &mut files[2];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&pixels).unwrap();
+    }
+    push_slot_frame(&fixture, 2);
+
+    let received = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.fake.releases.lock().unwrap().contains(&(1, 2)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slot release never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

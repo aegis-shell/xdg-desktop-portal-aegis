@@ -8,6 +8,7 @@ dependency.
 
 | Portal line | Aegis runtime | IPC protocol | Aegis build dependency |
 |-------------|---------------|--------------|------------------------|
+| Unreleased (post-`v0.0.5`) | `v0.0.11`–`v0.0.12` (24), development `dev` (25) | 25, negotiates down to 24 | None |
 | `v0.0.5` | `v0.0.11`, `v0.0.12` | 24 | None |
 | `v0.0.4` | `v0.0.11`, `v0.0.12` | 24 | None |
 | `v0.0.3` | `v0.0.11`, `v0.0.12` | 24 | Exact `v0.0.11` tagged Git crates |
@@ -21,11 +22,13 @@ Screenshot, color and target selection, and ScreenCast consume
 compositor-owned resources.
 
 Protocol 24 is verified against the `v0.0.11` and `v0.0.12` schemas. The
-Portal projection rejects every other protocol version at handshake. A future
-Aegis release is compatible only when it preserves protocol 24 and the
-operations listed in
-[ADR-0004](../adr/0004-portal-ownership-and-runtime-ipc-boundary.md), or after
-the Portal adds and tests the new protocol explicitly.
+post-`v0.0.5` Portal offers protocol 25 at the handshake and accepts a
+downgrade to 24, so it keeps working with protocol-24 compositors using the
+SHM transports while protocol-25 compositors additionally provide the
+zero-copy dmabuf slot stream (see
+[ADR-0005](../adr/0005-screencast-dmabuf-slot-protocol.md)). A future Aegis
+release is compatible when it preserves protocol 24 or implements the
+verified protocol-25 schema.
 
 FileChooser, Account, Secret, Email, and Lockdown do not require compositor
 IPC. FileChooser, Account confirmation, and Secret password input use the

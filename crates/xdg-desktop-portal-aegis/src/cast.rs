@@ -502,8 +502,9 @@ fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
                 let has_slots = !data.slot_files.is_empty();
                 drop(bindings);
                 if has_slots
-                    && let Err(error) =
-                        client.borrow_mut().release_stream_buffer(stream_id, slot as u32)
+                    && let Err(error) = client
+                        .borrow_mut()
+                        .release_stream_buffer(stream_id, slot as u32)
                 {
                     log::debug!("portal: slot release failed: {error}");
                 }
@@ -943,7 +944,9 @@ fn run_cast(
             drop(bindings);
             if was_in_flight
                 && has_slots
-                && let Err(error) = client.borrow_mut().release_stream_buffer(stream_id, slot as u32)
+                && let Err(error) = client
+                    .borrow_mut()
+                    .release_stream_buffer(stream_id, slot as u32)
             {
                 log::debug!("portal: slot release failed: {error}");
             }
@@ -1302,10 +1305,12 @@ fn format_pod(
     if let Some(modifier) = modifier {
         // The Long choice Enum carries exactly one modifier: the one the
         // compositor's slots have. `property!`'s Choice arms do not compile
-        // for Long, so the property is built by hand.
+        // for Long, so the property is built by hand. MANDATORY keeps
+        // modifier-ignorant consumers off this entry: they fixate the plain
+        // entry instead of fixating a dmabuf format they cannot serve.
         properties.push(pod::Property {
             key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
-            flags: pod::PropertyFlags::empty(),
+            flags: pod::PropertyFlags::MANDATORY,
             value: pod::Value::Choice(pod::ChoiceValue::Long(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Enum {
