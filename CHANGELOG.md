@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-08-10
+
 ### Added
 
 - Zero-copy ScreenCast over the protocol-25 dmabuf slot transport. The
@@ -143,7 +145,8 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.6
 [0.0.5]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.5
 [0.0.4]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.4
 [0.0.3]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.3
