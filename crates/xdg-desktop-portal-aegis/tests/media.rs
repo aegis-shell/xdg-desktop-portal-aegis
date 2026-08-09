@@ -39,6 +39,9 @@ struct FakeCompositor {
     stream_starts: Mutex<Vec<(Option<u32>, StreamTarget)>>,
     stream_stops: Mutex<Vec<u64>>,
     stream_disconnects: Mutex<Vec<u64>>,
+    /// Per-stream announced formats, consumed in start order; streams start
+    /// as Bgra8 when the queue is empty.
+    stream_formats: Mutex<Vec<StreamPixelFormat>>,
 }
 
 impl Handler for FakeCompositor {
@@ -86,11 +89,19 @@ impl Handler for FakeCompositor {
         target: StreamTarget,
     ) -> Result<StreamInfo, String> {
         self.stream_starts.lock().unwrap().push((max_fps, target));
+        let format = {
+            let mut queue = self.stream_formats.lock().unwrap();
+            if queue.is_empty() {
+                StreamPixelFormat::Bgra8
+            } else {
+                queue.remove(0)
+            }
+        };
         Ok(StreamInfo {
             stream_id: 1,
             width: 2,
             height: 2,
-            format: StreamPixelFormat::Bgra8,
+            format,
         })
     }
 
@@ -236,6 +247,175 @@ fn require_or_skip(condition: bool, message: &str) -> bool {
     false
 }
 
+/// Spawn the isolated PipeWire daemon and WirePlumber session manager that
+/// screencast E2E tests share. Returns `None` after printing a skip reason
+/// when the environment cannot host the stack (unless E2E is required).
+fn spawn_pipewire_stack(
+    bus_address: &str,
+    runtime_dir: &std::path::Path,
+) -> Option<(KillOnDrop, KillOnDrop)> {
+    if !require_or_skip(
+        media_tool_available("pipewire"),
+        "pipewire executable unavailable",
+    ) || !require_or_skip(
+        media_tool_available("gst-launch-1.0"),
+        "GStreamer PipeWire consumer unavailable",
+    ) || !require_or_skip(
+        media_tool_available("wireplumber"),
+        "WirePlumber session manager unavailable",
+    ) {
+        return None;
+    }
+    let pipewire_log = runtime_dir.join("pipewire.log");
+    let mut pipewire = Command::new("pipewire");
+    pipewire
+        .env("DBUS_SESSION_BUS_ADDRESS", bus_address)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&pipewire_log).expect("PipeWire log"),
+        ));
+    let mut pipewire = pipewire.spawn().expect("pipewire was probed above");
+    let socket = runtime_dir.join("pipewire-0");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if socket.exists() {
+            break;
+        }
+        if let Some(status) = pipewire.try_wait().expect("poll PipeWire") {
+            let log = std::fs::read_to_string(&pipewire_log).unwrap_or_default();
+            if !require_or_skip(
+                false,
+                &format!("isolated PipeWire exited as {status}: {log}"),
+            ) {
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = pipewire.kill();
+            let _ = pipewire.wait();
+            let log = std::fs::read_to_string(&pipewire_log).unwrap_or_default();
+            if !require_or_skip(false, &format!("isolated PipeWire did not start: {log}")) {
+                return None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pipewire = KillOnDrop(pipewire);
+
+    // Target-node linking is session-manager policy in PipeWire. Running the
+    // same WirePlumber component production desktops use makes this a real
+    // producer/consumer test rather than only a registry-object check.
+    let wireplumber_log = runtime_dir.join("wireplumber.log");
+    let mut wireplumber = Command::new("wireplumber");
+    wireplumber
+        .env("DBUS_SESSION_BUS_ADDRESS", bus_address)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&wireplumber_log).expect("WirePlumber log"),
+        ));
+    let mut wireplumber = wireplumber.spawn().expect("WirePlumber was probed above");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = wireplumber.try_wait().expect("poll WirePlumber") {
+            let log = std::fs::read_to_string(&wireplumber_log).unwrap_or_default();
+            panic!("WirePlumber exited as {status}: {log}");
+        }
+        let registry = Command::new("pw-dump")
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+            .output();
+        if registry
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("WirePlumber"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WirePlumber did not register: {}",
+            std::fs::read_to_string(&wireplumber_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let wireplumber = KillOnDrop(wireplumber);
+    Some((pipewire, wireplumber))
+}
+
+/// Consume one raw frame from a stream node through an independent
+/// GStreamer PipeWire client.
+fn spawn_gst_consumer(
+    bus_address: &str,
+    runtime_dir: &std::path::Path,
+    serial: u64,
+    caps: &str,
+    captured: &std::path::Path,
+) -> (std::process::Child, std::path::PathBuf) {
+    let consumer_log = runtime_dir.join("consumer.log");
+    let mut consumer = Command::new("gst-launch-1.0");
+    consumer
+        .args([
+            "-q",
+            "pipewiresrc",
+            &format!("target-object={serial}"),
+            "num-buffers=1",
+            "!",
+            caps,
+            "!",
+            "filesink",
+            &format!("location={}", captured.display()),
+        ])
+        .env("DBUS_SESSION_BUS_ADDRESS", bus_address)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+        .env("PIPEWIRE_REMOTE", "pipewire-0-manager")
+        .env("GST_DEBUG", "pipewiresrc:6")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&consumer_log).expect("consumer log"),
+        ));
+    (
+        consumer.spawn().expect("GStreamer was probed above"),
+        consumer_log,
+    )
+}
+
+/// Wait for a spawned consumer, dumping diagnostics on timeout.
+fn wait_consumer(
+    consumer: &mut std::process::Child,
+    runtime_dir: &std::path::Path,
+    consumer_log: &std::path::Path,
+    backend_log: &std::path::Path,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = consumer.try_wait().expect("poll consumer") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = consumer.kill();
+            let _ = consumer.wait();
+            let log = std::fs::read_to_string(consumer_log).unwrap_or_default();
+            let registry = Command::new("pw-dump")
+                .env("XDG_RUNTIME_DIR", runtime_dir)
+                .env("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default();
+            let backend = std::fs::read_to_string(backend_log).unwrap_or_default();
+            panic!(
+                "PipeWire consumer timed out: {log}\nbackend:\n{backend}\nregistry:\n{registry}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn stream_details(results: &HashMap<String, OwnedValue>) -> (u32, u64) {
     let streams = Value::from(results["streams"].clone());
     let Value::Array(streams) = streams else {
@@ -268,18 +448,6 @@ fn stream_details(results: &HashMap<String, OwnedValue>) -> (u32, u64) {
 
 #[test]
 fn screencast_republishes_compositor_frames_through_real_pipewire() {
-    if !require_or_skip(
-        media_tool_available("pipewire"),
-        "pipewire executable unavailable",
-    ) || !require_or_skip(
-        media_tool_available("gst-launch-1.0"),
-        "GStreamer PipeWire consumer unavailable",
-    ) || !require_or_skip(
-        media_tool_available("wireplumber"),
-        "WirePlumber session manager unavailable",
-    ) {
-        return;
-    }
     let Some(bus) = private_bus() else {
         if pipewire_e2e_required() {
             panic!("dbus-daemon unavailable");
@@ -293,87 +461,11 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
     std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
         .expect("secure PipeWire runtime directory");
 
-    let pipewire_log = runtime_dir.join("pipewire.log");
-    let mut pipewire = Command::new("pipewire");
-    pipewire
-        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(&pipewire_log).expect("PipeWire log"),
-        ));
-    let mut pipewire = pipewire.spawn().expect("pipewire was probed above");
-    let socket = runtime_dir.join("pipewire-0");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if socket.exists() {
-            break;
-        }
-        if let Some(status) = pipewire.try_wait().expect("poll PipeWire") {
-            let log = std::fs::read_to_string(&pipewire_log).unwrap_or_default();
-            if !require_or_skip(
-                false,
-                &format!("isolated PipeWire exited as {status}: {log}"),
-            ) {
-                std::fs::remove_dir_all(data_dir).ok();
-                std::fs::remove_dir_all(runtime_dir).ok();
-                return;
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = pipewire.kill();
-            let _ = pipewire.wait();
-            let log = std::fs::read_to_string(&pipewire_log).unwrap_or_default();
-            if !require_or_skip(false, &format!("isolated PipeWire did not start: {log}")) {
-                std::fs::remove_dir_all(data_dir).ok();
-                std::fs::remove_dir_all(runtime_dir).ok();
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _pipewire = KillOnDrop(pipewire);
-
-    // Target-node linking is session-manager policy in PipeWire. Running the
-    // same WirePlumber component production desktops use makes this a real
-    // producer/consumer test rather than only a registry-object check.
-    let wireplumber_log = runtime_dir.join("wireplumber.log");
-    let mut wireplumber = Command::new("wireplumber");
-    wireplumber
-        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(&wireplumber_log).expect("WirePlumber log"),
-        ));
-    let mut wireplumber = wireplumber.spawn().expect("WirePlumber was probed above");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = wireplumber.try_wait().expect("poll WirePlumber") {
-            let log = std::fs::read_to_string(&wireplumber_log).unwrap_or_default();
-            panic!("WirePlumber exited as {status}: {log}");
-        }
-        let registry = Command::new("pw-dump")
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-            .output();
-        if registry
-            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("WirePlumber"))
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "WirePlumber did not register: {}",
-            std::fs::read_to_string(&wireplumber_log).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _wireplumber = KillOnDrop(wireplumber);
+    let Some((_pipewire, _wireplumber)) = spawn_pipewire_stack(bus.address(), &runtime_dir) else {
+        std::fs::remove_dir_all(data_dir).ok();
+        std::fs::remove_dir_all(runtime_dir).ok();
+        return;
+    };
 
     let fake = Arc::new(FakeCompositor::default());
     let server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
@@ -467,38 +559,20 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
     assert_ne!(serial, 0, "v6 requires a stable PipeWire serial");
     assert_eq!(
         fake.stream_starts.lock().unwrap().as_slice(),
-        &[(Some(30), StreamTarget::Output)]
+        &[(Some(60), StreamTarget::Output)]
     );
 
     // Consume one raw frame from the exact node through an independent
     // PipeWire client. Keeping the latest compositor frame lets the producer
     // satisfy the first process callback even when linking finishes later.
     let captured = runtime_dir.join("captured.bgrx");
-    let consumer_log = runtime_dir.join("consumer.log");
-    let mut consumer = Command::new("gst-launch-1.0");
-    consumer
-        .args([
-            "-q",
-            "pipewiresrc",
-            &format!("target-object={serial}"),
-            "num-buffers=1",
-            "!",
-            "video/x-raw,format=BGRx,width=2,height=2",
-            "!",
-            "filesink",
-            &format!("location={}", captured.display()),
-        ])
-        .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-        .env("PIPEWIRE_REMOTE", "pipewire-0-manager")
-        .env("GST_DEBUG", "pipewiresrc:6")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            std::fs::File::create(&consumer_log).expect("consumer log"),
-        ));
-    let mut consumer = consumer.spawn().expect("GStreamer was probed above");
+    let (mut consumer, consumer_log) = spawn_gst_consumer(
+        bus.address(),
+        &runtime_dir,
+        serial,
+        "video/x-raw,format=BGRx,width=2,height=2",
+        &captured,
+    );
     let pixels: Arc<[u8]> = Arc::from(&[7_u8; 16][..]);
     assert!(server.push_stream_frame(StreamFramePayload {
         stream_id: 1,
@@ -511,28 +585,7 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
         dropped: 0,
         pixels,
     }));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = consumer.try_wait().expect("poll consumer") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = consumer.kill();
-            let _ = consumer.wait();
-            let log = std::fs::read_to_string(&consumer_log).unwrap_or_default();
-            let registry = Command::new("pw-dump")
-                .env("XDG_RUNTIME_DIR", &runtime_dir)
-                .env("PIPEWIRE_RUNTIME_DIR", &runtime_dir)
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .unwrap_or_default();
-            let backend = std::fs::read_to_string(&backend_log).unwrap_or_default();
-            panic!(
-                "PipeWire consumer timed out: {log}\nbackend:\n{backend}\nregistry:\n{registry}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_consumer(&mut consumer, &runtime_dir, &consumer_log, &backend_log);
     let log = std::fs::read_to_string(&consumer_log).unwrap_or_default();
     assert!(
         status.success(),
@@ -563,4 +616,240 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
 
     std::fs::remove_dir_all(data_dir).ok();
     std::fs::remove_dir_all(runtime_dir).ok();
+}
+
+#[path = "media/pipewire_consumer.rs"]
+mod pipewire_consumer;
+use pipewire_consumer::{Received, consume_one_frame};
+
+/// DRM_FORMAT_XRGB8888: the fourcc the compositor announces for its
+/// single-plane BGRA8-class dmabuf exports.
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// An unsealed memfd stands in for a GPU dmabuf: same wire transport, same
+/// fixed size, no seals, and mappable on any test machine.
+fn unsealed_memfd(bytes: &[u8]) -> std::fs::File {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    // SAFETY: the name is static and NUL-terminated; the fd is checked
+    // before ownership is constructed.
+    let fd = unsafe { libc::memfd_create(c"aegis-media-test".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    // SAFETY: `fd` is a new owned descriptor from memfd_create.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes).unwrap();
+    file
+}
+
+/// A running dmabuf-announced cast: private bus, isolated PipeWire stack,
+/// fake compositor, and daemon, with one started session. Guards drop in
+/// declaration order when the fixture goes away.
+struct DmabufCastFixture {
+    server: Server,
+    runtime_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    node_id: u32,
+    _daemon: KillOnDrop,
+    _stack: (KillOnDrop, KillOnDrop),
+    _bus: common::PrivateBus,
+}
+
+impl Drop for DmabufCastFixture {
+    fn drop(&mut self) {
+        // Keep the directories on request so failed runs leave their
+        // backend/PipeWire logs inspectable.
+        if std::env::var_os("AEGIS_PORTAL_E2E_KEEP").is_some() {
+            return;
+        }
+        std::fs::remove_dir_all(&self.runtime_dir).ok();
+        std::fs::remove_dir_all(&self.data_dir).ok();
+    }
+}
+
+fn start_cast_session(
+    conn: &zbus::blocking::Connection,
+    session_path: &str,
+    tag: &str,
+) -> (u32, u64) {
+    let screencast = Proxy::new(
+        conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.impl.portal.ScreenCast",
+    )
+    .expect("ScreenCast proxy");
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "CreateSession",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_create"
+                )),
+                handle(session_path),
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("CreateSession");
+    assert_eq!(code, 0);
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "SelectSources",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_select"
+                )),
+                handle(session_path),
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("SelectSources");
+    assert_eq!(code, 0);
+    let (code, results): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "Start",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_start"
+                )),
+                handle(session_path),
+                "",
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("Start");
+    assert_eq!(code, 0, "dmabuf-announced Start: {results:?}");
+    stream_details(&results)
+}
+
+fn dmabuf_cast_fixture(tag: &str) -> Option<DmabufCastFixture> {
+    let Some(bus) = private_bus() else {
+        if pipewire_e2e_required() {
+            panic!("dbus-daemon unavailable");
+        }
+        eprintln!("dmabuf PipeWire E2E: no dbus-daemon, skipping");
+        return None;
+    };
+    let conn = bus.connect();
+    let data_dir = temp_dir(&format!("cast-{tag}-data"));
+    let runtime_dir = temp_dir(&format!("cast-{tag}-runtime"));
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure PipeWire runtime directory");
+    let Some(stack) = spawn_pipewire_stack(bus.address(), &runtime_dir) else {
+        std::fs::remove_dir_all(data_dir).ok();
+        std::fs::remove_dir_all(runtime_dir).ok();
+        return None;
+    };
+    let fake = Arc::new(FakeCompositor::default());
+    fake.stream_formats
+        .lock()
+        .unwrap()
+        .push(StreamPixelFormat::Dmabuf {
+            drm_format: DRM_FORMAT_XRGB8888,
+            modifier: DRM_FORMAT_MOD_LINEAR,
+        });
+    let server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
+        .expect("bind fake compositor IPC");
+    let backend_log = runtime_dir.join("backend.log");
+    let mut backend = daemon_command(&bus, &data_dir, &runtime_dir);
+    backend.env("RUST_LOG", "debug").stderr(Stdio::from(
+        std::fs::File::create(&backend_log).expect("backend log"),
+    ));
+    let daemon = KillOnDrop(backend.spawn().expect("spawn portal daemon"));
+    wait_for_name(&conn, PORTAL);
+    let session_path = format!("/org/freedesktop/portal/desktop/session/1/{tag}");
+    let (node_id, _) = start_cast_session(&conn, &session_path, tag);
+    assert_eq!(
+        fake.stream_starts.lock().unwrap().as_slice(),
+        &[(Some(60), StreamTarget::Output)]
+    );
+    Some(DmabufCastFixture {
+        server,
+        runtime_dir,
+        data_dir,
+        node_id,
+        _daemon: daemon,
+        _stack: stack,
+        _bus: bus,
+    })
+}
+
+/// Push one dmabuf frame (memfd stand-in) through the fixture's compositor.
+fn push_dmabuf_frame(fixture: &DmabufCastFixture, pixels: &[u8]) {
+    let frame_fd = unsealed_memfd(pixels);
+    assert!(fixture.server.push_stream_frame_fd(
+        aegis_portal_ipc::testing::StreamFrameFdPayload {
+            stream_id: 1,
+            sequence: 1,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: StreamPixelFormat::Dmabuf {
+                drm_format: DRM_FORMAT_XRGB8888,
+                modifier: DRM_FORMAT_MOD_LINEAR,
+            },
+            damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
+            dropped: 0,
+            byte_len: pixels.len() as u64,
+        },
+        std::os::fd::AsRawFd::as_raw_fd(&frame_fd),
+    ));
+}
+
+/// Drive one frame through the cast: link a consumer, wait for it to reach
+/// streaming, push the frame, and return what the consumer received.
+fn drive_one_frame(
+    fixture: &DmabufCastFixture,
+    offer_dmabuf: bool,
+    pixels: &[u8],
+) -> Result<Received, String> {
+    let socket = fixture.runtime_dir.join("pipewire-0");
+    let node_id = fixture.node_id;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame(
+            &socket,
+            node_id,
+            2,
+            2,
+            offer_dmabuf,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+    push_dmabuf_frame(fixture, pixels);
+    consumer.join().expect("consumer thread")
+}
+
+/// A consumer that enumerates no modifier gets the shared-memory copy of
+/// each dmabuf frame (the universal fallback path).
+#[test]
+fn screencast_maps_dmabuf_frames_for_shm_consumers() {
+    let Some(fixture) = dmabuf_cast_fixture("shm") else {
+        return;
+    };
+    let pixels = [0xa5_u8; 16];
+    let received = drive_one_frame(&fixture, false, &pixels).expect("frame delivery");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+}
+
+/// PipeWire fixes each pool buffer's descriptor at allocation time, so a
+/// per-frame dmabuf descriptor cannot be forwarded through the pool: the
+/// consumer's buffer keeps its allocation-time type. A consumer enumerating
+/// a modifier therefore still receives shared-memory copies. Zero-copy
+/// delivery needs the slot protocol tracked in ADR-0005.
+#[test]
+fn screencast_cannot_forward_per_frame_descriptors() {
+    let Some(fixture) = dmabuf_cast_fixture("fwd") else {
+        return;
+    };
+    let pixels = [0x5a_u8; 16];
+    let received = drive_one_frame(&fixture, true, &pixels).expect("frame delivery");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
 }

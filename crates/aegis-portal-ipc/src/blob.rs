@@ -1,4 +1,11 @@
-//! Sealed memfd transport for screenshot and screencast payloads.
+//! Descriptor transport for screenshot and screencast payloads.
+//!
+//! Every payload crosses the socket as one SCM_RIGHTS descriptor behind a
+//! `0xfd` marker byte. SHM payloads are sealed memfds whose contents the
+//! sender can no longer modify; dmabuf payloads are single-plane GPU
+//! buffers, which cannot carry memfd seals and are validated by size only.
+//! A dmabuf has a fixed size for its lifetime, so the size check bounds the
+//! receiver's mapping the same way the seal check does for memfds.
 
 use std::fs::File;
 #[cfg(any(test, feature = "test-server"))]
@@ -57,6 +64,39 @@ impl SealedBlob {
 }
 
 pub(crate) fn receive(stream: &UnixStream, expected_len: u64) -> io::Result<Vec<u8>> {
+    let mut file = receive_memfd_file(stream, expected_len)?;
+    let length = usize::try_from(expected_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "capture is too large"))?;
+    let mut bytes = vec![0_u8; length];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Receive a sealed memfd and return it positioned at offset 0. The seals
+/// freeze the payload before the descriptor crosses the socket, so the
+/// receiver may safely memory-map it instead of copying.
+pub(crate) fn receive_memfd_file(stream: &UnixStream, expected_len: u64) -> io::Result<File> {
+    let file = receive_validated_fd(stream, expected_len)?;
+    // SAFETY: F_GET_SEALS has no pointer argument and `file` owns a valid fd.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 || seals & REQUIRED_SEALS != REQUIRED_SEALS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "capture descriptor is not fully sealed",
+        ));
+    }
+    Ok(file)
+}
+
+/// Receive a single-plane dmabuf descriptor. dmabufs cannot carry memfd
+/// seals; the fixed buffer size is the only integrity property the receiver
+/// can check. Contents remain GPU-owned and may change between frames, which
+/// is inherent to dmabuf sharing.
+pub(crate) fn receive_dmabuf_file(stream: &UnixStream, expected_len: u64) -> io::Result<File> {
+    receive_validated_fd(stream, expected_len)
+}
+
+fn receive_validated_fd(stream: &UnixStream, expected_len: u64) -> io::Result<File> {
     validate_len(expected_len)?;
     let fd = receive_fd(stream)?;
     // SAFETY: `receive_fd` returns a newly received owned descriptor.
@@ -66,25 +106,13 @@ pub(crate) fn receive(stream: &UnixStream, expected_len: u64) -> io::Result<Vec<
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "capture memfd length/type mismatch (expected {expected_len}, got {})",
+                "capture descriptor length/type mismatch (expected {expected_len}, got {})",
                 metadata.len()
             ),
         ));
     }
-    // SAFETY: F_GET_SEALS has no pointer argument and `file` owns a valid fd.
-    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
-    if seals < 0 || seals & REQUIRED_SEALS != REQUIRED_SEALS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "capture descriptor is not fully sealed",
-        ));
-    }
     file.seek(SeekFrom::Start(0))?;
-    let length = usize::try_from(expected_len)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "capture is too large"))?;
-    let mut bytes = vec![0_u8; length];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
+    Ok(file)
 }
 
 fn validate_len(length: u64) -> io::Result<()> {
@@ -98,7 +126,7 @@ fn validate_len(length: u64) -> io::Result<()> {
 }
 
 #[cfg(any(test, feature = "test-server"))]
-fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
+pub(crate) fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
     let mut marker = BLOB_MARKER;
     let mut iov = libc::iovec {
         iov_base: (&mut marker as *mut u8).cast(),
@@ -198,5 +226,48 @@ mod tests {
         assert!(validate_len(0).is_err());
         assert!(validate_len(MAX_BLOB_BYTES).is_ok());
         assert!(validate_len(MAX_BLOB_BYTES + 1).is_err());
+    }
+
+    /// A memfd without seals stands in for a dmabuf: both are plain
+    /// descriptors without seal support on the wire.
+    fn unsealed_memfd(bytes: &[u8]) -> File {
+        // SAFETY: the name is static and NUL-terminated; the returned fd is
+        // checked before ownership is constructed.
+        let fd = unsafe { libc::memfd_create(c"aegis-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        // SAFETY: `fd` is a new owned descriptor from memfd_create.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn dmabuf_receive_accepts_an_unsealed_descriptor() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut file = unsealed_memfd(b"gpu plane");
+        let len = file.metadata().unwrap().len();
+        send_fd(&sender, file.as_raw_fd()).unwrap();
+        let mut received = receive_dmabuf_file(&receiver, len).unwrap();
+        let mut bytes = Vec::new();
+        received.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"gpu plane");
+        file.seek(SeekFrom::Start(0)).ok();
+    }
+
+    #[test]
+    fn memfd_receive_rejects_an_unsealed_descriptor() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let file = unsealed_memfd(b"mutable pixels");
+        let len = file.metadata().unwrap().len();
+        send_fd(&sender, file.as_raw_fd()).unwrap();
+        assert!(receive_memfd_file(&receiver, len).is_err());
+    }
+
+    #[test]
+    fn receive_rejects_a_length_mismatch() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let file = unsealed_memfd(b"short");
+        send_fd(&sender, file.as_raw_fd()).unwrap();
+        assert!(receive_dmabuf_file(&receiver, 4096).is_err());
     }
 }

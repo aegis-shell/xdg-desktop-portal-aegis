@@ -14,7 +14,7 @@ mod schema;
 #[cfg(feature = "test-server")]
 pub mod testing;
 
-pub use client::{Client, StreamFrame, StreamMessage, StreamStarted};
+pub use client::{Client, StreamFrame, StreamMessage, StreamPayload, StreamStarted};
 pub use schema::{
     AccentColor, ColorScheme, ConfirmPickResult, ConnectionCapabilities, Contrast,
     DesktopPreferences, Event, LOCAL_PORTAL_SCOPE, LeaseGrant, PROTOCOL_VERSION, PickKind,

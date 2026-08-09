@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the ScreenCast frame-rate ceiling from 30 to 60 fps and offer
+  PipeWire consumers a 1–360 fps range (default 60) instead of a fixed
+  30/1, so capture matches the compositor's actual cadence on 60 Hz
+  outputs and each consumer paces against its own clock.
+- Accept dmabuf-announced compositor streams instead of failing `Start`,
+  and deliver their frames through a single mmap-and-copy into the PipeWire
+  pool. Sealed-memfd frames take the same path, which removes the previous
+  per-frame `Vec` allocation and copy. Per-frame dmabuf descriptors cannot
+  be forwarded through PipeWire's fixed buffer pools; true zero-copy
+  delivery is specified as the protocol-25 slot protocol in
+  [ADR-0005](docs/adr/0005-screencast-dmabuf-slot-protocol.md).
+- Log compositor-reported stream frame drops (`dropped` counter deltas)
+  and Portal-side delivery drops for capture diagnostics.
+
 ## [0.0.5] - 2026-08-07
 
 ### Fixed

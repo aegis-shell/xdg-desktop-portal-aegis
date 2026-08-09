@@ -22,7 +22,19 @@ pub struct StreamStarted {
     pub format: StreamPixelFormat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Frame payload descriptor received behind a `StreamFrame` header. The
+/// variant mirrors the header's pixel format: SHM formats carry a sealed
+/// memfd, `Dmabuf` carries the single-plane GPU buffer descriptor.
+#[derive(Debug)]
+pub enum StreamPayload {
+    /// Sealed memfd of `byte_len` bytes, positioned at offset 0.
+    Memfd(std::fs::File),
+    /// Single-plane dmabuf of `byte_len` bytes; the plane stride travels in
+    /// the frame header.
+    Dmabuf(std::fs::File),
+}
+
+#[derive(Debug)]
 pub struct StreamFrame {
     pub stream_id: u64,
     pub sequence: u64,
@@ -32,10 +44,10 @@ pub struct StreamFrame {
     pub format: StreamPixelFormat,
     pub damage: Vec<Rect>,
     pub dropped: u64,
-    pub pixels: Vec<u8>,
+    pub payload: StreamPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum StreamMessage {
     Frame(StreamFrame),
     Ended { stream_id: u64, reason: String },
@@ -273,7 +285,14 @@ impl Client {
                     else {
                         unreachable!();
                     };
-                    let pixels = blob::receive(&self.stream, byte_len)?;
+                    let payload = match format {
+                        StreamPixelFormat::Bgra8 | StreamPixelFormat::Rgba8 => {
+                            StreamPayload::Memfd(blob::receive_memfd_file(&self.stream, byte_len)?)
+                        }
+                        StreamPixelFormat::Dmabuf { .. } => StreamPayload::Dmabuf(
+                            blob::receive_dmabuf_file(&self.stream, byte_len)?,
+                        ),
+                    };
                     return Ok(StreamMessage::Frame(StreamFrame {
                         stream_id,
                         sequence,
@@ -283,7 +302,7 @@ impl Client {
                         format,
                         damage,
                         dropped,
-                        pixels,
+                        payload,
                     }));
                 }
                 Some("StreamEnded") => {

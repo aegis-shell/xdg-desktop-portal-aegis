@@ -319,6 +319,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dmabuf_stream_frames_match_the_v24_wire_shape() {
+        // DRM_FORMAT_XRGB8888 with DRM_FORMAT_MOD_LINEAR.
+        let format = StreamPixelFormat::Dmabuf {
+            drm_format: 0x3432_5258,
+            modifier: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(format).unwrap(),
+            serde_json::json!({
+                "type": "Dmabuf",
+                "drm_format": 875713112,
+                "modifier": 0
+            })
+        );
+        // A full StreamFrame event as the compositor emits it for a
+        // single-plane dmabuf: the descriptor follows out of band and the
+        // header carries the plane stride and the buffer's byte length.
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "StreamFrame",
+            "stream_id": 3,
+            "sequence": 41,
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "format": {
+                "type": "Dmabuf",
+                "drm_format": 875713112,
+                "modifier": 72057594037927937_u64
+            },
+            "damage": [{ "origin": { "x": 0, "y": 0 }, "size": { "w": 1920, "h": 1080 } }],
+            "dropped": 0,
+            "byte_len": 8294400
+        }))
+        .unwrap();
+        let Event::StreamFrame {
+            stream_id,
+            stride,
+            format,
+            byte_len,
+            ..
+        } = event
+        else {
+            panic!("dmabuf stream frame");
+        };
+        assert_eq!(stream_id, 3);
+        assert_eq!(stride, 7680);
+        assert_eq!(byte_len, 8294400);
+        assert_eq!(
+            format,
+            StreamPixelFormat::Dmabuf {
+                drm_format: 0x3432_5258,
+                modifier: 0x0100_0000_0000_0001
+            }
+        );
+    }
+
+    #[test]
     fn hello_matches_the_v24_wire_shape() {
         let request = Request::Hello {
             version: PROTOCOL_VERSION,

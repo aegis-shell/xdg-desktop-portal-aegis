@@ -45,6 +45,23 @@ pub struct StreamFramePayload {
     pub pixels: Arc<[u8]>,
 }
 
+/// A frame announced together with a caller-supplied descriptor. This
+/// mirrors the compositor's dmabuf stream transport: the same `StreamFrame`
+/// header, but the descriptor is sent unsealed because dmabufs cannot carry
+/// memfd seals. Tests supply the descriptor (a plain memfd stands in for a
+/// GPU buffer on machines without a render node).
+pub struct StreamFrameFdPayload {
+    pub stream_id: u64,
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: StreamPixelFormat,
+    pub damage: Vec<Rect>,
+    pub dropped: u64,
+    pub byte_len: u64,
+}
+
 pub trait Handler: Send + Sync + 'static {
     fn settings(&self) -> SettingsSnapshot {
         SettingsSnapshot::default()
@@ -155,6 +172,11 @@ impl Server {
     }
 
     #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
     pub fn push_stream_frame(&self, frame: StreamFramePayload) -> bool {
         let writer = self
             .streams
@@ -184,6 +206,42 @@ impl Server {
             },
         )
         .and_then(|()| blob.send(&writer))
+        .is_ok()
+    }
+
+    /// Push a `StreamFrame` header followed by an unsealed descriptor. Used
+    /// for dmabuf stream tests; `fd` must be `byte_len` bytes long.
+    #[must_use]
+    pub fn push_stream_frame_fd(
+        &self,
+        frame: StreamFrameFdPayload,
+        fd: std::os::fd::RawFd,
+    ) -> bool {
+        let writer = self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&frame.stream_id)
+            .map(|(_, writer)| Arc::clone(writer));
+        let Some(writer) = writer else {
+            return false;
+        };
+        let mut writer = writer.lock().unwrap();
+        write_msg(
+            &mut *writer,
+            &Event::StreamFrame {
+                stream_id: frame.stream_id,
+                sequence: frame.sequence,
+                width: frame.width,
+                height: frame.height,
+                stride: frame.stride,
+                format: frame.format,
+                damage: frame.damage,
+                dropped: frame.dropped,
+                byte_len: frame.byte_len,
+            },
+        )
+        .and_then(|()| crate::blob::send_fd(&writer, fd))
         .is_ok()
     }
 }

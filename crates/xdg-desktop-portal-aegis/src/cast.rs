@@ -1,16 +1,25 @@
 //! One PipeWire producer stream per started ScreenCast session.
 //!
 //! Each cast runs on its own thread: a scoped IPC connection receives the
-//! compositor's output-frame stream and a PipeWire `Output`
-//! stream republishes every new frame as raw `BGRx` video at a fixed
-//! framerate. The PipeWire main loop is also the IPC event loop — the IPC
-//! socket, the stop socket, and the lease-renewal timer are ordinary loop
-//! sources, so the thread never blocks anywhere but in `poll`.
+//! compositor's output-frame stream and a PipeWire `Output` stream
+//! republishes every new frame as raw video at the compositor's cadence.
+//! The PipeWire main loop is also the IPC event loop — the IPC socket, the
+//! stop socket, and the lease-renewal timer are ordinary loop sources, so
+//! the thread never blocks anywhere but in `poll`.
+//!
+//! Frames arrive as descriptors behind each `StreamFrame` header: sealed
+//! memfds for SHM captures, single-plane dmabufs when the compositor
+//! exports GPU buffers. Either way the frame is memory-mapped and copied
+//! into a PipeWire pool buffer exactly once. PipeWire fixes each pool
+//! buffer's descriptor at allocation time, so per-frame dmabuf descriptors
+//! cannot be forwarded through `pw_stream`; zero-copy delivery uses the
+//! slot protocol (see ADR-0005), and this copy path remains the universal
+//! fallback.
 //!
 //! The portal is producer-driven: when a compositor frame arrives the IPC
 //! source stores it, marks it pending, and calls `pw_stream_trigger_process`
 //! so PipeWire pulls exactly that frame on its next cycle. Stale frames are
-//! not copied again, which prevents duplicate frames from confusing the
+//! not republished, which prevents duplicate frames from confusing the
 //! consumer's pacing and causing stutter or latency.
 //!
 //! Teardown is single-path: closing the write end of the stop socket (or a
@@ -18,34 +27,48 @@
 //! which dropping the IPC client disconnects it — and the compositor's
 //! disconnect cleanup stops the stream with no extra round-trip.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use aegis_portal_ipc::{Client, StreamMessage};
+use aegis_portal_ipc::{Client, StreamFrame, StreamMessage, StreamPayload};
 use pipewire as pw;
-use pw::properties::properties;
 use pw::spa;
 use pw::spa::pod::{self, Pod};
+use pw::spa::sys as spa_sys;
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle};
 use pw::stream::{StreamFlags, StreamState};
+use pw::sys as pw_sys;
 
 use crate::ipc;
 use crate::screencast::CastJob;
 
-/// Frame rate requested from the compositor and offered to PipeWire.
-const STREAM_FPS: u32 = 30;
+/// Frame-rate ceiling requested from the compositor. The compositor paces
+/// frames itself (damage-driven, bounded by the output's vertical sync);
+/// this is only a cap, and the server clamps it to its own supported range.
+const STREAM_MAX_FPS: u32 = 60;
+/// Framerate choice offered to PipeWire consumers. Frames arrive at the
+/// compositor's actual cadence; the range lets each consumer pick the rate
+/// its own pipeline wants instead of forcing one fixed clock on everyone.
+const FRAMERATE_DEFAULT: Fraction = Fraction { num: 60, denom: 1 };
+const FRAMERATE_MIN: Fraction = Fraction { num: 1, denom: 1 };
+const FRAMERATE_MAX: Fraction = Fraction { num: 360, denom: 1 };
 /// A screencast publishes frames for PipeWire capture consumers.
 const STREAM_DIRECTION: Direction = Direction::Output;
 /// Lease TTL requested at handshake and renewal; renewed at half TTL.
 const LEASE_TTL_MS: u64 = 900_000;
 const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// `SPA_PARAM_BUFFERS_dataType` is a mask of `1 << SPA_DATA_*`: MemPtr is
+/// bit 1, MemFd is bit 2, and DmaBuf is bit 3.
+const ALL_DATA_TYPES: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
@@ -94,19 +117,111 @@ impl AsRawFd for IpcFd {
     }
 }
 
+/// The pixel format the compositor announced at `StreamOutputStart`, with
+/// the PipeWire-side mapping resolved once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncedFormat {
+    /// Sealed-memfd SHM frames; the value is the SPA raw format offered to
+    /// PipeWire (`BGRx` for Bgra8, `RGBx` for Rgba8; compositor alpha is
+    /// always opaque).
+    Shm(spa::param::video::VideoFormat),
+    /// Single-plane dmabuf frames with a fixed DRM format/modifier pair;
+    /// the value is the equivalent SPA raw format.
+    Dmabuf {
+        drm_format: u32,
+        modifier: u64,
+        spa_format: spa::param::video::VideoFormat,
+    },
+}
+
+impl AnnouncedFormat {
+    fn spa_format(&self) -> spa::param::video::VideoFormat {
+        match *self {
+            AnnouncedFormat::Shm(format)
+            | AnnouncedFormat::Dmabuf {
+                spa_format: format, ..
+            } => format,
+        }
+    }
+}
+
+/// Resolve the compositor's announced wire format into an offerable SPA
+/// format. Unknown dmabuf fourccs fail the cast: offering a guessed pixel
+/// layout would produce wrong colors in the consumer.
+fn announced_format(
+    format: aegis_portal_ipc::StreamPixelFormat,
+) -> Result<AnnouncedFormat, String> {
+    use aegis_portal_ipc::StreamPixelFormat as Wire;
+    match format {
+        Wire::Bgra8 => Ok(AnnouncedFormat::Shm(spa::param::video::VideoFormat::BGRx)),
+        Wire::Rgba8 => Ok(AnnouncedFormat::Shm(spa::param::video::VideoFormat::RGBx)),
+        Wire::Dmabuf {
+            drm_format,
+            modifier,
+        } => {
+            let spa_format = spa_format_for_drm(drm_format).ok_or_else(|| {
+                format!("unsupported compositor dmabuf format {drm_format:#010x}")
+            })?;
+            Ok(AnnouncedFormat::Dmabuf {
+                drm_format,
+                modifier,
+                spa_format,
+            })
+        }
+    }
+}
+
+/// Little-endian DRM fourcc, matching `drm_fourcc.h`'s `fourcc_code`.
+const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+/// Map a single-plane 8-bit DRM fourcc to the SPA raw video format with the
+/// same memory order (DRM names read most- to least-significant byte, SPA
+/// names read in memory order).
+fn spa_format_for_drm(drm_format: u32) -> Option<spa::param::video::VideoFormat> {
+    use spa::param::video::VideoFormat;
+    Some(match drm_format {
+        f if f == fourcc(b'X', b'R', b'2', b'4') => VideoFormat::BGRx,
+        f if f == fourcc(b'A', b'R', b'2', b'4') => VideoFormat::BGRA,
+        f if f == fourcc(b'X', b'B', b'2', b'4') => VideoFormat::RGBx,
+        f if f == fourcc(b'A', b'B', b'2', b'4') => VideoFormat::RGBA,
+        f if f == fourcc(b'R', b'X', b'2', b'4') => VideoFormat::xBGR,
+        f if f == fourcc(b'R', b'A', b'2', b'4') => VideoFormat::ABGR,
+        f if f == fourcc(b'B', b'X', b'2', b'4') => VideoFormat::xRGB,
+        f if f == fourcc(b'B', b'A', b'2', b'4') => VideoFormat::ARGB,
+        _ => return None,
+    })
+}
+
+/// A received compositor frame: the payload descriptor plus the plane
+/// stride from the frame header.
+struct FramePayload {
+    file: File,
+    stride: u32,
+}
+
 /// Latest frame shared between the IPC source (writer) and the PipeWire
 /// `process` callback (reader). `None` until the first frame arrives.
-type LatestFrame = Rc<RefCell<Option<Rc<Vec<u8>>>>>;
+type LatestFrame = Rc<RefCell<Option<FramePayload>>>;
 
 /// Stream-listener user data.
 struct StreamData {
     latest: LatestFrame,
+    /// Set when a new IPC frame has arrived but not yet been pushed to
+    /// PipeWire. Cleared by the `process` callback after publishing.
+    pending: Rc<Cell<bool>>,
     width: u32,
     height: u32,
+    announced: AnnouncedFormat,
+    /// Pool buffers dequeued in earlier cycles; the copy path fills them.
+    pool: RefCell<Vec<*mut pw_sys::pw_buffer>>,
     start_state: Rc<RefCell<StartState>>,
-    /// Set when a new IPC frame has arrived but not yet been pushed to
-    /// PipeWire. Cleared by the `process` callback after copying the frame.
-    pending: Rc<std::cell::Cell<bool>>,
+    /// Portal-side frame drops (unmappable dmabuf, pool starvation),
+    /// counted for the stream's lifetime.
+    dropped_frames: Cell<u64>,
+    /// Rate-limit the unmappable-dmabuf warning to once per stream.
+    warned_unmappable: Cell<bool>,
 }
 
 /// PipeWire reports the node id through the stream state callback and the
@@ -154,6 +269,193 @@ fn cast_thread(
     // cleanup stops the output stream.
 }
 
+/// Check one received frame against the stream's announced format and
+/// geometry, returning the storable payload.
+fn validate_frame(
+    frame: StreamFrame,
+    width: u32,
+    height: u32,
+    announced: AnnouncedFormat,
+) -> Result<FramePayload, String> {
+    if frame.width != width || frame.height != height {
+        return Err(format!(
+            "frame geometry {}x{} differs from the announced {width}x{height}",
+            frame.width, frame.height
+        ));
+    }
+    let row_bytes = width as u64 * 4;
+    if u64::from(frame.stride) < row_bytes || frame.stride > i32::MAX as u32 {
+        return Err(format!("invalid frame stride {}", frame.stride));
+    }
+    match (announced, frame.format, frame.payload) {
+        (
+            AnnouncedFormat::Shm(_),
+            aegis_portal_ipc::StreamPixelFormat::Bgra8 | aegis_portal_ipc::StreamPixelFormat::Rgba8,
+            StreamPayload::Memfd(file),
+        ) => {
+            // The compositor's SHM readback is tightly packed.
+            if u64::from(frame.stride) != row_bytes {
+                return Err(format!(
+                    "SHM frame stride {} is not tightly packed",
+                    frame.stride
+                ));
+            }
+            Ok(FramePayload {
+                file,
+                stride: frame.stride,
+            })
+        }
+        (
+            AnnouncedFormat::Dmabuf {
+                drm_format,
+                modifier,
+                ..
+            },
+            aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+                drm_format: frame_drm,
+                modifier: frame_modifier,
+            },
+            StreamPayload::Dmabuf(file),
+        ) if frame_drm == drm_format && frame_modifier == modifier => Ok(FramePayload {
+            file,
+            stride: frame.stride,
+        }),
+        (announced, wire, _) => Err(format!(
+            "frame format {wire:?} does not match the announced {announced:?}"
+        )),
+    }
+}
+
+/// Reclaim every buffer PipeWire returns to the producer into the copy
+/// path's stash.
+fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
+    loop {
+        // SAFETY: called from the stream's own thread inside `process`.
+        let raw = unsafe { stream.dequeue_raw_buffer() };
+        let Some(raw) = NonNull::new(raw) else {
+            break;
+        };
+        data.pool.borrow_mut().push(raw.as_ptr());
+    }
+}
+
+/// The PipeWire `process` callback: publish the pending frame, if any.
+fn process_frame(stream: &pw::stream::Stream, data: &mut StreamData) {
+    reclaim_returned_buffers(stream, data);
+
+    if !data.pending.replace(false) {
+        return;
+    }
+    let Some(frame) = data.latest.borrow_mut().take() else {
+        return;
+    };
+    copy_into_pool(stream, data, &frame);
+}
+
+/// Map the frame's descriptor and copy the pixels into a shared-pool
+/// buffer. Sealed memfds and mappable dmabufs take the same path.
+fn copy_into_pool(stream: &pw::stream::Stream, data: &mut StreamData, frame: &FramePayload) {
+    let height = data.height as usize;
+    let row_bytes = data.width as usize * 4;
+    let stride = frame.stride as usize;
+
+    let Ok(src_len) = frame.file.metadata().map(|meta| meta.len() as usize) else {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        log::debug!("portal: could not stat the frame descriptor");
+        return;
+    };
+    let needed = stride * (height - 1) + row_bytes;
+    if src_len < needed || needed > MAX_FRAME_BYTES {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        log::warn!(
+            "portal: frame payload of {src_len} bytes cannot hold {height} rows of stride {stride}"
+        );
+        return;
+    }
+    // SAFETY: the descriptor outlives the mapping; it is owned by `frame`,
+    // which outlives this call.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            src_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            frame.file.as_raw_fd(),
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        if data.warned_unmappable.replace(true) {
+            log::debug!(
+                "portal: frame descriptor is not mappable: {}",
+                io::Error::last_os_error()
+            );
+        } else {
+            log::warn!(
+                "portal: frame descriptor is not mappable ({}); frames are dropped because \
+                 this capture cannot be delivered as shared memory",
+                io::Error::last_os_error()
+            );
+        }
+        return;
+    }
+
+    let pool_raw = data
+        .pool
+        .borrow_mut()
+        .pop()
+        .or_else(|| NonNull::new(unsafe { stream.dequeue_raw_buffer() }).map(NonNull::as_ptr));
+    let published = match pool_raw {
+        Some(pool_raw) => unsafe {
+            // SAFETY: `pool_raw` is a live pool buffer of this stream,
+            // dequeued on this thread; its first spa_data is a mapped memory
+            // block of `maxsize` bytes.
+            let spa_buffer = (*pool_raw).buffer;
+            let spa_data = (*spa_buffer).datas;
+            let dest_ptr = (*spa_data).data.cast::<u8>();
+            let dest_cap = (*spa_data).maxsize as usize;
+            if dest_ptr.is_null() || dest_cap < height * row_bytes {
+                data.pool.borrow_mut().push(pool_raw);
+                false
+            } else {
+                let dest = std::slice::from_raw_parts_mut(dest_ptr, dest_cap);
+                let src = std::slice::from_raw_parts(map.cast::<u8>(), src_len);
+                copy_rows(src, stride, dest, row_bytes, height);
+                let chunk = (*spa_data).chunk;
+                (*chunk).offset = 0;
+                (*chunk).size = (height * row_bytes) as u32;
+                (*chunk).stride = row_bytes as i32;
+                (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
+                stream.queue_raw_buffer(pool_raw);
+                true
+            }
+        },
+        None => false,
+    };
+    if !published {
+        data.dropped_frames.set(data.dropped_frames.get() + 1);
+        log::debug!("portal: no free PipeWire buffer; dropping frame");
+    }
+    // SAFETY: `map`/`src_len` name the live mapping created above.
+    unsafe { libc::munmap(map, src_len) };
+}
+
+/// Copy `height` rows of `row_bytes` from a source with the given row
+/// stride into a tightly packed destination.
+fn copy_rows(src: &[u8], src_stride: usize, dest: &mut [u8], row_bytes: usize, height: usize) {
+    if src_stride == row_bytes {
+        dest[..height * row_bytes].copy_from_slice(&src[..height * row_bytes]);
+        return;
+    }
+    for row in 0..height {
+        let src_start = row * src_stride;
+        let dest_start = row * row_bytes;
+        dest[dest_start..dest_start + row_bytes]
+            .copy_from_slice(&src[src_start..src_start + row_bytes]);
+    }
+}
+
 /// The whole cast, as a fallible sequence. `started` is consumed by the
 /// stream listener on success, so on failure the caller still owns it.
 fn run_cast(
@@ -167,18 +469,13 @@ fn run_cast(
     let mut client = ipc::connect_compositor(socket, IPC_TIMEOUT)
         .map_err(|e| format!("compositor IPC connect: {e}"))?;
     let stream_info = client
-        .start_output_stream_target(Some(STREAM_FPS), aegis_portal_ipc::StreamTarget::Output)
+        .start_output_stream_target(Some(STREAM_MAX_FPS), aegis_portal_ipc::StreamTarget::Output)
         .map_err(|e| format!("start output stream: {e}"))?;
     let (width, height) = (stream_info.width, stream_info.height);
-    let expected_frame_len = frame_len(width, height)?;
-    if stream_info.format != aegis_portal_ipc::StreamPixelFormat::Bgra8 {
-        return Err(format!(
-            "unsupported compositor stream format: {:?}",
-            stream_info.format
-        ));
-    }
+    frame_len(width, height)?;
+    let announced = announced_format(stream_info.format)?;
     log::info!(
-        "portal: compositor stream {} for {session_path}: {width}x{height}@{STREAM_FPS}",
+        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}",
         stream_info.stream_id
     );
     let client = Rc::new(RefCell::new(client));
@@ -193,7 +490,7 @@ fn run_cast(
     let stream = pw::stream::StreamRc::new(
         core.clone(),
         "xdg-desktop-portal-aegis-screencast",
-        properties! {
+        pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_ROLE => "Screen",
@@ -202,8 +499,8 @@ fn run_cast(
     .map_err(|e| e.to_string())?;
 
     let latest: LatestFrame = Rc::new(RefCell::new(None));
-    let format_pod = format_pod(width, height);
-    let pending = Rc::new(std::cell::Cell::new(false));
+    let format_bytes = format_pod(width, height, announced.spa_format());
+    let pending = Rc::new(Cell::new(false));
     let start_state = Rc::new(RefCell::new(StartState {
         started: Some(started.clone()),
         paused: None,
@@ -232,10 +529,14 @@ fn run_cast(
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             latest: Rc::clone(&latest),
+            pending: Rc::clone(&pending),
             width,
             height,
+            announced,
+            pool: RefCell::new(Vec::new()),
             start_state,
-            pending: Rc::clone(&pending),
+            dropped_frames: Cell::new(0),
+            warned_unmappable: Cell::new(false),
         })
         .state_changed(move |stream, data, _old, new| {
             log::debug!("portal: pipewire stream {new:?}");
@@ -267,7 +568,14 @@ fn run_cast(
             }
         })
         .param_changed(|stream, data, id, param| {
-            if id == spa::param::ParamType::Format.as_raw() && param.is_some() {
+            let Some(param) = param else {
+                return;
+            };
+            if id == spa::param::ParamType::Format.as_raw() {
+                match parse_format_param(param) {
+                    Some(fixated) => data.check_fixated_format(&fixated),
+                    None => log::warn!("portal: could not parse the fixated PipeWire format"),
+                }
                 let buffers = buffers_pod(data.width, data.height);
                 let mut params = [Pod::from_bytes(&buffers).expect("buffers pod")];
                 if let Err(error) = stream.update_params(&mut params) {
@@ -275,40 +583,7 @@ fn run_cast(
                 }
             }
         })
-        .process(|_stream, data| {
-            let Some(mut buffer) = _stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let data_ref = &mut datas[0];
-            let stride = data.width as usize * 4;
-            // Only publish frames the compositor has produced since the last
-            // process cycle. Copying stale frames makes OBS/GStreamer see
-            // duplicate frames and can cause the consumer's pacing logic to
-            // stall or misreport the real rate.
-            let size = if data.pending.replace(false) {
-                let frame = data.latest.borrow();
-                match frame.as_ref() {
-                    Some(frame) => match data_ref.data() {
-                        Some(dest) if dest.len() >= frame.len() => {
-                            dest[..frame.len()].copy_from_slice(frame);
-                            frame.len()
-                        }
-                        _ => 0,
-                    },
-                    None => 0,
-                }
-            } else {
-                0
-            };
-            let chunk = data_ref.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.size_mut() = size as u32;
-            *chunk.stride_mut() = stride as i32;
-        })
+        .process(process_frame)
         .register()
         .map_err(|e| e.to_string())?;
 
@@ -316,23 +591,28 @@ fn run_cast(
     // connection alive across quiet periods.
     let loop_weak = mainloop.downgrade();
     let stream_weak = stream.downgrade();
+    let compositor_dropped = Rc::new(Cell::new(0_u64));
     let _ipc_source = mainloop.loop_().add_io(
         IpcFd(Rc::clone(&client)),
         spa::support::system::IoFlags::IN | spa::support::system::IoFlags::ERR,
         {
             let jobs = jobs.clone();
             let session_path = session_path.to_string();
+            let compositor_dropped = Rc::clone(&compositor_dropped);
             move |io| {
                 let message = io.0.borrow_mut().next_stream_message();
                 match message {
-                    Ok(StreamMessage::Frame(frame)) => match frame.format {
-                        aegis_portal_ipc::StreamPixelFormat::Bgra8 => {
-                            if frame.width == width
-                                && frame.height == height
-                                && frame.stride == width * 4
-                                && frame.pixels.len() == expected_frame_len
-                            {
-                                *latest.borrow_mut() = Some(Rc::new(frame.pixels));
+                    Ok(StreamMessage::Frame(frame)) => {
+                        if frame.dropped != compositor_dropped.get() {
+                            log::debug!(
+                                "portal: compositor reports {} backpressure-dropped stream frames",
+                                frame.dropped
+                            );
+                            compositor_dropped.set(frame.dropped);
+                        }
+                        match validate_frame(frame, width, height, announced) {
+                            Ok(payload) => {
+                                *latest.borrow_mut() = Some(payload);
                                 pending.set(true);
                                 if let Some(stream) = stream_weak.upgrade()
                                     && let Err(error) = stream.trigger_process()
@@ -340,11 +620,11 @@ fn run_cast(
                                     log::debug!("portal: trigger_process failed: {error}");
                                 }
                             }
+                            Err(reason) => {
+                                log::debug!("portal: ignoring stream frame: {reason}");
+                            }
                         }
-                        other => {
-                            log::warn!("portal: ignoring unexpected stream frame format {other:?}");
-                        }
-                    },
+                    }
                     Ok(StreamMessage::LeaseRenewed) => {}
                     Ok(StreamMessage::Ended { reason, .. }) => {
                         log::info!("portal: compositor ended stream for {session_path}: {reason}");
@@ -359,7 +639,7 @@ fn run_cast(
         },
     );
 
-    let stopped_by_owner = Rc::new(std::cell::Cell::new(false));
+    let stopped_by_owner = Rc::new(Cell::new(false));
     let stop_flag = Rc::clone(&stopped_by_owner);
     let _stop_source = mainloop.loop_().add_io(
         stop_read,
@@ -387,7 +667,7 @@ fn run_cast(
     let half_ttl = Duration::from_millis(LEASE_TTL_MS / 2);
     lease_timer.update_timer(Some(half_ttl), Some(half_ttl));
 
-    let mut params = [Pod::from_bytes(&format_pod).expect("format pod")];
+    let mut format_refs = [Pod::from_bytes(&format_bytes).expect("format pod")];
     stream
         .connect(
             // This stream publishes compositor frames. `Input` describes a
@@ -401,7 +681,7 @@ fn run_cast(
             // policy to route this source to an unrelated default target and
             // can tear the stream down with "no target node available".
             StreamFlags::MAP_BUFFERS,
-            &mut params,
+            &mut format_refs,
         )
         .map_err(|e| e.to_string())?;
 
@@ -412,6 +692,90 @@ fn run_cast(
         });
     }
     Ok(())
+}
+
+impl StreamData {
+    /// Check the fixated format against what was offered. Consumers can
+    /// renegotiate mid-stream, so this runs on every `Format` param change.
+    fn check_fixated_format(&self, fixated: &FixatedFormat) {
+        let expected = self.announced.spa_format();
+        if fixated.spa_format != expected.as_raw() {
+            log::warn!(
+                "portal: consumer fixated SPA format {} but only {} was offered",
+                fixated.spa_format,
+                expected.as_raw()
+            );
+        }
+        if fixated.width != self.width || fixated.height != self.height {
+            log::warn!(
+                "portal: consumer fixated {}x{} but the compositor streams {}x{}",
+                fixated.width,
+                fixated.height,
+                self.width,
+                self.height
+            );
+        }
+    }
+}
+
+/// The fixated `SPA_PARAM_Format`, reduced to what sanity checks need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FixatedFormat {
+    spa_format: u32,
+    width: u32,
+    height: u32,
+}
+
+/// The default of a SPA choice; fixation may leave any choice kind behind.
+fn choice_default<T: Copy + pod::CanonicalFixedSizedPod>(choice: &Choice<T>) -> T {
+    match &choice.1 {
+        ChoiceEnum::None(value) => *value,
+        ChoiceEnum::Range { default, .. } => *default,
+        ChoiceEnum::Step { default, .. } => *default,
+        ChoiceEnum::Enum { default, .. } => *default,
+        ChoiceEnum::Flags { default, .. } => *default,
+    }
+}
+
+fn pod_value_id(value: &pod::Value) -> Option<u32> {
+    match value {
+        pod::Value::Id(id) => Some(id.0),
+        pod::Value::Choice(pod::ChoiceValue::Id(choice)) => Some(choice_default(choice).0),
+        _ => None,
+    }
+}
+
+fn pod_value_rectangle(value: &pod::Value) -> Option<Rectangle> {
+    match value {
+        pod::Value::Rectangle(rectangle) => Some(*rectangle),
+        pod::Value::Choice(pod::ChoiceValue::Rectangle(choice)) => Some(choice_default(choice)),
+        _ => None,
+    }
+}
+
+/// Parse a fixated `SPA_PARAM_Format` raw-video pod, tolerating both plain
+/// and choice-wrapped property values.
+fn parse_format_param(param: &Pod) -> Option<FixatedFormat> {
+    let value = pod::deserialize::PodDeserializer::deserialize_from::<pod::Value>(param.as_bytes())
+        .ok()?
+        .1;
+    let pod::Value::Object(object) = value else {
+        return None;
+    };
+    let mut format = None;
+    let mut size = None;
+    for property in &object.properties {
+        if property.key == spa::param::format::FormatProperties::VideoFormat.as_raw() {
+            format = pod_value_id(&property.value);
+        } else if property.key == spa::param::format::FormatProperties::VideoSize.as_raw() {
+            size = pod_value_rectangle(&property.value);
+        }
+    }
+    Some(FixatedFormat {
+        spa_format: format?,
+        width: size?.width,
+        height: size?.height,
+    })
 }
 
 fn frame_len(width: u32, height: u32) -> Result<usize, String> {
@@ -443,46 +807,60 @@ fn end_cast(
     }
 }
 
-/// Offered video format: raw BGRx at the output's geometry and a fixed
-/// framerate matching the compositor stream. The compositor's stream format
-/// is BGRA with opaque alpha, which is exactly `BGRx` semantics.
-fn format_pod(width: u32, height: u32) -> Vec<u8> {
-    let object = pod::object! {
-        spa::utils::SpaTypes::ObjectParamFormat,
-        spa::param::ParamType::EnumFormat,
-        pod::property!(
-            spa::param::format::FormatProperties::MediaType,
-            Id,
-            spa::param::format::MediaType::Video
-        ),
-        pod::property!(
-            spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            spa::param::format::MediaSubtype::Raw
-        ),
-        pod::property!(
-            spa::param::format::FormatProperties::VideoFormat,
-            Id,
-            spa::param::video::VideoFormat::BGRx
-        ),
-        pod::property!(
-            spa::param::format::FormatProperties::VideoSize,
-            Rectangle,
-            Rectangle { width, height }
-        ),
-        pod::property!(
-            spa::param::format::FormatProperties::VideoFramerate,
-            Fraction,
-            Fraction { num: STREAM_FPS, denom: 1 }
-        ),
+/// The offered video format: raw video in the SPA format matching the
+/// compositor's pixel layout at the output's geometry. The framerate is a
+/// range because the compositor is damage-driven: frames arrive when the
+/// screen changes, bounded by its vertical sync, and each consumer picks
+/// the rate its pipeline wants.
+fn format_pod(width: u32, height: u32, spa_format: spa::param::video::VideoFormat) -> Vec<u8> {
+    let properties = vec![
+        pod::Property {
+            key: spa::param::format::FormatProperties::MediaType.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Id(spa::utils::Id(
+                spa::param::format::MediaType::Video.as_raw(),
+            )),
+        },
+        pod::Property {
+            key: spa::param::format::FormatProperties::MediaSubtype.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Id(spa::utils::Id(
+                spa::param::format::MediaSubtype::Raw.as_raw(),
+            )),
+        },
+        pod::Property {
+            key: spa::param::format::FormatProperties::VideoFormat.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Id(spa::utils::Id(spa_format.as_raw())),
+        },
+        pod::Property {
+            key: spa::param::format::FormatProperties::VideoSize.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Rectangle(Rectangle { width, height }),
+        },
+        pod::Property {
+            key: spa::param::format::FormatProperties::VideoFramerate.as_raw(),
+            flags: pod::PropertyFlags::empty(),
+            value: pod::Value::Choice(pod::ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: FRAMERATE_DEFAULT,
+                    min: FRAMERATE_MIN,
+                    max: FRAMERATE_MAX,
+                },
+            ))),
+        },
+    ];
+    let object = pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties,
     };
     serialize(&pod::Value::Object(object))
 }
 
-/// Buffer constraints offered once the format is negotiated: 2–8 shared or
-/// plain buffers of exactly one frame. `SPA_PARAM_BUFFERS_dataType` is a mask
-/// of enum positions, not the enum values themselves: MemPtr is bit 1 and
-/// MemFd is bit 2, hence `(1 << 1) | (1 << 2) == 6`.
+/// Buffer constraints offered once the format is negotiated: 2–8 shared,
+/// plain, or dmabuf buffers of exactly one frame.
 fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
     let stride = width as i32 * 4;
     let size = stride * height as i32;
@@ -523,7 +901,7 @@ fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
                 value: pod::Value::Choice(pod::ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: (1 << 1) | (1 << 2),
+                        default: ALL_DATA_TYPES as i32,
                         flags: Vec::new(),
                     },
                 ))),
@@ -543,11 +921,48 @@ fn serialize(value: &pod::Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
 
     fn pod_words(bytes: &[u8]) -> &[u32] {
         let (head, words, tail) = unsafe { bytes.align_to::<u32>() };
         assert!(head.is_empty() && tail.is_empty());
         words
+    }
+
+    fn parse_pod(bytes: &[u8]) -> pod::Object {
+        let parsed = pod::deserialize::PodDeserializer::deserialize_from::<pod::Value>(bytes)
+            .expect("deserialize")
+            .1;
+        let pod::Value::Object(object) = parsed else {
+            panic!("expected an object pod");
+        };
+        object
+    }
+
+    fn unsealed_memfd(bytes: &[u8]) -> File {
+        // SAFETY: the name is static and NUL-terminated; the returned fd is
+        // checked before ownership is constructed.
+        let fd = unsafe { libc::memfd_create(c"aegis-cast-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        // SAFETY: `fd` is a new owned descriptor from memfd_create.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(bytes).unwrap();
+        file
+    }
+
+    fn frame_for_test(format: aegis_portal_ipc::StreamPixelFormat) -> StreamFrame {
+        StreamFrame {
+            stream_id: 1,
+            sequence: 1,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format,
+            damage: Vec::new(),
+            dropped: 0,
+            payload: StreamPayload::Memfd(unsealed_memfd(&[0; 16])),
+        }
     }
 
     #[test]
@@ -556,8 +971,27 @@ mod tests {
     }
 
     #[test]
-    fn format_pod_is_a_parseable_video_format() {
-        let bytes = format_pod(1920, 1080);
+    fn drm_fourccs_map_to_spa_formats_in_memory_order() {
+        use spa::param::video::VideoFormat;
+        let cases = [
+            (fourcc(b'X', b'R', b'2', b'4'), VideoFormat::BGRx),
+            (fourcc(b'A', b'R', b'2', b'4'), VideoFormat::BGRA),
+            (fourcc(b'X', b'B', b'2', b'4'), VideoFormat::RGBx),
+            (fourcc(b'A', b'B', b'2', b'4'), VideoFormat::RGBA),
+            (fourcc(b'R', b'X', b'2', b'4'), VideoFormat::xBGR),
+            (fourcc(b'R', b'A', b'2', b'4'), VideoFormat::ABGR),
+            (fourcc(b'B', b'X', b'2', b'4'), VideoFormat::xRGB),
+            (fourcc(b'B', b'A', b'2', b'4'), VideoFormat::ARGB),
+        ];
+        for (drm, spa_format) in cases {
+            assert_eq!(spa_format_for_drm(drm), Some(spa_format), "{drm:#010x}");
+        }
+        assert_eq!(spa_format_for_drm(fourcc(b'N', b'V', b'1', b'2')), None);
+    }
+
+    #[test]
+    fn format_pod_is_a_parseable_video_format_with_a_framerate_range() {
+        let bytes = format_pod(1920, 1080, spa::param::video::VideoFormat::BGRx);
         assert!(Pod::from_bytes(&bytes).is_some(), "pod parses");
         let words = pod_words(&bytes);
         // Pod header: body size, then SPA_TYPE_Object; the object body
@@ -565,39 +999,31 @@ mod tests {
         assert_eq!(words[0] as usize, bytes.len() - 8);
         assert_eq!(words[2], spa::utils::SpaTypes::ObjectParamFormat.as_raw());
         assert_eq!(words[3], spa::param::ParamType::EnumFormat.as_raw());
-        // Round-trip through the deserializer to prove the shape is valid.
-        let parsed = pod::deserialize::PodDeserializer::deserialize_from::<pod::Value>(&bytes)
-            .expect("deserialize")
-            .1;
-        let pod::Value::Object(object) = parsed else {
-            panic!("expected an object pod");
-        };
+        let object = parse_pod(&bytes);
         assert_eq!(object.properties.len(), 5);
-        // The advertised framerate must be fixed and match the compositor
-        // stream so consumers like OBS/GStreamer can pace correctly instead of
-        // guessing from a variable 0/1 rate.
+        // The framerate is a range so each consumer paces against its own
+        // clock; frames arrive at the compositor's actual cadence.
         let framerate = object
             .properties
             .iter()
             .find(|p| p.key == spa::param::format::FormatProperties::VideoFramerate.as_raw())
-            .and_then(|p| match p.value {
-                pod::Value::Fraction(fraction) => Some(fraction),
+            .and_then(|p| match &p.value {
+                pod::Value::Choice(pod::ChoiceValue::Fraction(choice)) => Some(choice),
                 _ => None,
             })
             .expect("framerate property");
-        assert_eq!(framerate.num, STREAM_FPS);
-        assert_eq!(framerate.denom, 1);
+        assert_eq!(choice_default(framerate), FRAMERATE_DEFAULT);
+        let Choice(_, ChoiceEnum::Range { min, max, .. }) = framerate else {
+            panic!("framerate must be a range");
+        };
+        assert_eq!(*min, FRAMERATE_MIN);
+        assert_eq!(*max, FRAMERATE_MAX);
     }
 
     #[test]
-    fn buffers_pod_covers_one_frame() {
+    fn buffers_pod_covers_one_frame_and_every_data_type() {
         let bytes = buffers_pod(640, 480);
-        let parsed = pod::deserialize::PodDeserializer::deserialize_from::<pod::Value>(&bytes)
-            .expect("deserialize")
-            .1;
-        let pod::Value::Object(object) = parsed else {
-            panic!("expected an object pod");
-        };
+        let object = parse_pod(&bytes);
         assert_eq!(
             object.type_,
             spa::utils::SpaTypes::ObjectParamBuffers.as_raw()
@@ -624,6 +1050,76 @@ mod tests {
                 _ => None,
             })
             .expect("dataType flags property");
-        assert_eq!(data_types, (6, &[][..]));
+        assert_eq!(data_types, (ALL_DATA_TYPES as i32, &[][..]));
+    }
+
+    #[test]
+    fn format_param_parsing_tolerates_plain_and_choice_values() {
+        let fixated = parse_format_param(
+            Pod::from_bytes(&format_pod(640, 480, spa::param::video::VideoFormat::BGRx))
+                .expect("pod"),
+        )
+        .expect("parseable format pod");
+        assert_eq!(
+            fixated,
+            FixatedFormat {
+                spa_format: spa::param::video::VideoFormat::BGRx.as_raw(),
+                width: 640,
+                height: 480,
+            }
+        );
+    }
+
+    #[test]
+    fn shm_frames_validate_against_the_announced_geometry() {
+        let announced = announced_format(aegis_portal_ipc::StreamPixelFormat::Bgra8).unwrap();
+        let frame = frame_for_test(aegis_portal_ipc::StreamPixelFormat::Bgra8);
+        assert!(validate_frame(frame, 2, 2, announced).is_ok());
+
+        let wrong_geometry = StreamFrame {
+            width: 4,
+            payload: StreamPayload::Memfd(unsealed_memfd(&[0; 32])),
+            ..frame_for_test(aegis_portal_ipc::StreamPixelFormat::Bgra8)
+        };
+        assert!(validate_frame(wrong_geometry, 2, 2, announced).is_err());
+    }
+
+    #[test]
+    fn dmabuf_frames_allow_padded_strides_but_pin_the_modifier() {
+        let announced = announced_format(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+            drm_format: fourcc(b'X', b'R', b'2', b'4'),
+            modifier: 3,
+        })
+        .unwrap();
+        let frame = StreamFrame {
+            stride: 16, // padded: 2 pixels wide would only need 8
+            payload: StreamPayload::Dmabuf(unsealed_memfd(&[0; 32])),
+            ..frame_for_test(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+                drm_format: fourcc(b'X', b'R', b'2', b'4'),
+                modifier: 3,
+            })
+        };
+        assert!(matches!(
+            validate_frame(frame, 2, 2, announced),
+            Ok(FramePayload { stride: 16, .. })
+        ));
+
+        let wrong_modifier = frame_for_test(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+            drm_format: fourcc(b'X', b'R', b'2', b'4'),
+            modifier: 4,
+        });
+        assert!(validate_frame(wrong_modifier, 2, 2, announced).is_err());
+    }
+
+    #[test]
+    fn copy_rows_handles_tight_and_padded_strides() {
+        let src: Vec<u8> = (0..64).collect();
+        let mut dest = vec![0_u8; 16];
+        copy_rows(&src, 8, &mut dest, 8, 2);
+        assert_eq!(dest, src[..16]);
+
+        let mut dest = vec![0_u8; 8];
+        copy_rows(&src, 16, &mut dest, 4, 2);
+        assert_eq!(dest, [0, 1, 2, 3, 16, 17, 18, 19]);
     }
 }
