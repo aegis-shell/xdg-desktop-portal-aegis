@@ -1,4 +1,4 @@
-//! Supervision for one Portal-owned, one-shot GTK prompter process.
+//! Supervision for one Portal-owned, one-shot optics (iris/lens) prompter process.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -25,9 +25,6 @@ pub(crate) fn invoke(
 ) -> Result<PromptResult, InvokeError> {
     let executable = executable().map_err(InvokeError::Failed)?;
     let mut child = Command::new(&executable)
-        // The prompter implements portal interactions and must not recurse
-        // through the portal it is currently serving.
-        .env("GTK_USE_PORTAL", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

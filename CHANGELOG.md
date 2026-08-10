@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Re-implement the prompter dialogs on the optics (iris/lens) stack
+  instead of GTK4, styled after the aegis design language and following
+  the system light/dark preference. FileChooser, Account confirmation,
+  and Secret password requests keep the same versioned stdin/stdout
+  process contract; prompts now map as independent windows because iris
+  cannot yet import an exported `wayland:` parent handle. The build no
+  longer requires GTK 4 development files; it requires the flux, lens,
+  and iris C libraries from the tagged `ming2k/optics` release.
+
 ## [0.0.6] - 2026-08-10
 
 ### Added

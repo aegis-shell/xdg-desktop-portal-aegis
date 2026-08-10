@@ -17,8 +17,21 @@ aegis-portal-secret = { version = "=0.0.6", path = "crates/aegis-portal-secret" 
 
 dirs = "5"
 env_logger = "0.11"
+# The canonical build resolves the optics binding sources from the tagged
+# monorepo release. Joint development against a sibling optics checkout uses
+# .cargo/optics-local.toml without making the sibling checkout mandatory for
+# CI (mirror of the Aegis workflow).
+iris = { git = "https://github.com/ming2k/optics", tag = "v0.0.13" }
+lens = { git = "https://github.com/ming2k/optics", tag = "v0.0.13" }
+# Direct -sys dependencies are how the terminal binary sees the
+# DEP_*_RPATHS metadata (published via the -sys crates' `links`) and can
+# re-emit the loader paths itself; see aegis-portal-prompter/build.rs.
+flux-sys = { git = "https://github.com/ming2k/optics", tag = "v0.0.13" }
+iris-sys = { git = "https://github.com/ming2k/optics", tag = "v0.0.13" }
+lens-sys = { git = "https://github.com/ming2k/optics", tag = "v0.0.13" }
 libc = "0.2"
 log = "0.4"
+mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

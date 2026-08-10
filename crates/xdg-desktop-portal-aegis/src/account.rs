@@ -1,7 +1,7 @@
 //! `org.freedesktop.impl.portal.Account` v1: user identity sharing.
 //!
 //! `GetUserInformation` never answers silently: the request parks on a
-//! worker while a Portal-owned, one-shot GTK confirmation dialog asks the
+//! worker while a Portal-owned, one-shot confirmation dialog asks the
 //! user whether to share their name and avatar
 //! with the calling application. Only an affirmative answer releases the
 //! identity: the account name and GECOS real name from `getpwuid`, plus the

@@ -26,6 +26,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve the locked Optics release
+        id: optics-release
+        run: echo "ref=$(scripts/optics-release-ref.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ming2k/optics
+          path: optics
+          ref: ${{ steps.optics-release.outputs.ref }}
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy
@@ -33,8 +41,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libclang-dev libgtk-4-dev libpam0g-dev \
-            libpipewire-0.3-dev libspa-0.2-dev pkg-config
+            build-essential libclang-dev libpam0g-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pkg-config \
+            meson ninja-build glslang-tools \
+            libwayland-dev wayland-protocols libvulkan-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig1-dev \
+            libfribidi-dev libxkbcommon-dev
+      - name: Build and install optics C libraries
+        run: |
+          meson setup optics/build optics \
+            -Dexamples=false -Dtests=false --buildtype=release
+          meson compile -C optics/build
+          sudo meson install -C optics/build
+          sudo ldconfig
+          pkg-config --modversion flux lens iris
       - name: Check minimum supported Rust
         run: cargo check --locked --workspace --all-targets
       - name: Lint with minimum supported Rust
@@ -44,6 +64,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve the locked Optics release
+        id: optics-release
+        run: echo "ref=$(scripts/optics-release-ref.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ming2k/optics
+          path: optics
+          ref: ${{ steps.optics-release.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -51,11 +79,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dbus-daemon libclang-dev libgtk-4-dev libpam0g-dev \
+            build-essential dbus-daemon libclang-dev libpam0g-dev \
             libpipewire-0.3-dev libspa-0.2-dev pkg-config \
-            meson ninja-build pipewire wireplumber \
+            meson ninja-build glslang-tools \
+            libwayland-dev wayland-protocols libvulkan-dev \
+            libfreetype-dev libharfbuzz-dev libfontconfig1-dev \
+            libfribidi-dev libxkbcommon-dev \
+            mesa-vulkan-drivers pipewire wireplumber \
             gstreamer1.0-pipewire gstreamer1.0-tools \
             xdg-desktop-portal xdg-desktop-portal-gtk xdg-utils
+      - name: Build and install optics C libraries
+        run: |
+          meson setup optics/build optics \
+            -Dexamples=false -Dtests=false --buildtype=release
+          meson compile -C optics/build
+          sudo meson install -C optics/build
+          sudo ldconfig
+          pkg-config --modversion flux lens iris
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

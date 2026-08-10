@@ -14,9 +14,9 @@ UI host from a small Cargo workspace:
   and workers.
 - `aegis-portal-ipc` implements the protocol-24 settings, capture, picking,
   and streaming wire contract without depending on Aegis source crates.
-- `aegis-portal-prompter` runs one GTK4 interaction per request. It owns file
-  browsing, Account consent, and Secret password input and never connects to
-  compositor IPC.
+- `aegis-portal-prompter` runs one optics (iris/lens) interaction per
+  request. It owns file browsing, Account consent, and Secret password input
+  and never connects to compositor IPC.
 - `aegis-portal-runtime` owns the shared portal Request lifecycle.
 - `aegis-portal-secret` owns the encrypted vault and native Secret backend.
 - `aegis-pam` optionally forwards a verified login password for vault
@@ -32,7 +32,8 @@ compatibility contract, not a source dependency; see the
 
 ## Build
 
-Install Meson, GTK 4.10 or newer, PipeWire, SPA, and `pkg-config` development
+Install Meson, the optics C libraries (flux/lens/iris, from the tagged
+`ming2k/optics` release), PipeWire, SPA, and `pkg-config` development
 packages, then run:
 
 ```bash

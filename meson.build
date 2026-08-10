@@ -8,7 +8,6 @@ cargo = find_program('cargo')
 artifact_builder = find_program('scripts/meson-cargo-build.sh')
 
 # Fail during configure instead of halfway through a distribution build.
-dependency('gtk4', version: '>=4.10')
 dependency('libpipewire-0.3', version: '>=0.3')
 dependency('libspa-0.2', version: '>=0.2')
 if get_option('pam')

@@ -11,9 +11,13 @@ rust-version.workspace = true
 
 [dependencies]
 env_logger = { workspace = true }
-gdk4-wayland = "0.10.1"
-gtk4 = "0.10.1"
+flux-sys = { workspace = true }
+iris = { workspace = true }
+iris-sys = { workspace = true }
+lens = { workspace = true }
+lens-sys = { workspace = true }
 log = { workspace = true }
+mime_guess = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }

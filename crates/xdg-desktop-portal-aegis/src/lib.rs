@@ -12,8 +12,8 @@
 //! and `org.freedesktop.impl.portal.Account` at
 //! `/org/freedesktop/portal/desktop` under the well-known name
 //! `org.freedesktop.impl.portal.desktop.aegis`. Secret is backed by an
-//! encrypted at-rest vault. FileChooser launches one portal-owned GTK4
-//! prompter process; no file data crosses compositor IPC. For
+//! encrypted at-rest vault. FileChooser launches one portal-owned optics
+//! (iris/lens) prompter process; no file data crosses compositor IPC. For
 //! compositor-owned resources the backend is an ordinary scoped IPC client:
 //! pixels come from `CaptureOutput` under the built-in
 //! `aegis-portal` named scope with a sealed-memfd blob transfer
@@ -80,7 +80,7 @@ pub enum PortalError {
 }
 
 /// Process adapter kept at the composition root so Secret storage depends on
-/// only a narrow prompt capability, not GTK or compositor IPC.
+/// only a narrow prompt capability, not toolkit or compositor IPC.
 struct PortalSecretPrompter;
 
 impl SecretPrompter for PortalSecretPrompter {

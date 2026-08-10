@@ -2,7 +2,8 @@
 
 ## Install Dependencies
 
-Install Rust 1.88 or newer, Meson, Ninja, `pkg-config`, GTK 4.10 or newer,
+Install Rust 1.88 or newer, Meson, Ninja, `pkg-config`, the optics C
+libraries (flux, lens, and iris from the tagged `ming2k/optics` release),
 PipeWire and SPA development files, `xdg-desktop-portal`,
 `xdg-desktop-portal-gtk`, WirePlumber, and `xdg-email`. Install PAM
 development files only when the optional PAM module is required.
