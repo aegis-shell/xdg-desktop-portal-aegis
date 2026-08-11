@@ -1,6 +1,6 @@
 # ADR-0005: ScreenCast dmabuf transport and the slot protocol
 
-- Status: Accepted
+- Status: Accepted — decision points 1 and 2 (the mmap fallback) are amended by [ADR-0006](0006-shm-consumers-switch-to-readback-transport.md)
 - Date: 2026-08-09
 
 ## Context

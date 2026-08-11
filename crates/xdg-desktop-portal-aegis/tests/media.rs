@@ -31,17 +31,22 @@ const PNG: &[u8] = &[
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
+/// One recorded `StreamOutputStart`: fps cap, target, dmabuf opt-in.
+type StreamStart = (Option<u32>, StreamTarget, Option<bool>);
+
 #[derive(Default)]
 struct FakeCompositor {
     captures: Mutex<Vec<Option<aegis_portal_ipc::Rect>>>,
     picks: Mutex<Vec<PickKind>>,
     confirms: Mutex<Vec<(String, String)>>,
-    stream_starts: Mutex<Vec<(Option<u32>, StreamTarget)>>,
+    stream_starts: Mutex<Vec<StreamStart>>,
     stream_stops: Mutex<Vec<u64>>,
     stream_disconnects: Mutex<Vec<u64>>,
     /// Per-stream announced formats, consumed in start order; streams start
     /// as Bgra8 when the queue is empty.
     stream_formats: Mutex<Vec<StreamPixelFormat>>,
+    /// Stream ids handed out in start order, mirroring the compositor.
+    next_stream_id: Mutex<u64>,
     /// Offer a protocol-25 slot table on dmabuf-opted-in streams.
     offer_slots: Mutex<bool>,
     /// The slot files handed out, kept writable so tests control the slot
@@ -96,7 +101,15 @@ impl Handler for FakeCompositor {
         target: StreamTarget,
         dmabuf: Option<bool>,
     ) -> Result<StreamInfo, String> {
-        self.stream_starts.lock().unwrap().push((max_fps, target));
+        self.stream_starts
+            .lock()
+            .unwrap()
+            .push((max_fps, target, dmabuf));
+        let stream_id = {
+            let mut id = self.next_stream_id.lock().unwrap();
+            *id += 1;
+            *id
+        };
         let format = {
             let mut queue = self.stream_formats.lock().unwrap();
             if queue.is_empty() {
@@ -126,7 +139,7 @@ impl Handler for FakeCompositor {
             slots = Some(infos);
         }
         Ok(StreamInfo {
-            stream_id: 1,
+            stream_id,
             width: 2,
             height: 2,
             format,
@@ -592,7 +605,7 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
     assert_ne!(serial, 0, "v6 requires a stable PipeWire serial");
     assert_eq!(
         fake.stream_starts.lock().unwrap().as_slice(),
-        &[(Some(60), StreamTarget::Output)]
+        &[(Some(60), StreamTarget::Output, Some(true))]
     );
 
     // Consume one raw frame from the exact node through an independent
@@ -659,6 +672,17 @@ use pipewire_consumer::{Received, consume_one_frame};
 /// single-plane BGRA8-class dmabuf exports.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// DRM_FORMAT_MOD_I915_X_TILED: a device-native tiled layout, the kind of
+/// modifier the compositor's slot streams carry in production.
+const DRM_FORMAT_MOD_I915_X_TILED: u64 = 0x0100_0000_0000_0001;
+
+/// The format queue for a dmabuf-announced stream with LINEAR slots.
+fn linear_dmabuf_formats() -> Vec<StreamPixelFormat> {
+    vec![StreamPixelFormat::Dmabuf {
+        drm_format: DRM_FORMAT_XRGB8888,
+        modifier: DRM_FORMAT_MOD_LINEAR,
+    }]
+}
 
 /// An unsealed memfd stands in for a GPU dmabuf: same wire transport, same
 /// fixed size, no seals, and mappable on any test machine.
@@ -759,7 +783,11 @@ fn start_cast_session(
     stream_details(&results)
 }
 
-fn dmabuf_cast_fixture(tag: &str, offer_slots: bool) -> Option<DmabufCastFixture> {
+fn dmabuf_cast_fixture(
+    tag: &str,
+    offer_slots: bool,
+    formats: Vec<StreamPixelFormat>,
+) -> Option<DmabufCastFixture> {
     let Some(bus) = private_bus() else {
         if pipewire_e2e_required() {
             panic!("dbus-daemon unavailable");
@@ -779,13 +807,7 @@ fn dmabuf_cast_fixture(tag: &str, offer_slots: bool) -> Option<DmabufCastFixture
     };
     let fake = Arc::new(FakeCompositor::default());
     *fake.offer_slots.lock().unwrap() = offer_slots;
-    fake.stream_formats
-        .lock()
-        .unwrap()
-        .push(StreamPixelFormat::Dmabuf {
-            drm_format: DRM_FORMAT_XRGB8888,
-            modifier: DRM_FORMAT_MOD_LINEAR,
-        });
+    *fake.stream_formats.lock().unwrap() = formats;
     let server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
         .expect("bind fake compositor IPC");
     let backend_log = runtime_dir.join("backend.log");
@@ -799,7 +821,7 @@ fn dmabuf_cast_fixture(tag: &str, offer_slots: bool) -> Option<DmabufCastFixture
     let (node_id, _) = start_cast_session(&conn, &session_path, tag);
     assert_eq!(
         fake.stream_starts.lock().unwrap().as_slice(),
-        &[(Some(60), StreamTarget::Output)]
+        &[(Some(60), StreamTarget::Output, Some(true))]
     );
     Some(DmabufCastFixture {
         fake,
@@ -888,7 +910,7 @@ fn drive_one_frame(
 /// each dmabuf frame (the universal fallback path).
 #[test]
 fn screencast_maps_dmabuf_frames_for_shm_consumers() {
-    let Some(fixture) = dmabuf_cast_fixture("shm", false) else {
+    let Some(fixture) = dmabuf_cast_fixture("shm", false, linear_dmabuf_formats()) else {
         return;
     };
     let pixels = [0xa5_u8; 16];
@@ -903,7 +925,7 @@ fn screencast_maps_dmabuf_frames_for_shm_consumers() {
 /// delivery needs the slot protocol tracked in ADR-0005.
 #[test]
 fn screencast_cannot_forward_per_frame_descriptors() {
-    let Some(fixture) = dmabuf_cast_fixture("fwd", false) else {
+    let Some(fixture) = dmabuf_cast_fixture("fwd", false, linear_dmabuf_formats()) else {
         return;
     };
     let pixels = [0x5a_u8; 16];
@@ -917,7 +939,7 @@ fn screencast_cannot_forward_per_frame_descriptors() {
 #[test]
 fn screencast_forwards_slot_frames_zero_copy() {
     use std::io::{Seek, SeekFrom, Write};
-    let Some(fixture) = dmabuf_cast_fixture("slots", true) else {
+    let Some(fixture) = dmabuf_cast_fixture("slots", true, linear_dmabuf_formats()) else {
         return;
     };
     assert_eq!(fixture.fake.slot_files.lock().unwrap().len(), 3);
@@ -975,7 +997,7 @@ fn screencast_forwards_slot_frames_zero_copy() {
 #[test]
 fn screencast_copies_slot_frames_for_shm_consumers() {
     use std::io::{Seek, SeekFrom, Write};
-    let Some(fixture) = dmabuf_cast_fixture("slotshm", true) else {
+    let Some(fixture) = dmabuf_cast_fixture("slotshm", true, linear_dmabuf_formats()) else {
         return;
     };
     let socket = fixture.runtime_dir.join("pipewire-0");
@@ -1019,4 +1041,92 @@ fn screencast_copies_slot_frames_for_shm_consumers() {
         assert!(Instant::now() < deadline, "slot release never arrived");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A consumer that cannot import the compositor's tiled modifier must never
+/// receive a linear memcpy of the tiled slot bytes — that copies
+/// tile-swizzled garbage. Fixating the modifier-less entry restarts the
+/// compositor stream on the SHM readback transport underneath the live
+/// PipeWire connection, and the readback pixels are what the consumer
+/// receives.
+#[test]
+fn screencast_switches_tiled_slot_streams_to_shm_readback() {
+    let Some(fixture) = dmabuf_cast_fixture(
+        "tiled",
+        true,
+        vec![
+            StreamPixelFormat::Dmabuf {
+                drm_format: DRM_FORMAT_XRGB8888,
+                modifier: DRM_FORMAT_MOD_I915_X_TILED,
+            },
+            // The restarted stream answers on the SHM readback transport.
+            StreamPixelFormat::Bgra8,
+        ],
+    ) else {
+        return;
+    };
+    let socket = fixture.runtime_dir.join("pipewire-0");
+    let node_id = fixture.node_id;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame(
+            &socket,
+            node_id,
+            2,
+            2,
+            false,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+
+    // The fixation must stop the tiled slot stream and restart it without
+    // the dmabuf opt-in.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stopped = fixture.fake.stream_stops.lock().unwrap().contains(&1);
+        let restarts = fixture.fake.stream_starts.lock().unwrap().clone();
+        if stopped && restarts.len() == 2 {
+            assert_eq!(
+                restarts.as_slice(),
+                &[
+                    (Some(60), StreamTarget::Output, Some(true)),
+                    (Some(60), StreamTarget::Output, None),
+                ]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the compositor stream never restarted as SHM readback"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The new transport delivers sealed SHM readback frames on stream 2.
+    let pixels = [0x66_u8; 16];
+    assert!(
+        fixture
+            .server
+            .push_stream_frame(aegis_portal_ipc::testing::StreamFramePayload {
+                stream_id: 2,
+                sequence: 1,
+                width: 2,
+                height: 2,
+                stride: 8,
+                format: StreamPixelFormat::Bgra8,
+                damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
+                dropped: 0,
+                pixels: pixels.to_vec().into(),
+            },)
+    );
+
+    let received = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
 }

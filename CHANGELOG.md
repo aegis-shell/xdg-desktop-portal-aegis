@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- ScreenCast no longer delivers a scrambled picture to consumers that
+  cannot import the compositor's dmabuf modifier (reported with Flatpak
+  OBS). The shared-memory fallback memory-mapped the slot descriptors and
+  copied them linearly, which returns tile-swizzled bytes for the
+  device-native tiled modifiers the compositor exports. Fixating the
+  modifier-less format now restarts the compositor stream on the SHM
+  readback transport underneath the live PipeWire connection, and the
+  copy path never memory-maps a non-`DRM_FORMAT_MOD_LINEAR` descriptor;
+  see [ADR-0006](docs/adr/0006-shm-consumers-switch-to-readback-transport.md).
+- The `SPA_PARAM_BUFFERS` offer now advertises the layout delivery
+  actually uses: the slot's stride and size for zero-copy dmabuf,
+  tightly packed dimensions for the shared-memory copy path.
+
 ## [0.0.8] - 2026-08-11
 
 ### Added

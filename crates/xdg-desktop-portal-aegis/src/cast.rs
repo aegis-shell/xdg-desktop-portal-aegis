@@ -21,7 +21,18 @@
 //!   and only then is its release reported to the compositor.
 //! - **Per-frame descriptors**: every frame carries a sealed memfd or a
 //!   single-plane dmabuf behind its header. The frame is memory-mapped and
-//!   copied into a pool buffer exactly once — the universal fallback.
+//!   copied into a pool buffer exactly once. Memory-mapping is only defined
+//!   for CPU-typed pixels, so this path serves SHM frames and LINEAR
+//!   dmabufs; a tiled dmabuf would copy tile-swizzled bytes.
+//!
+//! The compositor's dmabuf slots normally carry a device-native tiled
+//! modifier, which only GPU consumers can import. When the fixated
+//! PipeWire format cannot be served by the current transport — a
+//! modifier-ignorant consumer facing a tiled slot stream, or a GPU
+//! consumer facing an SHM stream — the compositor stream is restarted on
+//! the matching transport (the `dmabuf` flag at `StreamOutputStart`)
+//! underneath the live PipeWire connection. The offered format is the same
+//! on both transports, so the consumer never observes the switch.
 //!
 //! The stream is a PipeWire DRIVER fed by `pw_stream_trigger_process` when
 //! a compositor frame arrives, so graph cycles run only when there is a new
@@ -78,6 +89,10 @@ const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 /// bit 1, MemFd is bit 2, and DmaBuf is bit 3.
 const DMABUF_DATA_TYPE_BIT: u32 = 1 << 3;
 const ALL_DATA_TYPES: u32 = (1 << 1) | (1 << 2) | DMABUF_DATA_TYPE_BIT;
+/// DRM_FORMAT_MOD_LINEAR: the only dmabuf layout the copy path may
+/// memory-map. Tiled layouts read back tile-swizzled on the CPU, so they
+/// must come from the compositor's SHM readback instead.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
@@ -254,6 +269,36 @@ struct SlotBinding {
     in_flight: bool,
 }
 
+/// The compositor-side transport behind the PipeWire stream: which
+/// compositor stream frames belong to, what layout they have, and the
+/// protocol-25 slot table when streaming dmabuf slots. Shared between the
+/// stream listener, the IPC source, and teardown so a transport switch
+/// (dmabuf slots ↔ SHM readback) is observed everywhere without
+/// renegotiating the PipeWire stream.
+struct Transport {
+    stream_id: u64,
+    announced: AnnouncedFormat,
+    slot_files: Vec<aegis_portal_ipc::StreamSlot>,
+    slot_bindings: Vec<SlotBinding>,
+}
+
+impl Transport {
+    fn slot_count(&self) -> usize {
+        self.slot_files.len()
+    }
+
+    /// True when the copy path may memory-map this transport's frames:
+    /// CPU-typed SHM pixels or LINEAR dmabufs. A tiled dmabuf memory-maps
+    /// to tile-swizzled bytes, so those frames must come from the
+    /// compositor's SHM readback transport instead.
+    fn cpu_mappable(&self) -> bool {
+        match self.announced {
+            AnnouncedFormat::Shm(_) => true,
+            AnnouncedFormat::Dmabuf { modifier, .. } => modifier == DRM_FORMAT_MOD_LINEAR,
+        }
+    }
+}
+
 /// Latest frame shared between the IPC source (writer) and the PipeWire
 /// `process` callback (reader). `None` until the first frame arrives.
 type LatestFrame = Rc<RefCell<Option<FramePayload>>>;
@@ -315,12 +360,15 @@ struct StreamData {
     pending: Rc<Cell<bool>>,
     width: u32,
     height: u32,
-    announced: AnnouncedFormat,
-    /// Slot descriptors and their pool bindings (protocol 25); empty on a
-    /// per-frame transport. The bindings are shared with the cast thread's
-    /// teardown so abandoned slots are released.
-    slot_files: Vec<aegis_portal_ipc::StreamSlot>,
-    slot_bindings: Rc<RefCell<Vec<SlotBinding>>>,
+    /// The SPA raw format offered at connect; fixated formats and
+    /// restarted transports are validated against it.
+    spa_format: spa::param::video::VideoFormat,
+    /// The modifier offered at connect, when a dmabuf slot stream was
+    /// announced. Consumers can only fixate this modifier, so transport
+    /// decisions key off it rather than the current transport state.
+    offered_modifier: Option<u64>,
+    /// The live compositor transport; swapped by `sync_transport`.
+    transport: Rc<RefCell<Transport>>,
     negotiation: RefCell<Negotiation>,
     /// Unbound pool buffers dequeued in earlier cycles; the copy path
     /// fills them.
@@ -329,9 +377,10 @@ struct StreamData {
     /// `pw_buffer` pointer. With `ALLOC_BUFFERS` the producer supplies the
     /// pool memory; entries are unmapped at `remove_buffer` and teardown.
     pool_mem: Rc<RefCell<HashMap<usize, PoolMem>>>,
-    /// The IPC client, for sending slot releases from the process callback.
+    /// The IPC client, for slot releases and transport restarts.
     client: Rc<RefCell<Client>>,
-    stream_id: u64,
+    /// Quit handle for fatal transport errors.
+    mainloop: pw::main_loop::MainLoopWeak,
     start_state: Rc<RefCell<StartState>>,
     /// Portal-side frame drops (unmappable dmabuf, pool starvation),
     /// counted for the stream's lifetime.
@@ -344,18 +393,19 @@ impl StreamData {
     /// Tell the compositor a slot is reusable. Best-effort: the stream's
     /// teardown cleans up regardless.
     fn release_slot(&self, slot: u32) {
-        if self.slot_files.is_empty() {
+        let (stream_id, has_slots) = {
+            let transport = self.transport.borrow();
+            (transport.stream_id, !transport.slot_files.is_empty())
+        };
+        if !has_slots {
             return;
         }
         if let Err(error) = self
             .client
             .borrow_mut()
-            .release_stream_buffer(self.stream_id, slot)
+            .release_stream_buffer(stream_id, slot)
         {
-            log::debug!(
-                "portal: slot release for stream {} failed: {error}",
-                self.stream_id
-            );
+            log::debug!("portal: slot release for stream {stream_id} failed: {error}");
         }
     }
 }
@@ -468,6 +518,15 @@ fn validate_frame(
             },
             StreamPayload::Dmabuf(file),
         ) if frame_drm == drm_format && frame_modifier == modifier => {
+            // The copy path memory-maps the descriptor, which is only
+            // defined for CPU-typed pixels: a tiled dmabuf would copy
+            // tile-swizzled bytes. Tiled streams belong to the
+            // compositor's SHM readback (see `sync_transport`).
+            if modifier != DRM_FORMAT_MOD_LINEAR {
+                return Err(format!(
+                    "dmabuf frame with non-LINEAR modifier {modifier:#x} cannot be memory-mapped"
+                ));
+            }
             Ok(FramePayload::Descriptor {
                 file,
                 stride: frame.stride,
@@ -489,18 +548,19 @@ fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
         let Some(raw) = NonNull::new(raw) else {
             break;
         };
-        let mut bindings = data.slot_bindings.borrow_mut();
-        let bound = bindings
+        let mut transport = data.transport.borrow_mut();
+        let bound = transport
+            .slot_bindings
             .iter_mut()
             .enumerate()
             .find(|(_, binding)| binding.pool == Some(raw.as_ptr()));
         if let Some((slot, binding)) = bound {
             if binding.in_flight {
                 binding.in_flight = false;
+                let stream_id = transport.stream_id;
+                let has_slots = !transport.slot_files.is_empty();
                 let client = Rc::clone(&data.client);
-                let stream_id = data.stream_id;
-                let has_slots = !data.slot_files.is_empty();
-                drop(bindings);
+                drop(transport);
                 if has_slots
                     && let Err(error) = client
                         .borrow_mut()
@@ -510,7 +570,7 @@ fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
                 }
             }
         } else {
-            drop(bindings);
+            drop(transport);
             data.pool.borrow_mut().push(raw.as_ptr());
         }
     }
@@ -540,8 +600,8 @@ fn process_frame(stream: &pw::stream::Stream, data: &mut StreamData) {
 /// slot when the consumer takes dmabufs, or copy the slot's pixels into a
 /// free pool buffer (and release the slot immediately) otherwise.
 fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
-    let mut bindings = data.slot_bindings.borrow_mut();
-    let Some(binding) = bindings.get_mut(slot as usize) else {
+    let mut transport = data.transport.borrow_mut();
+    let Some(binding) = transport.slot_bindings.get_mut(slot as usize) else {
         data.dropped_frames.set(data.dropped_frames.get() + 1);
         log::warn!("portal: frame for unknown slot {slot}; dropping");
         return;
@@ -555,16 +615,26 @@ fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
     match (forward, binding.pool) {
         (true, Some(pool_raw)) => {
             binding.in_flight = true;
-            drop(bindings);
+            drop(transport);
             // SAFETY: `pool_raw` is a live pool buffer of this stream bound
             // to this slot, dequeued earlier and not referenced elsewhere.
             unsafe { stream.queue_raw_buffer(pool_raw) };
         }
         _ => {
-            let file = &data.slot_files[slot as usize].file;
-            let stride = data.slot_files[slot as usize].stride;
-            drop(bindings);
+            if !transport.cpu_mappable() {
+                // Never linear-copy tiled pixels: the transport switch to
+                // the compositor's SHM readback is what serves this
+                // consumer. Drop the frame and hand the slot back so the
+                // compositor's ring keeps turning until then.
+                data.dropped_frames.set(data.dropped_frames.get() + 1);
+                drop(transport);
+                data.release_slot(slot);
+                return;
+            }
+            let file = &transport.slot_files[slot as usize].file;
+            let stride = transport.slot_files[slot as usize].stride;
             copy_into_pool(stream, data, file, stride);
+            drop(transport);
             data.release_slot(slot);
         }
     }
@@ -696,22 +766,28 @@ fn run_cast(
     frame_len(width, height)?;
     let announced = announced_format(stream_info.format)?;
     let slot_files = stream_info.slots.unwrap_or_default();
-    let slot_bindings: Rc<RefCell<Vec<SlotBinding>>> = Rc::new(RefCell::new(
-        slot_files
-            .iter()
+    let slot_count = slot_files.len();
+    let offered_modifier = match announced {
+        AnnouncedFormat::Dmabuf { modifier, .. } if slot_count > 0 => Some(modifier),
+        _ => None,
+    };
+    let transport = Rc::new(RefCell::new(Transport {
+        stream_id: stream_info.stream_id,
+        announced,
+        slot_files,
+        slot_bindings: (0..slot_count)
             .map(|_| SlotBinding {
                 pool: None,
                 in_flight: false,
             })
             .collect(),
-    ));
-    let teardown_in_flight = Rc::clone(&slot_bindings);
+    }));
+    let teardown_transport = Rc::clone(&transport);
     let teardown_pool_mem: Rc<RefCell<HashMap<usize, PoolMem>>> =
         Rc::new(RefCell::new(HashMap::new()));
     log::info!(
-        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}, {} slots",
+        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}, {slot_count} slots",
         stream_info.stream_id,
-        slot_files.len()
     );
     let client = Rc::new(RefCell::new(client));
     let teardown_client = Rc::clone(&client);
@@ -735,8 +811,7 @@ fn run_cast(
     .map_err(|e| e.to_string())?;
 
     let latest: LatestFrame = Rc::new(RefCell::new(None));
-    let format_bytes = format_pods(width, height, announced, !slot_files.is_empty());
-    let slot_count = slot_files.len();
+    let format_bytes = format_pods(width, height, announced, slot_count > 0);
     let pending = Rc::new(Cell::new(false));
     let start_state = Rc::new(RefCell::new(StartState {
         started: Some(started.clone()),
@@ -769,8 +844,9 @@ fn run_cast(
             pending: Rc::clone(&pending),
             width,
             height,
-            announced,
-            slot_bindings,
+            spa_format: announced.spa_format(),
+            offered_modifier,
+            transport: Rc::clone(&transport),
             negotiation: RefCell::new(Negotiation {
                 mode: DeliveryMode::Shm,
                 consumer_data_types: None,
@@ -778,8 +854,7 @@ fn run_cast(
             pool: RefCell::new(Vec::new()),
             pool_mem: Rc::clone(&teardown_pool_mem),
             client: Rc::clone(&client),
-            stream_id: stream_info.stream_id,
-            slot_files,
+            mainloop: mainloop.downgrade(),
             start_state,
             dropped_frames: Cell::new(0),
             warned_unmappable: Cell::new(false),
@@ -833,7 +908,30 @@ fn run_cast(
                     Some(fixated) => data.apply_fixated_format(&fixated),
                     None => log::warn!("portal: could not parse the fixated PipeWire format"),
                 }
-                let buffers = buffers_pod(data.width, data.height, data.slot_files.len());
+                // Advertise the layout delivery actually uses: the slot's
+                // stride and size for zero-copy dmabuf, tightly packed for
+                // the shared-memory copy path.
+                let buffers = {
+                    let transport = data.transport.borrow();
+                    let mode = data.negotiation.borrow().mode;
+                    let slot = if mode == DeliveryMode::Dmabuf {
+                        transport.slot_files.first()
+                    } else {
+                        None
+                    };
+                    match slot {
+                        Some(slot) => buffers_pod(
+                            transport.slot_files.len(),
+                            slot.stride as i32,
+                            slot.byte_len as i32,
+                        ),
+                        None => buffers_pod(
+                            transport.slot_files.len(),
+                            (data.width * 4) as i32,
+                            (data.width * data.height * 4) as i32,
+                        ),
+                    }
+                };
                 let mut params = [Pod::from_bytes(&buffers).expect("buffers pod")];
                 if let Err(error) = stream.update_params(&mut params) {
                     log::warn!("portal: pipewire update_params failed: {error}");
@@ -851,8 +949,9 @@ fn run_cast(
             // dmabuf-negotiated slot stream binds the next compositor slot;
             // everything else gets a Portal-owned memfd for the copy path.
             let bind = if data.negotiation.borrow().forwarding_eligible() {
-                let mut bindings = data.slot_bindings.borrow_mut();
-                bindings
+                let mut transport = data.transport.borrow_mut();
+                transport
+                    .slot_bindings
                     .iter_mut()
                     .enumerate()
                     .find(|(_, binding)| binding.pool.is_none())
@@ -877,20 +976,24 @@ fn run_cast(
                 return;
             };
             if let Some(index) = bind {
-                let slot = &data.slot_files[index];
+                let (fd, byte_len, stride) = {
+                    let transport = data.transport.borrow();
+                    let slot = &transport.slot_files[index];
+                    (slot.file.as_raw_fd() as i64, slot.byte_len, slot.stride)
+                };
                 // SAFETY: `datas`/`chunk` are live pool slots patched here
                 // before any use; they stay patched until remove_buffer.
                 unsafe {
                     let chunk = (*datas).chunk;
                     (*datas).type_ = spa_sys::SPA_DATA_DmaBuf;
                     (*datas).flags = spa::buffer::DataFlags::READABLE.bits();
-                    (*datas).fd = slot.file.as_raw_fd() as i64;
+                    (*datas).fd = fd;
                     (*datas).mapoffset = 0;
-                    (*datas).maxsize = slot.byte_len as u32;
+                    (*datas).maxsize = byte_len as u32;
                     (*datas).data = std::ptr::null_mut();
                     (*chunk).offset = 0;
-                    (*chunk).size = slot.byte_len as u32;
-                    (*chunk).stride = slot.stride as i32;
+                    (*chunk).size = byte_len as u32;
+                    (*chunk).stride = stride as i32;
                     (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
                 }
                 log::debug!("portal: bound compositor slot {index} to a pool buffer");
@@ -928,8 +1031,9 @@ fn run_cast(
             // binding and release any in-flight slot the consumer abandoned.
             data.pool_mem.borrow_mut().remove(&(buffer as usize));
             data.pool.borrow_mut().retain(|pooled| *pooled != buffer);
-            let mut bindings = data.slot_bindings.borrow_mut();
-            let Some((slot, binding)) = bindings
+            let mut transport = data.transport.borrow_mut();
+            let Some((slot, binding)) = transport
+                .slot_bindings
                 .iter_mut()
                 .enumerate()
                 .find(|(_, binding)| binding.pool == Some(buffer))
@@ -938,10 +1042,10 @@ fn run_cast(
             };
             binding.pool = None;
             let was_in_flight = std::mem::replace(&mut binding.in_flight, false);
+            let stream_id = transport.stream_id;
+            let has_slots = !transport.slot_files.is_empty();
             let client = Rc::clone(&data.client);
-            let stream_id = data.stream_id;
-            let has_slots = !data.slot_files.is_empty();
-            drop(bindings);
+            drop(transport);
             if was_in_flight
                 && has_slots
                 && let Err(error) = client
@@ -967,6 +1071,7 @@ fn run_cast(
             let jobs = jobs.clone();
             let session_path = session_path.to_string();
             let compositor_dropped = Rc::clone(&compositor_dropped);
+            let transport = Rc::clone(&transport);
             move |io| {
                 let message = io.0.borrow_mut().next_stream_message();
                 match message {
@@ -978,8 +1083,25 @@ fn run_cast(
                             );
                             compositor_dropped.set(frame.dropped);
                         }
-                        match validate_frame(frame, width, height, announced, slot_count) {
+                        let state = transport.borrow();
+                        if frame.stream_id != state.stream_id {
+                            // A transport switch left frames of the
+                            // superseded stream on the wire.
+                            log::debug!(
+                                "portal: ignoring frame for superseded stream {}",
+                                frame.stream_id
+                            );
+                            return;
+                        }
+                        match validate_frame(
+                            frame,
+                            width,
+                            height,
+                            state.announced,
+                            state.slot_count(),
+                        ) {
                             Ok(payload) => {
+                                drop(state);
                                 *latest.borrow_mut() = Some(payload);
                                 pending.set(true);
                                 if let Some(stream) = stream_weak.upgrade()
@@ -1066,16 +1188,17 @@ fn run_cast(
     // holds so the compositor can reuse them without waiting for the
     // disconnect cleanup.
     teardown_pool_mem.borrow_mut().clear();
-    for (slot, binding) in teardown_in_flight.borrow().iter().enumerate() {
-        let in_flight = &binding.in_flight;
-        if *in_flight
+    let transport_state = teardown_transport.borrow();
+    for (slot, binding) in transport_state.slot_bindings.iter().enumerate() {
+        if binding.in_flight
             && let Err(error) = teardown_client
                 .borrow_mut()
-                .release_stream_buffer(stream_info.stream_id, slot as u32)
+                .release_stream_buffer(transport_state.stream_id, slot as u32)
         {
             log::debug!("portal: teardown slot release failed: {error}");
         }
     }
+    drop(transport_state);
     if exit_start_state.borrow().completed && !stopped_by_owner.get() {
         let _ = jobs.send(CastJob::SessionEnded {
             session_path: session_path.to_owned(),
@@ -1085,18 +1208,17 @@ fn run_cast(
 }
 
 impl StreamData {
-    /// Record the fixated format: verify it against what was offered and
-    /// derive the delivery mode from the presence of the announced
-    /// modifier. Consumers can renegotiate mid-stream (OBS removes an
-    /// unimportable modifier and retries), so this runs on every `Format`
-    /// param change.
+    /// Record the fixated format: verify it against what was offered,
+    /// switch the compositor transport when the current one cannot serve
+    /// it, and derive the delivery mode. Consumers can renegotiate
+    /// mid-stream (OBS removes an unimportable modifier and retries), so
+    /// this runs on every `Format` param change.
     fn apply_fixated_format(&self, fixated: &FixatedFormat) {
-        let expected = self.announced.spa_format();
-        if fixated.spa_format != expected.as_raw() {
+        if fixated.spa_format != self.spa_format.as_raw() {
             log::warn!(
                 "portal: consumer fixated SPA format {} but only {} was offered",
                 fixated.spa_format,
-                expected.as_raw()
+                self.spa_format.as_raw()
             );
         }
         if fixated.width != self.width || fixated.height != self.height {
@@ -1108,22 +1230,31 @@ impl StreamData {
                 self.height
             );
         }
-        let mode = match (self.announced, fixated.modifier) {
+        if let Err(error) = self.sync_transport(fixated.modifier) {
+            log::error!("portal: compositor transport switch failed: {error}");
+            if let Some(mainloop) = self.mainloop.upgrade() {
+                mainloop.quit();
+            }
+            return;
+        }
+        let transport = self.transport.borrow();
+        let mode = match (transport.announced, fixated.modifier) {
             (AnnouncedFormat::Dmabuf { modifier, .. }, Some(fixated_modifier))
-                if fixated_modifier == modifier && !self.slot_files.is_empty() =>
+                if fixated_modifier == modifier && !transport.slot_files.is_empty() =>
             {
                 DeliveryMode::Dmabuf
             }
             (AnnouncedFormat::Dmabuf { modifier, .. }, Some(fixated_modifier))
-                if !self.slot_files.is_empty() =>
+                if !transport.slot_files.is_empty() =>
             {
                 log::warn!(
-                    "portal: consumer fixated modifier {fixated_modifier:#x} but the compositor                      streams {modifier:#x}; falling back to SHM delivery"
+                    "portal: consumer fixated modifier {fixated_modifier:#x} but the compositor streams {modifier:#x}; falling back to SHM delivery"
                 );
                 DeliveryMode::Shm
             }
             _ => DeliveryMode::Shm,
         };
+        drop(transport);
         let mut negotiation = self.negotiation.borrow_mut();
         if negotiation.mode != mode {
             match mode {
@@ -1140,6 +1271,87 @@ impl StreamData {
             }
             negotiation.mode = mode;
         }
+    }
+
+    /// Restart the compositor stream on the transport the fixated PipeWire
+    /// format needs: dmabuf slots when the consumer fixated the offered
+    /// modifier, the compositor's SHM readback when it did not. A no-op
+    /// when the current transport already serves the fixation — crucially,
+    /// a LINEAR dmabuf transport stays, because memory-mapping it is
+    /// exact. A tiled dmabuf transport never serves SHM consumers: the
+    /// copy path would read tile-swizzled bytes, so the readback
+    /// transport (which de-tiles on the GPU) takes over. The PipeWire
+    /// stream itself is untouched: the offered format is identical on
+    /// both transports, so the consumer never observes the switch.
+    fn sync_transport(&self, fixated_modifier: Option<u64>) -> Result<(), String> {
+        let want_dmabuf = matches!(
+            (self.offered_modifier, fixated_modifier),
+            (Some(offered), Some(fixated)) if fixated == offered
+        );
+        let (stream_id, needs_switch) = {
+            let transport = self.transport.borrow();
+            let is_dmabuf = matches!(transport.announced, AnnouncedFormat::Dmabuf { .. });
+            let needs = if want_dmabuf {
+                !is_dmabuf
+            } else {
+                is_dmabuf && !transport.cpu_mappable()
+            };
+            (transport.stream_id, needs)
+        };
+        if !needs_switch {
+            return Ok(());
+        }
+        let mut client = self.client.borrow_mut();
+        client
+            .stop_output_stream(stream_id)
+            .map_err(|e| format!("stop compositor stream {stream_id}: {e}"))?;
+        let started = client
+            .start_output_stream(
+                Some(STREAM_MAX_FPS),
+                aegis_portal_ipc::StreamTarget::Output,
+                want_dmabuf,
+            )
+            .map_err(|e| format!("restart compositor stream (dmabuf={want_dmabuf}): {e}"))?;
+        drop(client);
+        if started.width != self.width || started.height != self.height {
+            return Err(format!(
+                "restarted stream geometry {}x{} differs from the negotiated {}x{}",
+                started.width, started.height, self.width, self.height
+            ));
+        }
+        let announced = announced_format(started.format)?;
+        if announced.spa_format() != self.spa_format {
+            return Err(format!(
+                "restarted stream format {announced:?} differs from the negotiated {:?}",
+                self.spa_format
+            ));
+        }
+        let slot_files = started.slots.unwrap_or_default();
+        log::info!(
+            "portal: restarted compositor stream {} as {} ({} slots)",
+            started.stream_id,
+            match announced {
+                AnnouncedFormat::Dmabuf { .. } => "dmabuf slots",
+                AnnouncedFormat::Shm(_) => "shared-memory readback",
+            },
+            slot_files.len()
+        );
+        let slot_count = slot_files.len();
+        let mut transport = self.transport.borrow_mut();
+        transport.stream_id = started.stream_id;
+        transport.announced = announced;
+        transport.slot_files = slot_files;
+        transport.slot_bindings = (0..slot_count)
+            .map(|_| SlotBinding {
+                pool: None,
+                in_flight: false,
+            })
+            .collect();
+        drop(transport);
+        // Frames of the superseded stream must never be published.
+        *self.latest.borrow_mut() = None;
+        self.pending.set(false);
+        Ok(())
     }
 }
 
@@ -1374,13 +1586,12 @@ fn format_pods(
     pods
 }
 
-/// Buffer constraints offered once the format is negotiated: shared, plain,
-/// or dmabuf buffers of exactly one frame, defaulting to the slot count on
-/// slot streams.
-fn buffers_pod(width: u32, height: u32, slots: usize) -> Vec<u8> {
+/// Buffer constraints offered once the format is negotiated: buffers of
+/// exactly one frame at the layout delivery actually uses (the slot's
+/// stride and size for zero-copy dmabuf, tightly packed for the copy
+/// path), defaulting to the slot count on slot streams.
+fn buffers_pod(slots: usize, stride: i32, size: i32) -> Vec<u8> {
     let default = u32::try_from(slots).unwrap_or(0).clamp(2, 8);
-    let stride = width as i32 * 4;
-    let size = stride * height as i32;
     let object = pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),
@@ -1540,7 +1751,7 @@ mod tests {
 
     #[test]
     fn buffers_pod_covers_one_frame_and_every_data_type() {
-        let bytes = buffers_pod(640, 480, 0);
+        let bytes = buffers_pod(0, 640 * 4, 640 * 480 * 4);
         let object = parse_pod(&bytes);
         assert_eq!(
             object.type_,
@@ -1612,7 +1823,7 @@ mod tests {
     fn dmabuf_frames_allow_padded_strides_but_pin_the_modifier() {
         let announced = announced_format(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
             drm_format: fourcc(b'X', b'R', b'2', b'4'),
-            modifier: 3,
+            modifier: DRM_FORMAT_MOD_LINEAR,
         })
         .unwrap();
         let frame = StreamFrame {
@@ -1620,7 +1831,7 @@ mod tests {
             payload: StreamPayload::Dmabuf(unsealed_memfd(&[0; 32])),
             ..frame_for_test(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
                 drm_format: fourcc(b'X', b'R', b'2', b'4'),
-                modifier: 3,
+                modifier: DRM_FORMAT_MOD_LINEAR,
             })
         };
         assert!(matches!(
@@ -1633,6 +1844,31 @@ mod tests {
             modifier: 4,
         });
         assert!(validate_frame(wrong_modifier, 2, 2, announced, 0).is_err());
+    }
+
+    /// The copy path memory-maps the frame descriptor, so a tiled dmabuf
+    /// can never enter it: mapping it would copy tile-swizzled bytes into
+    /// the consumer's buffers. Tiled streams are served by the
+    /// compositor's SHM readback transport instead.
+    #[test]
+    fn non_linear_dmabuf_frames_never_enter_the_copy_path() {
+        let announced = announced_format(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+            drm_format: fourcc(b'X', b'R', b'2', b'4'),
+            modifier: 0x0100_0000_0000_0001, // DRM_FORMAT_MOD_I915_X_TILED
+        })
+        .unwrap();
+        let frame = StreamFrame {
+            stride: 16,
+            payload: StreamPayload::Dmabuf(unsealed_memfd(&[0; 32])),
+            ..frame_for_test(aegis_portal_ipc::StreamPixelFormat::Dmabuf {
+                drm_format: fourcc(b'X', b'R', b'2', b'4'),
+                modifier: 0x0100_0000_0000_0001,
+            })
+        };
+        let Err(reason) = validate_frame(frame, 2, 2, announced, 0) else {
+            panic!("a tiled dmabuf frame must not validate for the copy path");
+        };
+        assert!(reason.contains("non-LINEAR"), "{reason}");
     }
 
     #[test]
