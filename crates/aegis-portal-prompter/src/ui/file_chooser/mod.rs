@@ -4,11 +4,18 @@
 //! ancestors, and Ctrl+L (or the pencil button, or typing `/`/`~`) opens
 //! a type-a-path location field with Tab completion. The toolbar carries
 //! back/forward history, parent, home, and a create-folder action.
-//! Directory navigation is double-click based, arrow keys move a cursor
-//! (selection follows, Ctrl+Space toggles in multiple mode), typing
-//! selects by name, Enter activates, Backspace/Alt+Up walks up, Ctrl+H
-//! toggles dotfiles, Enter accepts, saving over an existing file asks for
-//! confirmation, and Escape cancels (closing the window cancels too).
+//! Directory navigation is double-click based, arrow keys move the
+//! listing's cursor (selection follows, Ctrl+Space toggles in multiple
+//! mode), typing selects by name, Enter activates, Backspace/Alt+Up walks
+//! up, Ctrl+H toggles dotfiles, Enter accepts, saving over an existing
+//! file asks for confirmation, and Escape cancels (closing the window
+//! cancels too).
+//!
+//! The location and save-name fields are plain lens text fields; after a
+//! programmatic rewrite (Tab completion, a pre-filled name) the caret is
+//! moved through `Frame::textfield_set_caret` (optics ADR-0064). The
+//! listing is a virtualized `Frame::table_ex` with per-cell icons and a
+//! host-owned cursor/selection (optics ADR-0066).
 
 mod model;
 
@@ -19,18 +26,17 @@ use std::time::{Duration, Instant};
 use aegis_portal_prompter::{
     BytePath, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter, PromptResult,
 };
-use lens::{Align, Color, Frame, Input, LayoutOpts, ModalOpts, TextBuf, key, mods};
+use lens::{Align, Color, Frame, Input, LayoutOpts, ModalOpts, TableColumn, TableOpts, TextBuf, key, mods};
 use model::{
     Entry, History, Place, PlaceIcon, breadcrumbs, common_prefix, expand_tilde, list_dir,
     normalize_lexical, split_dir_tail, typeahead_index, valid_filename,
 };
 
-use super::edit;
-use super::style;
+use super::style::{self, metrics};
 use super::{
     back_icon, close_window, command_held, committed_text, computer_icon, edit_icon,
-    escape_pressed, file_icon, focus_widget, folder_icon, forward_icon, home_icon, key_down,
-    key_pressed, modifiers, new_folder_icon, parent_icon, raw_icon, run_window, window_title,
+    escape_pressed, focus_widget, forward_icon, home_icon, key_pressed, modifiers,
+    new_folder_icon, parent_icon, raw_icon, run_window, truncate_to_width, window_title,
 };
 
 /// Double-click window for "activate" (navigate/open) gestures.
@@ -49,15 +55,17 @@ struct State {
     entries: Vec<Entry>,
     listing_error: Option<String>,
     selected: BTreeSet<PathBuf>,
-    /// The save name (`SaveFile` only): an app-owned editing surface (see
-    /// `ui::edit`), because lens's textfield cannot move its caret when
-    /// the host rewrites the buffer.
-    name: String,
-    /// Caret as a byte index into `name`, always on a char boundary.
-    name_caret: usize,
-    /// Whether the save-name surface owns typing (starts focused in save
-    /// mode, matching GTK's name entry).
-    name_focused: bool,
+    /// The save name (`SaveFile` only), a lens text field; programmatic
+    /// rewrites flag `name_caret_end` so the caret lands at the end.
+    name: TextBuf,
+    /// Move the save-name caret to the end when the field next builds
+    /// (caret setters only resolve in the field's own id scope).
+    name_caret_end: bool,
+    /// The save-name field owned keyboard input last frame.
+    name_field_focused: bool,
+    /// Focus the save-name field on this frame (save mode starts focused,
+    /// matching GTK's name entry).
+    name_focus_pending: bool,
     /// The filters offered in the footer dropdown (the request's filters,
     /// or the lone `current_filter` promoted to the only choice).
     filters: Vec<FileFilter>,
@@ -67,22 +75,24 @@ struct State {
     last_click: Option<(PathBuf, Instant)>,
     /// The sidebar shortcuts to well-known folders, resolved once at start.
     places: Vec<Place>,
-    /// The type-a-path field content (while `location_editing`), an
-    /// app-owned editing surface like `name`.
-    location: String,
-    location_caret: usize,
+    /// The type-a-path field content (while `location_editing`), a lens
+    /// text field like `name`.
+    location: TextBuf,
+    /// Move the location caret to the end when the field next builds.
+    location_caret_end: bool,
     /// Whether the location bar is a text field instead of breadcrumbs.
     location_editing: bool,
+    /// The location field owned keyboard input last frame.
+    location_field_focused: bool,
     /// Why the last typed path was rejected, shown under the toolbar.
     location_error: Option<String>,
-    /// The row the keyboard acts on (the arrow-key cursor), if any.
+    /// The row the keyboard acts on — the listing table's cursor row,
+    /// host-owned through the table's in/out cursor (clicks and typeahead
+    /// write it, the table's arrow keys move it).
     focus_index: Option<usize>,
-    /// Bring this row into view after the list builds.
-    scroll_to_index: Option<usize>,
-    /// Reset the listing scroll to the top (set on directory changes).
-    scroll_top: bool,
-    /// Measured entry-row stride (height + gap) for scroll-into-view math.
-    row_stride: f32,
+    /// Focus the listing table on this frame (startup and after
+    /// navigation — GTK's default list focus).
+    table_focus_pending: bool,
     /// Back/forward navigation stacks.
     history: History,
     /// Typeahead buffer and when the last character arrived.
@@ -98,7 +108,7 @@ struct State {
     /// Focus the new-folder field on this frame.
     folder_focus: bool,
     /// The new-folder lens text field owned keyboard input last frame.
-    field_focused: bool,
+    folder_field_focused: bool,
     /// Whether Ctrl/Super is held this frame (multi-select modifier),
     /// sampled at the top of every build.
     ctrl_held: bool,
@@ -199,30 +209,32 @@ impl State {
             })
             .collect();
 
+        let save_mode = matches!(request.mode, FileChooserMode::SaveFile);
         State {
-            name_caret: initial_name.len(),
-            name_focused: matches!(request.mode, FileChooserMode::SaveFile),
+            name: TextBuf::new(1024, &initial_name),
+            name_caret_end: save_mode,
+            name_field_focused: false,
+            name_focus_pending: save_mode,
             request,
             dark: iris::system_prefers_dark(),
             dir,
             entries: Vec::new(),
             listing_error: None,
             selected,
-            name: initial_name,
             filters,
             filter_index,
             choices,
             show_hidden: false,
             last_click: None,
             places: model::places(),
-            location: String::new(),
-            location_caret: 0,
+            location: TextBuf::new(1024, ""),
+            location_caret_end: false,
             location_editing: false,
+            location_field_focused: false,
             location_error: None,
             focus_index: None,
-            scroll_to_index: None,
-            scroll_top: true,
-            row_stride: 0.0,
+            // In save mode the name entry takes the initial focus instead.
+            table_focus_pending: !save_mode,
             history: History::default(),
             typeahead: (String::new(), None),
             confirm_overwrite: None,
@@ -231,7 +243,7 @@ impl State {
             folder_name: TextBuf::new(1024, ""),
             folder_error: None,
             folder_focus: false,
-            field_focused: false,
+            folder_field_focused: false,
             ctrl_held: false,
             reload: true,
             done: None,
@@ -294,8 +306,10 @@ impl State {
         self.location_editing = false;
         self.location_error = None;
         self.focus_index = None;
-        self.scroll_to_index = None;
-        self.scroll_top = true;
+        // The listing table's id derives from the directory, so its
+        // retained scroll position is per-directory; only the lens focus
+        // needs re-granting — unless the save-name field keeps it.
+        self.table_focus_pending = !self.name_field_focused;
         self.typeahead.0.clear();
         self.reload = true;
     }
@@ -341,7 +355,7 @@ fn accept_valid(state: &State) -> bool {
         state.request.mode,
         &state.dir,
         &state.selected,
-        state.name.as_str(),
+        &state.name.as_str(),
     )
     .is_some()
 }
@@ -358,7 +372,7 @@ fn accept_checked(state: &mut State, force: bool) {
         state.request.mode,
         &state.dir,
         &state.selected,
-        state.name.as_str(),
+        &state.name.as_str(),
     ) else {
         return;
     };
@@ -419,21 +433,21 @@ fn start_location_edit(state: &mut State) {
 fn open_location(state: &mut State, seed: String) {
     state.location_editing = true;
     state.location_error = None;
-    state.location_caret = seed.len();
-    state.location = seed;
+    state.location.set(&seed);
+    state.location_caret_end = true;
 }
 
 /// Set the save name programmatically, caret to the end.
 fn set_name(state: &mut State, name: &str) {
-    state.name = name.to_owned();
-    state.name_caret = state.name.len();
+    state.name.set(name);
+    state.name_caret_end = true;
 }
 
 /// Resolve the typed location: a directory navigates, an existing file
 /// selects (or seeds the save name), anything else reports inline why the
 /// path cannot be used.
 fn go_location(state: &mut State) {
-    let typed = state.location.trim().to_owned();
+    let typed = state.location.as_str().trim().to_owned();
     if typed.is_empty() {
         return;
     }
@@ -474,7 +488,7 @@ fn go_location(state: &mut State) {
 /// a single match completes in full (with a trailing `/` for folders),
 /// several matches complete the longest common prefix.
 fn complete_location(state: &mut State) {
-    let typed = state.location.clone();
+    let typed = state.location.as_str().into_owned();
     if typed.is_empty() {
         return;
     }
@@ -495,24 +509,23 @@ fn complete_location(state: &mut State) {
         .iter()
         .filter(|entry| entry.name.starts_with(tail))
         .collect();
-    match matches.as_slice() {
-        [] => {}
+    let completed = match matches.as_slice() {
+        [] => None,
         [only] => {
             let mut completed = format!("{dir_part}{}", only.name);
             if only.is_dir {
                 completed.push('/');
             }
-            state.location_caret = completed.len();
-            state.location = completed;
+            Some(completed)
         }
         many => {
             let prefix = common_prefix(many.iter().map(|entry| entry.name.as_str()));
-            if prefix.len() > tail.len() {
-                let completed = format!("{dir_part}{prefix}");
-                state.location_caret = completed.len();
-                state.location = completed;
-            }
+            (prefix.len() > tail.len()).then(|| format!("{dir_part}{prefix}"))
         }
+    };
+    if let Some(completed) = completed {
+        state.location.set(&completed);
+        state.location_caret_end = true;
     }
 }
 
@@ -539,25 +552,10 @@ fn create_folder(state: &mut State) {
     }
 }
 
-/// Move the keyboard cursor by `delta` rows, clamped to the listing.
-fn focus_move(state: &mut State, delta: i64) {
-    let len = state.entries.len() as i64;
-    if len == 0 {
-        return;
-    }
-    let next = match state.focus_index {
-        None if delta < 0 => len - 1,
-        None => 0,
-        Some(index) => (index as i64 + delta).clamp(0, len - 1),
-    };
-    focus_to(state, next as usize);
-}
-
 /// Set the keyboard cursor on a row; selection follows unless Ctrl is
 /// held (then only the cursor moves and Ctrl+Space toggles, like GTK).
 fn focus_to(state: &mut State, index: usize) {
     state.focus_index = Some(index);
-    state.scroll_to_index = Some(index);
     let Some(entry) = state.entries.get(index).cloned() else {
         return;
     };
@@ -597,22 +595,6 @@ fn toggle_focused(state: &mut State) {
     }
     if !state.selected.remove(&entry.path) {
         state.selected.insert(entry.path);
-    }
-}
-
-/// Enter activates the keyboard cursor (navigate/open); with no cursor it
-/// accepts the dialog when the current state is valid.
-fn handle_enter(state: &mut State) {
-    if let Some(entry) = state
-        .focus_index
-        .and_then(|index| state.entries.get(index))
-        .cloned()
-    {
-        activate_entry(state, &entry);
-        return;
-    }
-    if accept_valid(state) {
-        accept(state);
     }
 }
 
@@ -664,7 +646,7 @@ fn icon_tool_button(
     enabled: bool,
     icon: impl Fn(&mut Frame),
 ) -> bool {
-    f.size_next(28.0, 28.0);
+    f.size_next(metrics::CONTROL_HEIGHT, metrics::CONTROL_HEIGHT);
     if !enabled {
         f.push_style(style::muted_style(dark));
     }
@@ -672,8 +654,8 @@ fn icon_tool_button(
         id,
         "",
         &LayoutOpts {
-            pad: 4.0,
-            radius: 6.0,
+            pad: metrics::SPACE_XS,
+            radius: metrics::RADIUS,
             ..Default::default()
         },
         |f, _| icon(f),
@@ -696,8 +678,10 @@ fn popup_open(state: &State, f: &mut Frame) -> bool {
 }
 
 /// All keyboard processing for the dialog, run before rendering so the
-/// frame reflects the keys pressed this frame. Text fields own their keys
-/// while focused; dropdowns and the overwrite modal own Escape while open.
+/// frame reflects the keys pressed this frame. The lens text fields and
+/// the listing table own their keys while focused (the table reports
+/// arrow/Return handling through its result); dropdowns and the overwrite
+/// modal own Escape while open; what remains is dialog-level routing.
 fn handle_keys(state: &mut State, f: &mut Frame, input: &Input) {
     let popup = popup_open(state, f);
     if escape_pressed(input) {
@@ -740,17 +724,16 @@ fn handle_keys(state: &mut State, f: &mut Frame, input: &Input) {
         return;
     }
     if state.location_editing {
-        // The location surface owns the remaining keys; Tab completes and
-        // Return resolves the typed path.
-        edit_location(state, f, input);
+        // The location field owns the remaining keys while the mode is
+        // open; Tab completes the typed path (Return resolves it through
+        // the field's `clicked` response at build).
+        if state.location_field_focused && key_pressed(input, key::TAB) {
+            complete_location(state);
+        }
         return;
     }
-    if state.name_focused {
-        // The save-name surface owns the remaining keys while focused.
-        edit_name(state, f, input);
-        return;
-    }
-    if state.field_focused {
+    if state.name_field_focused || state.folder_field_focused {
+        // The lens text fields own the remaining keys while focused.
         return;
     }
     if modifiers(input) & mods::ALT != 0 && key_pressed(input, key::UP) {
@@ -760,17 +743,13 @@ fn handle_keys(state: &mut State, f: &mut Frame, input: &Input) {
         }
         return;
     }
-    if key_down(input, key::UP) {
-        focus_move(state, -1);
-    } else if key_down(input, key::DOWN) {
-        focus_move(state, 1);
-    } else if key_pressed(input, key::HOME) {
-        focus_to(state, 0);
-    } else if key_pressed(input, key::END) && !state.entries.is_empty() {
-        focus_to(state, state.entries.len() - 1);
-    }
     if key_pressed(input, key::RETURN) {
-        handle_enter(state);
+        // The listing table owns Return on a cursor row (it reports
+        // `activated`); with no cursor row, Enter accepts the dialog when
+        // the current state is valid.
+        if state.focus_index.is_none() && accept_valid(state) {
+            accept(state);
+        }
         return;
     }
     if command_held(input) && key_pressed(input, ' ' as i32) && state.multiple_allowed() {
@@ -789,110 +768,6 @@ fn handle_keys(state: &mut State, f: &mut Frame, input: &Input) {
     }
 }
 
-/// Apply this frame's text and editing keys to the owned location path;
-/// Tab completes and Return resolves the typed path.
-fn edit_location(state: &mut State, f: &mut Frame, input: &Input) {
-    let text = committed_text(input);
-    if !text.is_empty() {
-        edit::insert(&mut state.location, &mut state.location_caret, &text);
-    }
-    edit_keys(&mut state.location, &mut state.location_caret, f, input);
-    if key_pressed(input, key::TAB) {
-        complete_location(state);
-    }
-    if key_pressed(input, key::RETURN) {
-        go_location(state);
-    }
-}
-
-/// Apply this frame's text and editing keys to the owned save name;
-/// Return accepts the dialog when the name is valid.
-fn edit_name(state: &mut State, f: &mut Frame, input: &Input) {
-    let text = committed_text(input);
-    if !text.is_empty() {
-        edit::insert(&mut state.name, &mut state.name_caret, &text);
-    }
-    edit_keys(&mut state.name, &mut state.name_caret, f, input);
-    if key_pressed(input, key::RETURN) && accept_valid(state) {
-        accept(state);
-    }
-}
-
-/// The editing keys every app-owned surface in this dialog shares:
-/// Backspace/Delete, caret arrows/Home/End, and Ctrl+V paste.
-fn edit_keys(text: &mut String, caret: &mut usize, f: &mut Frame, input: &Input) {
-    if key_down(input, key::BACKSPACE) {
-        edit::delete_backward(text, caret);
-    }
-    if key_down(input, key::DELETE) {
-        edit::delete_forward(text, caret);
-    }
-    if key_down(input, key::LEFT) {
-        *caret = edit::prev_boundary(text, *caret);
-    }
-    if key_down(input, key::RIGHT) {
-        *caret = edit::next_boundary(text, *caret);
-    }
-    if key_down(input, key::HOME) {
-        *caret = 0;
-    }
-    if key_down(input, key::END) {
-        *caret = text.len();
-    }
-    if command_held(input) && key_pressed(input, 'v' as i32) {
-        f.request_paste();
-    }
-    if let Some(paste) = f.take_paste() {
-        edit::insert(text, caret, &paste);
-    }
-}
-
-/// An app-owned single-line field row: text before the caret, the caret
-/// bar, text after (the secret prompt's pattern, see `ui::edit`).
-fn edit_surface(
-    state: &State,
-    f: &mut Frame,
-    id: &str,
-    text: &str,
-    caret: usize,
-    placeholder: &str,
-    focused: bool,
-) -> lens::Response {
-    let palette = style::palette(state.dark);
-    let opts = LayoutOpts {
-        height: 34.0,
-        pad: 8.0,
-        cross: Align::Center,
-        bg: palette.field,
-        border: if focused {
-            palette.accent
-        } else {
-            palette.border
-        },
-        border_width: 1.0,
-        radius: 8.0,
-        ..Default::default()
-    };
-    let (response, ()) = f.pressable_row(id, "", &opts, |f, _| {
-        let (before, after) = text.split_at(caret);
-        if text.is_empty() {
-            f.push_style(style::muted_style(state.dark));
-            f.label(placeholder);
-            f.pop_style();
-        }
-        if !before.is_empty() {
-            f.label(before);
-        }
-        if focused {
-            f.row_ex(&edit::caret_bar(palette.text), |_| {});
-        }
-        if !after.is_empty() {
-            f.label(after);
-        }
-    });
-    response
-}
-
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
     f.set_theme(style::theme(state.dark));
     state.ctrl_held = command_held(input);
@@ -904,13 +779,10 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
         return;
     }
 
-    let palette = style::palette(state.dark);
-    let mut folder_focused = false;
-
     f.column_ex(
         &LayoutOpts {
-            gap: 8.0,
-            pad: 10.0,
+            gap: metrics::SPACE_S,
+            pad: metrics::SPACE_M,
             // Fill the window so the flexible listing row absorbs both the
             // slack and the deficit; an intrinsic-sized root column would
             // push the footer below the window's bottom edge on short
@@ -920,9 +792,12 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
         },
         |f| {
             // ---- location toolbar --------------------------------------
+            // Pinned to the field height so swapping the breadcrumb chips
+            // for the location field never moves the rest of the dialog.
             f.row_ex(
                 &LayoutOpts {
-                    gap: 6.0,
+                    gap: metrics::SPACE_S,
+                    height: metrics::FIELD_HEIGHT,
                     cross: Align::Center,
                     ..Default::default()
                 },
@@ -933,7 +808,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         "go-back",
                         state.dark,
                         state.history.back().is_some(),
-                        |f| back_icon(f, 16.0),
+                        |f| back_icon(f, metrics::ICON),
                     ) && let Some(target) = state.history.go_back(&current_dir)
                     {
                         state.navigate_history(target);
@@ -943,7 +818,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         "go-forward",
                         state.dark,
                         state.history.forward().is_some(),
-                        |f| forward_icon(f, 16.0),
+                        |f| forward_icon(f, metrics::ICON),
                     ) && let Some(target) = state.history.go_forward(&current_dir)
                     {
                         state.navigate_history(target);
@@ -953,43 +828,52 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         "go-parent",
                         state.dark,
                         state.dir.parent().is_some(),
-                        |f| parent_icon(f, 16.0),
+                        |f| parent_icon(f, metrics::ICON),
                     ) && let Some(parent) = state.dir.parent().map(Path::to_path_buf)
                     {
                         state.navigate(parent);
                     }
-                    if icon_tool_button(f, "go-home", state.dark, true, |f| home_icon(f, 16.0))
-                        && let Some(home) = std::env::home_dir()
+                    if icon_tool_button(f, "go-home", state.dark, true, |f| {
+                        home_icon(f, metrics::ICON)
+                    }) && let Some(home) = std::env::home_dir()
                     {
                         state.navigate(home);
                     }
                     if icon_tool_button(f, "new-folder", state.dark, true, |f| {
-                        new_folder_icon(f, 16.0)
+                        new_folder_icon(f, metrics::ICON)
                     }) {
                         state.creating_folder = true;
                         state.folder_focus = true;
                         state.folder_error = None;
                         state.folder_name.set("");
-                        state.name_focused = false;
                     }
                     if state.location_editing {
                         f.flex(1.0);
-                        let text = state.location.clone();
-                        edit_surface(
-                            state,
-                            f,
-                            "location-path",
-                            &text,
-                            state.location_caret,
-                            "Type a path",
-                            true,
-                        );
+                        if state.location_caret_end {
+                            // Caret setters resolve in the field's own id
+                            // scope, so they run here, right before the
+                            // field builds — not at the rewrite site.
+                            f.textfield_set_caret("location-path", u32::MAX);
+                            state.location_caret_end = false;
+                        }
+                        f.textfield_placeholder("location-path", &mut state.location, "Type a path");
+                        let response = f.response();
+                        state.location_field_focused = response.focused;
+                        if !response.focused {
+                            // The field owns input for as long as the mode
+                            // is open: Tab completion and stray clicks move
+                            // lens focus, so pull it back.
+                            focus_widget(f, "location-path");
+                        }
+                        if response.clicked {
+                            go_location(state);
+                        }
                     } else {
                         breadcrumb(state, f);
                         f.flex(1.0);
                         f.spacer(0.0);
                         if icon_tool_button(f, "edit-location", state.dark, true, |f| {
-                            edit_icon(f, 16.0)
+                            edit_icon(f, metrics::ICON)
                         }) {
                             start_location_edit(state);
                         }
@@ -999,8 +883,8 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             if state.location_editing
                 && let Some(error) = state.location_error.clone()
             {
-                f.push_style(style::muted_style(state.dark));
-                f.label(&error);
+                f.push_style(style::error_style(state.dark));
+                f.label_sized(&error, metrics::FONT_SMALL);
                 f.pop_style();
             }
 
@@ -1008,19 +892,20 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             if state.creating_folder {
                 f.row_ex(
                     &LayoutOpts {
-                        gap: 8.0,
+                        gap: metrics::SPACE_S,
                         cross: Align::Center,
                         ..Default::default()
                     },
                     |f| {
                         f.label("Folder name:");
+                        f.size_next(260.0, metrics::FIELD_HEIGHT);
                         f.textfield_placeholder(
                             "folder-name",
                             &mut state.folder_name,
                             "New folder",
                         );
                         let response = f.response();
-                        folder_focused = response.focused;
+                        state.folder_field_focused = response.focused;
                         if state.folder_focus {
                             focus_widget(f, "folder-name");
                             state.folder_focus = false;
@@ -1028,15 +913,15 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         if response.clicked {
                             create_folder(state);
                         }
-                        f.size_next(80.0, 30.0);
+                        f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                         if f.button("Create") {
                             create_folder(state);
                         }
                     },
                 );
                 if let Some(error) = state.folder_error.clone() {
-                    f.push_style(style::muted_style(state.dark));
-                    f.label(&error);
+                    f.push_style(style::error_style(state.dark));
+                    f.label_sized(&error, metrics::FONT_SMALL);
                     f.pop_style();
                 }
             }
@@ -1045,30 +930,26 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             if state.request.mode == FileChooserMode::SaveFile {
                 f.row_ex(
                     &LayoutOpts {
-                        gap: 8.0,
+                        gap: metrics::SPACE_S,
                         cross: Align::Center,
                         ..Default::default()
                     },
                     |f| {
                         f.label("Name:");
                         f.flex(1.0);
-                        let name = state.name.clone();
-                        let response = edit_surface(
-                            state,
-                            f,
-                            "save-name",
-                            &name,
-                            state.name_caret,
-                            "File name",
-                            state.name_focused,
-                        );
-                        // Focus follows the pointer: clicking the field
-                        // focuses it, clicking anywhere else unfocuses it.
-                        let left = lens::sys::lens_mouse_button::LENS_MOUSE_LEFT as usize;
-                        if response.clicked {
-                            state.name_focused = true;
-                        } else if input.as_raw().mouse_pressed[left] && !response.hovered {
-                            state.name_focused = false;
+                        if state.name_caret_end {
+                            f.textfield_set_caret("save-name", u32::MAX);
+                            state.name_caret_end = false;
+                        }
+                        f.textfield_placeholder("save-name", &mut state.name, "File name");
+                        let response = f.response();
+                        state.name_field_focused = response.focused;
+                        if state.name_focus_pending {
+                            focus_widget(f, "save-name");
+                            state.name_focus_pending = false;
+                        }
+                        if response.clicked && accept_valid(state) {
+                            accept(state);
                         }
                     },
                 );
@@ -1077,7 +958,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             // ---- places sidebar + directory listing ---------------------
             f.row_ex(
                 &LayoutOpts {
-                    gap: 8.0,
+                    gap: metrics::SPACE_S,
                     flex: 1.0,
                     ..Default::default()
                 },
@@ -1085,8 +966,8 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.scroll("chooser-places", |f| {
                         f.column_ex(
                             &LayoutOpts {
-                                width: 148.0,
-                                gap: 2.0,
+                                width: metrics::SIDEBAR_WIDTH,
+                                gap: metrics::SPACE_XXS,
                                 ..Default::default()
                             },
                             |f| {
@@ -1104,50 +985,85 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                             ..Default::default()
                         },
                         |f| {
-                            f.flex(1.0);
-                            f.scroll("chooser-list", |f| {
-                                f.column_ex(
-                                    &LayoutOpts {
-                                        gap: 2.0,
-                                        ..Default::default()
-                                    },
-                                    |f| {
-                                        if let Some(error) = state.listing_error.clone() {
-                                            f.push_style(style::muted_style(state.dark));
-                                            f.label(&error);
-                                            f.pop_style();
-                                        }
-                                        if state.entries.is_empty() && state.listing_error.is_none()
-                                        {
-                                            f.push_style(style::muted_style(state.dark));
-                                            f.label("This folder is empty");
-                                            f.pop_style();
-                                        }
-                                        for index in 0..state.entries.len() {
-                                            entry_row(state, f, index, palette);
-                                        }
-                                    },
-                                );
-                            });
-                            if !state.typeahead.0.is_empty() {
-                                f.push_style(style::muted_style(state.dark));
-                                f.label(&format!("Search: {}", state.typeahead.0));
+                            if let Some(error) = state.listing_error.clone() {
+                                f.push_style(style::error_style(state.dark));
+                                f.label_sized(&error, metrics::FONT_SMALL);
                                 f.pop_style();
                             }
-                            // Measure the row stride for scroll-into-view,
-                            // then apply pending scroll requests.
-                            if let Some(bounds) = f.node_bounds("entry-0") {
-                                state.row_stride = bounds.h + 2.0;
+                            if state.entries.is_empty() && state.listing_error.is_none() {
+                                f.push_style(style::small_muted_style(state.dark));
+                                f.label_sized("This folder is empty", metrics::FONT_SMALL);
+                                f.pop_style();
                             }
-                            if state.scroll_top {
-                                state.scroll_top = false;
-                                f.scroll_to("chooser-list", 0.0, 0.0);
+                            f.flex(1.0);
+                            // The table's id derives from the directory, so
+                            // its retained scroll position is
+                            // per-directory (back/forward restores it).
+                            let table_id = format!("chooser-list:{}", state.dir.display());
+                            if state.table_focus_pending {
+                                focus_widget(f, &table_id);
+                                state.table_focus_pending = false;
                             }
-                            if let Some(index) = state.scroll_to_index.take()
-                                && state.row_stride > 0.0
+                            let mut cursor = state.focus_index.map_or(-1, |index| index as i32);
+                            let entries = &state.entries;
+                            let selected = &state.selected;
+                            let result = f.table_ex(
+                                &table_id,
+                                &[TableColumn {
+                                    title: "Name",
+                                    width: 0.0,
+                                    align: Align::Start,
+                                }],
+                                entries.len(),
+                                TableOpts {
+                                    row_height: metrics::ROW_HEIGHT,
+                                    show_header: false,
+                                    selectable: true,
+                                    zebra: false,
+                                    keyboard: true,
+                                },
+                                |row, _col| entries[row].name.clone(),
+                                |row, _col| {
+                                    Some(if entries[row].is_dir {
+                                        lens::sys::lens_icon_id::LENS_ICON_FOLDER
+                                    } else {
+                                        lens::sys::lens_icon_id::LENS_ICON_FILE
+                                    })
+                                },
+                                |row| selected.contains(&entries[row].path),
+                                &mut cursor,
+                            );
+                            // The table moved the cursor (arrows/Home/End,
+                            // or a clamp after the model shrank): selection
+                            // follows, matching GTK.
+                            let moved_to = (cursor >= 0).then_some(cursor as usize);
+                            if result.cursor_changed && moved_to != state.focus_index {
+                                if let Some(index) = moved_to {
+                                    focus_to(state, index);
+                                } else {
+                                    state.focus_index = None;
+                                }
+                            } else {
+                                state.focus_index = moved_to;
+                            }
+                            if let Some(row) = result.clicked_row {
+                                handle_click(state, row);
+                            }
+                            if result.activated
+                                && let Some(entry) = state
+                                    .focus_index
+                                    .and_then(|index| state.entries.get(index))
+                                    .cloned()
                             {
-                                let y = index as f32 * state.row_stride - 120.0;
-                                f.scroll_to("chooser-list", 0.0, y.max(0.0));
+                                activate_entry(state, &entry);
+                            }
+                            if !state.typeahead.0.is_empty() {
+                                f.push_style(style::small_muted_style(state.dark));
+                                f.label_sized(
+                                    &format!("Search: {}", state.typeahead.0),
+                                    metrics::FONT_SMALL,
+                                );
+                                f.pop_style();
                             }
                         },
                     );
@@ -1155,11 +1071,11 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             );
 
             if state.request.mode == FileChooserMode::SaveFiles {
-                f.push_style(style::muted_style(state.dark));
-                f.label(&format!(
-                    "New files will be created in {}",
-                    state.dir.display()
-                ));
+                f.push_style(style::small_muted_style(state.dark));
+                f.label_sized(
+                    &format!("New files will be created in {}", state.dir.display()),
+                    metrics::FONT_SMALL,
+                );
                 f.pop_style();
             }
 
@@ -1171,7 +1087,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             // ---- footer: filter + buttons --------------------------------
             f.row_ex(
                 &LayoutOpts {
-                    gap: 8.0,
+                    gap: metrics::SPACE_S,
                     cross: Align::Center,
                     ..Default::default()
                 },
@@ -1185,7 +1101,6 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         labels.truncate(16);
                         if f.dropdown(FILTER_DROPDOWN, &mut state.filter_index, &labels) {
                             state.focus_index = None;
-                            state.scroll_top = true;
                             state.reload = true;
                         }
                     }
@@ -1193,7 +1108,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.flex(1.0);
                     f.spacer(0.0);
 
-                    f.size_next(88.0, 30.0);
+                    f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                     f.push_style(style::secondary_button_style(state.dark));
                     let cancel = f.button("Cancel");
                     f.pop_style();
@@ -1202,7 +1117,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         return;
                     }
 
-                    f.size_next(96.0, 30.0);
+                    f.size_next(metrics::ACCEPT_WIDTH, metrics::CONTROL_HEIGHT);
                     let label = state
                         .request
                         .accept_label
@@ -1251,8 +1166,8 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             |f| {
                 f.column_ex(
                     &LayoutOpts {
-                        gap: 12.0,
-                        pad: 6.0,
+                        gap: metrics::SPACE_M,
+                        pad: metrics::SPACE_S,
                         ..Default::default()
                     },
                     |f| {
@@ -1262,14 +1177,14 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         ));
                         f.row_ex(
                             &LayoutOpts {
-                                gap: 8.0,
+                                gap: metrics::SPACE_S,
                                 cross: Align::Center,
                                 ..Default::default()
                             },
                             |f| {
                                 f.flex(1.0);
                                 f.spacer(0.0);
-                                f.size_next(88.0, 30.0);
+                                f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                                 f.push_style(style::secondary_button_style(state.dark));
                                 let cancel = f.button("Cancel");
                                 f.pop_style();
@@ -1277,7 +1192,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                                     f.modal_close(OVERWRITE_MODAL);
                                     state.confirm_overwrite = None;
                                 }
-                                f.size_next(96.0, 30.0);
+                                f.size_next(metrics::ACCEPT_WIDTH, metrics::CONTROL_HEIGHT);
                                 if f.button("Replace") {
                                     f.modal_close(OVERWRITE_MODAL);
                                     state.confirm_overwrite = None;
@@ -1291,18 +1206,11 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
         );
     }
 
-    state.field_focused = folder_focused;
-    // App-owned surfaces consume Return and caret keys; keep lens's own
-    // focus empty so no lens-focused widget also reacts.
-    if state.location_editing || state.name_focused {
-        f.clear_focus();
-    }
-
     // Backspace walks up one folder when no text field owns the key.
     if key_pressed(input, key::BACKSPACE)
         && !state.location_editing
-        && !state.name_focused
-        && !folder_focused
+        && !state.name_field_focused
+        && !state.folder_field_focused
         && !popup_open(state, f)
         && let Some(parent) = state.dir.parent().map(Path::to_path_buf)
     {
@@ -1346,7 +1254,7 @@ fn palette_active(state: &State) -> Color {
 }
 
 /// One breadcrumb segment: the root shows a drive glyph, folders show
-/// their (truncated) name.
+/// their name truncated to a measured pixel budget.
 fn crumb_button(
     state: &mut State,
     f: &mut Frame,
@@ -1357,21 +1265,22 @@ fn crumb_button(
 ) {
     let is_root = component.parent().is_none();
     let opts = LayoutOpts {
-        gap: 4.0,
-        pad: 4.0,
+        gap: metrics::SPACE_XS,
+        pad: metrics::SPACE_XS,
+        min_height: metrics::CRUMB_HEIGHT,
         cross: Align::Center,
         bg: if current {
             active_bg
         } else {
             Color::TRANSPARENT
         },
-        radius: 6.0,
+        radius: metrics::RADIUS,
         ..Default::default()
     };
-    let name = crumb_name(component);
+    let name = truncate_to_width(f, &crumb_name(component), metrics::CRUMB_MAX_W);
     let (response, ()) = f.pressable_row(&format!("crumb-{position}"), "", &opts, |f, _| {
         if is_root {
-            computer_icon(f, 14.0);
+            computer_icon(f, metrics::ICON_SMALL);
         } else {
             f.label(&name);
         }
@@ -1381,34 +1290,29 @@ fn crumb_button(
     }
 }
 
-/// A crumb's display text: the folder's name capped at 24 chars (the root
-/// crumb, drawn as an icon, would read "/").
+/// A crumb's display text: the folder's name (the root crumb, drawn as an
+/// icon, would read "/").
 fn crumb_name(component: &Path) -> String {
-    let name = component
+    component
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".to_owned());
-    if name.chars().count() > 24 {
-        let truncated: String = name.chars().take(21).collect();
-        format!("{truncated}…")
-    } else {
-        name
-    }
+        .unwrap_or_else(|| "/".to_owned())
 }
 
 /// One sidebar shortcut row, highlighted when it is the browsed folder.
 fn place_row(state: &mut State, f: &mut Frame, index: usize, place: &Place) {
     let active = state.dir == place.path;
     let opts = LayoutOpts {
-        gap: 8.0,
-        pad: 6.0,
+        gap: metrics::SPACE_S,
+        pad: metrics::SPACE_XS,
+        min_height: metrics::ROW_HEIGHT,
         cross: Align::Center,
         bg: if active {
             palette_active(state)
         } else {
             Color::TRANSPARENT
         },
-        radius: 6.0,
+        radius: metrics::RADIUS,
         ..Default::default()
     };
     let (response, ()) = f.pressable_row(&format!("place-{index}"), "", &opts, |f, _| {
@@ -1424,8 +1328,8 @@ fn place_row(state: &mut State, f: &mut Frame, index: usize, place: &Place) {
 fn place_icon(f: &mut Frame, icon: PlaceIcon) {
     use lens::sys::lens_icon_id as id;
     let icon = match icon {
-        PlaceIcon::Home => return home_icon(f, 16.0),
-        PlaceIcon::Computer => return computer_icon(f, 16.0),
+        PlaceIcon::Home => return home_icon(f, metrics::ICON),
+        PlaceIcon::Computer => return computer_icon(f, metrics::ICON),
         PlaceIcon::Desktop => id::LENS_ICON_MONITOR,
         PlaceIcon::Documents => id::LENS_ICON_FILE_TEXT,
         PlaceIcon::Downloads => id::LENS_ICON_DOWNLOAD,
@@ -1433,49 +1337,15 @@ fn place_icon(f: &mut Frame, icon: PlaceIcon) {
         PlaceIcon::Pictures => id::LENS_ICON_IMAGE,
         PlaceIcon::Videos => id::LENS_ICON_FILM,
     };
-    raw_icon(f, icon, 16.0);
-}
-
-/// One directory-listing row: icon, name, the selection/activation
-/// gestures for the mode, and the keyboard-cursor border when focused.
-fn entry_row(state: &mut State, f: &mut Frame, index: usize, palette: style::Palette) {
-    let entry = state.entries[index].clone();
-    let selected = state.selected.contains(&entry.path);
-    let focused = state.focus_index == Some(index);
-    let opts = LayoutOpts {
-        gap: 8.0,
-        pad: 4.0,
-        cross: Align::Center,
-        bg: if selected {
-            palette.active
-        } else {
-            Color::TRANSPARENT
-        },
-        border: if focused {
-            palette.accent
-        } else {
-            Color::TRANSPARENT
-        },
-        border_width: if focused { 1.0 } else { 0.0 },
-        radius: 6.0,
-        ..Default::default()
-    };
-    let (response, ()) = f.pressable_row(&format!("entry-{index}"), "", &opts, |f, _| {
-        if entry.is_dir {
-            folder_icon(f, 16.0);
-        } else {
-            file_icon(f, 16.0);
-        }
-        f.label(&entry.name);
-    });
-    if response.clicked {
-        handle_click(state, index, &entry);
-    }
+    raw_icon(f, icon, metrics::ICON);
 }
 
 /// Single click moves the keyboard cursor and selects (Ctrl toggles in
 /// multiple mode); double click enters a folder or opens a file directly.
-fn handle_click(state: &mut State, index: usize, entry: &Entry) {
+fn handle_click(state: &mut State, index: usize) {
+    let Some(entry) = state.entries.get(index).cloned() else {
+        return;
+    };
     state.focus_index = Some(index);
     let now = Instant::now();
     let double = state.last_click.as_ref().is_some_and(|(path, when)| {
@@ -1484,7 +1354,7 @@ fn handle_click(state: &mut State, index: usize, entry: &Entry) {
     state.last_click = Some((entry.path.clone(), now));
 
     if double {
-        activate_entry(state, entry);
+        activate_entry(state, &entry);
         return;
     }
     if entry.is_dir {
@@ -1538,7 +1408,7 @@ fn choice_row(state: &mut State, f: &mut Frame, index: usize) {
         ChoiceState::Options(selected) => {
             f.row_ex(
                 &LayoutOpts {
-                    gap: 8.0,
+                    gap: metrics::SPACE_S,
                     cross: Align::Center,
                     ..Default::default()
                 },
@@ -1605,12 +1475,248 @@ mod tests {
     }
 
     #[test]
-    fn crumb_names_cap_long_components() {
+    fn crumb_names_map_path_components() {
         assert_eq!(crumb_name(Path::new("/")), "/");
         assert_eq!(crumb_name(Path::new("/home/ming")), "ming");
-        let long = "a-very-long-folder-name-that-overflows";
-        let shown = crumb_name(Path::new("/tmp").join(long).as_path());
-        assert_eq!(shown.chars().count(), 22);
-        assert!(shown.ends_with('…'));
+    }
+}
+
+/// Headless interaction tests: the dialog's `build` runs on a headless
+/// lens `Ui` with synthetic inputs, exercising the real keyboard routing,
+/// the listing table's cursor/activation contract, and the lens text
+/// fields — no windowing system involved.
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use lens::{Input, Ui, key, mods};
+
+    /// A temporary directory tree for the dialog to browse: two folders
+    /// first (dirs sort first), then two files.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(name: &str) -> Fixture {
+            let root =
+                std::env::temp_dir().join(format!("aegis-fc-ui-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("alpha")).unwrap();
+            std::fs::create_dir_all(root.join("beta")).unwrap();
+            std::fs::write(root.join("notes.txt"), "n").unwrap();
+            std::fs::write(root.join("report.pdf"), "r").unwrap();
+            Fixture(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn request(mode: FileChooserMode, fixture: &Fixture) -> FileChooserRequest {
+        FileChooserRequest {
+            mode,
+            app_id: "dev.aegis.Test".to_owned(),
+            title: String::new(),
+            accept_label: None,
+            modal: false,
+            parent_window: None,
+            multiple: false,
+            current_folder: Some(BytePath::from(fixture.0.clone())),
+            current_name: None,
+            current_file: None,
+            filters: vec![],
+            current_filter: None,
+            choices: vec![],
+            files: vec![],
+        }
+    }
+
+    fn fresh_state(mode: FileChooserMode, fixture: &Fixture) -> State {
+        let mut state = State::new(request(mode, fixture));
+        state.reload_entries();
+        state
+    }
+
+    fn frame(ui: &mut Ui, state: &mut State, input: &Input) {
+        ui.frame(input, |f| build(state, f, input));
+    }
+
+    /// Idle frames so retained state (focus, the table's viewport) settles.
+    fn settle(ui: &mut Ui, state: &mut State) {
+        let input = Input::new((920.0, 540.0), 0.016);
+        for _ in 0..3 {
+            frame(ui, state, &input);
+        }
+    }
+
+    fn tap(ui: &mut Ui, state: &mut State, key: i32) {
+        let mut input = Input::new((920.0, 540.0), 0.016);
+        input.push_key(key, true, false);
+        frame(ui, state, &input);
+    }
+
+    fn tap_with_mods(ui: &mut Ui, state: &mut State, key: i32, mask: u32) {
+        let mut input = Input::new((920.0, 540.0), 0.016);
+        input.set_mods(mask);
+        input.push_key(key, true, false);
+        frame(ui, state, &input);
+    }
+
+    fn type_text(ui: &mut Ui, state: &mut State, text: &str) {
+        let mut input = Input::new((920.0, 540.0), 0.016);
+        input.set_text(text);
+        frame(ui, state, &input);
+    }
+
+    fn selected_paths(state: &State) -> Vec<PathBuf> {
+        state.selected.iter().cloned().collect()
+    }
+
+    #[test]
+    fn table_keyboard_drives_cursor_selection_and_activation() {
+        let fixture = Fixture::new("kbd");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        settle(&mut ui, &mut state);
+        assert_eq!(state.focus_index, None);
+
+        // Rows: alpha/ beta/ notes.txt report.pdf (dirs first). The table
+        // is focused by default, so arrows move its cursor.
+        tap(&mut ui, &mut state, key::DOWN);
+        assert_eq!(state.focus_index, Some(0));
+        tap(&mut ui, &mut state, key::DOWN);
+        assert_eq!(state.focus_index, Some(1));
+        tap(&mut ui, &mut state, key::DOWN);
+        assert_eq!(state.focus_index, Some(2));
+        // Selection follows the cursor onto files.
+        assert_eq!(selected_paths(&state), vec![fixture.0.join("notes.txt")]);
+
+        tap(&mut ui, &mut state, key::END);
+        assert_eq!(state.focus_index, Some(3));
+        tap(&mut ui, &mut state, key::HOME);
+        assert_eq!(state.focus_index, Some(0));
+
+        // Enter activates the cursor row: a folder navigates.
+        tap(&mut ui, &mut state, key::RETURN);
+        assert_eq!(state.dir, fixture.0.join("alpha"));
+        assert_eq!(state.focus_index, None);
+
+        // Enter on a file accepts the dialog.
+        tap(&mut ui, &mut state, key::END);
+        tap(&mut ui, &mut state, key::UP);
+        tap(&mut ui, &mut state, key::UP);
+        // alpha/ is the only entry; go back up for a file instead.
+        state.navigate(fixture.0.clone());
+        settle(&mut ui, &mut state);
+        tap(&mut ui, &mut state, key::DOWN);
+        tap(&mut ui, &mut state, key::DOWN);
+        tap(&mut ui, &mut state, key::DOWN);
+        assert_eq!(state.focus_index, Some(2));
+        tap(&mut ui, &mut state, key::RETURN);
+        match &state.done {
+            Some(FileChooserResponse::Selected { paths, .. }) => {
+                assert_eq!(
+                    paths,
+                    &vec![BytePath::from(fixture.0.join("notes.txt"))]
+                );
+            }
+            other => panic!("expected selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typeahead_jumps_the_cursor() {
+        let fixture = Fixture::new("typeahead");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        settle(&mut ui, &mut state);
+
+        type_text(&mut ui, &mut state, "rep");
+        assert_eq!(state.focus_index, Some(3));
+        assert_eq!(selected_paths(&state), vec![fixture.0.join("report.pdf")]);
+    }
+
+    #[test]
+    fn ctrl_space_toggles_multi_selection() {
+        let fixture = Fixture::new("multi");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        state.request.multiple = true;
+        settle(&mut ui, &mut state);
+
+        tap(&mut ui, &mut state, key::DOWN);
+        tap(&mut ui, &mut state, key::DOWN);
+        tap(&mut ui, &mut state, key::DOWN);
+        assert_eq!(selected_paths(&state), vec![fixture.0.join("notes.txt")]);
+        // Ctrl+Down moves only the cursor; Ctrl+Space toggles its row.
+        tap_with_mods(&mut ui, &mut state, key::DOWN, mods::CTRL);
+        assert_eq!(state.focus_index, Some(3));
+        assert_eq!(selected_paths(&state), vec![fixture.0.join("notes.txt")]);
+        tap_with_mods(&mut ui, &mut state, ' ' as i32, mods::CTRL);
+        let mut expected = vec![fixture.0.join("notes.txt"), fixture.0.join("report.pdf")];
+        expected.sort();
+        assert_eq!(selected_paths(&state), expected);
+    }
+
+    #[test]
+    fn location_field_completes_and_navigates() {
+        let fixture = Fixture::new("location");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        settle(&mut ui, &mut state);
+
+        tap_with_mods(&mut ui, &mut state, 'l' as i32, mods::CTRL);
+        assert!(state.location_editing);
+        // The seeded path is the browsed folder; typing appends at the end.
+        settle(&mut ui, &mut state);
+        type_text(&mut ui, &mut state, "/al");
+        tap(&mut ui, &mut state, key::TAB);
+        let completed = state.location.as_str().into_owned();
+        assert!(
+            completed.ends_with("alpha/"),
+            "unexpected completion: {completed}"
+        );
+        // Tab moved lens focus away; completion pulls it back, then Return
+        // resolves the path.
+        settle(&mut ui, &mut state);
+        tap(&mut ui, &mut state, key::RETURN);
+        assert_eq!(state.dir, fixture.0.join("alpha"));
+        assert!(!state.location_editing);
+    }
+
+    #[test]
+    fn save_name_prefilled_with_caret_at_end() {
+        let fixture = Fixture::new("savename");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::SaveFile, &fixture);
+        state.name.set("report.pdf");
+        state.name_focus_pending = true;
+        settle(&mut ui, &mut state);
+        assert!(state.name_field_focused);
+
+        type_text(&mut ui, &mut state, "x");
+        assert_eq!(state.name.as_str(), "report.pdfx");
+
+        tap(&mut ui, &mut state, key::RETURN);
+        match &state.done {
+            Some(FileChooserResponse::Selected { paths, .. }) => {
+                assert_eq!(
+                    paths,
+                    &vec![BytePath::from(fixture.0.join("report.pdfx"))]
+                );
+            }
+            other => panic!("expected selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_cancels() {
+        let fixture = Fixture::new("escape");
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        settle(&mut ui, &mut state);
+        tap(&mut ui, &mut state, key::ESCAPE);
+        assert!(matches!(state.done, Some(FileChooserResponse::Cancelled)));
     }
 }

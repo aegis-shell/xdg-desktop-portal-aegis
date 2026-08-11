@@ -94,6 +94,24 @@ The fake prompter records every request the daemon issues as
 replay a realistic, backend-generated request through the real UI in the
 direct setup above.
 
+### Headless UI Interaction Tests
+
+The prompter's `ui_tests` unit tests (e.g.
+`ui::file_chooser::ui_tests`) run the dialog's real per-frame `build`
+closure on a headless lens `Ui` with synthetic input — key presses,
+modifier chords, and text commits — and assert the resulting state:
+the listing table's cursor/selection/activation contract, typeahead,
+Ctrl+Space multi-select, location-field Tab completion and navigation,
+the pre-filled save name's caret, and Escape cancellation:
+
+```bash
+cargo test -p aegis-portal-prompter
+```
+
+They need no Wayland display, compositor, or D-Bus session (the lens
+text stack still discovers fonts through fontconfig), so they run in CI
+with the rest of the unit tests.
+
 ### Synthetic Interaction Tests
 
 To verify buttons and keyboard interaction in the real lens dialog (not

@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Full IME support in the prompter's app-owned text fields (the location
+  path, save-name, and secret surfaces). They now render the in-progress
+  composition (preedit) inline — accent text underlined, caret inside at
+  the composition's own cursor — apply the IME's
+  `delete_surrounding_text` requests, and report the caret rectangle every
+  focused frame through `lens_set_caret_rect`, so the input method's
+  candidate window anchors at the caret instead of falling back to a
+  default screen position. The secret field masks the composition too, so
+  a preedit never echoes the password.
+
+### Changed
+
+- Rebuild the FileChooser's text fields and directory listing on new
+  optics host-control APIs instead of app-owned implementations. The
+  location and save-name fields are plain lens text fields; after a
+  programmatic rewrite (Tab completion, a pre-filled name) the caret is
+  moved through `lens_textfield_set_caret` (optics ADR-0064), with the
+  setter applied in the field's own id scope at build time. The listing
+  is now a virtualized `lens_table` (optics ADR-0066) with a keyboard
+  cursor, per-cell folder/file icons, host-owned selection, and a
+  per-directory scroll position (back/forward restores it); IME preedit
+  and candidate-window anchoring on those fields now come from the
+  toolkit itself. The dialog's headless interaction tests drive the real
+  build path on a `Ui::headless` with synthetic input. Note: this
+  consumes optics APIs added after v0.0.13, so local optics mode
+  (`.cargo/config.toml`) is required until the next optics tag.
+- Put the prompter dialogs on one design-token grid (`ui::style::metrics`):
+  a 4 px spacing scale, paired control heights (text fields 36, buttons
+  and toolbar buttons 32, listing and sidebar rows 32 minimum), a single
+  corner radius, and type roles (body 14, dialog title 17, small 12.5 for
+  hints, typeahead, and inline errors — the latter now in a danger color
+  instead of muted gray). The location toolbar is pinned to the field
+  height so swapping breadcrumbs for the path field no longer shifts the
+  dialog; breadcrumb names truncate to a measured pixel budget rather
+  than a character count; and keyboard navigation keeps the focused row
+  inside the viewport with ensure-visible scrolling instead of a fixed
+  pixel lead.
+
 ### Fixed
 
 - ScreenCast no longer delivers a scrambled picture to consumers that

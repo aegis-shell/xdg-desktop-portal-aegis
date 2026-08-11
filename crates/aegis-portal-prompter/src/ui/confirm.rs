@@ -5,7 +5,7 @@
 use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptResult};
 use lens::{Align, Frame, Input, LayoutOpts};
 
-use super::style;
+use super::style::{self, metrics};
 use super::{close_window, display_size, escape_pressed, run_window, window_title};
 
 struct State {
@@ -35,11 +35,11 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
         return;
     }
 
-    let width = display_size(input).0 - 32.0;
+    let width = display_size(input).0 - 2.0 * metrics::SPACE_L;
     f.column_ex(
         &LayoutOpts {
-            gap: 12.0,
-            pad: 16.0,
+            gap: metrics::SPACE_M,
+            pad: metrics::SPACE_L,
             ..Default::default()
         },
         |f| {
@@ -56,7 +56,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
 
             f.row_ex(
                 &LayoutOpts {
-                    gap: 8.0,
+                    gap: metrics::SPACE_S,
                     cross: Align::Center,
                     ..Default::default()
                 },
@@ -64,7 +64,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.flex(1.0);
                     f.spacer(0.0);
 
-                    f.size_next(88.0, 30.0);
+                    f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                     f.push_style(style::secondary_button_style(state.dark));
                     let cancel = f.button("Cancel");
                     f.pop_style();
@@ -73,7 +73,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         return;
                     }
 
-                    f.size_next(96.0, 30.0);
+                    f.size_next(metrics::ACCEPT_WIDTH, metrics::CONTROL_HEIGHT);
                     let accept = state
                         .request
                         .accept_label

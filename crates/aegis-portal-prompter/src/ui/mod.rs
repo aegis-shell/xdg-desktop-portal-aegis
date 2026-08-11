@@ -10,6 +10,7 @@ pub mod style;
 
 use iris::{Application, Config, Frame, Input, PaintHost};
 use lens::{key, mods};
+use style::metrics;
 
 /// The stable desktop application id reported to the compositor.
 pub const APP_ID: &str = "dev.aegis.PortalPrompter";
@@ -82,10 +83,56 @@ pub fn command_held(input: &Input) -> bool {
 
 /// Text committed this frame (typed characters, IME results).
 pub fn committed_text(input: &Input) -> String {
+    c_field_text(&input.as_raw().text_utf8)
+}
+
+/// The in-progress IME composition (preedit) reported for this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preedit {
+    /// The composition text (e.g. the pinyin being converted).
+    pub text: String,
+    /// Caret as a byte index into `text`, always on a char boundary.
+    pub cursor: usize,
+    /// The active clause as a byte range into `text` (the segment the IME
+    /// highlights as the conversion target).
+    pub sel: (usize, usize),
+}
+
+/// The IME's in-progress composition this frame, if any. The app-owned edit
+/// surfaces render this inline (underlined) and anchor the IME's candidate
+/// window at it, mirroring lens's own textfield.
+pub fn preedit(input: &Input) -> Option<Preedit> {
     let raw = input.as_raw();
-    let bytes = &raw.text_utf8;
-    let len = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
-    let bytes: Vec<u8> = bytes[..len].iter().map(|&c| c as u8).collect();
+    let text = c_field_text(&raw.preedit_utf8);
+    if text.is_empty() {
+        return None;
+    }
+    let clamp = |offset: u32| -> usize {
+        let mut offset = (offset as usize).min(text.len());
+        while offset > 0 && !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    };
+    Some(Preedit {
+        cursor: clamp(raw.preedit_cursor),
+        sel: (clamp(raw.preedit_sel_lo), clamp(raw.preedit_sel_hi)),
+        text,
+    })
+}
+
+/// The surrounding-text deletion the IME requested this frame, as byte
+/// counts before and after the caret (`zwp_text_input_v3`
+/// `delete_surrounding_text`); `(0, 0)` means none.
+pub fn ime_delete(input: &Input) -> (u32, u32) {
+    let raw = input.as_raw();
+    (raw.ime_delete_before, raw.ime_delete_after)
+}
+
+/// Decode a NUL-terminated UTF-8 C field from the input snapshot.
+fn c_field_text(field: &[std::ffi::c_char]) -> String {
+    let len = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+    let bytes: Vec<u8> = field[..len].iter().map(|&c| c as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -101,6 +148,29 @@ pub fn close_window() {
     // SAFETY: called from inside the per-frame build callback on the run
     // thread; outside a run it is a documented no-op.
     unsafe { iris::sys::iris_window_close() };
+}
+
+/// Truncate `text` to fit `max_width` logical pixels at body size, adding
+/// an ellipsis when anything is dropped. Measurement goes through the same
+/// shaping seam the labels render with.
+pub fn truncate_to_width(frame: &Frame, text: &str, max_width: f32) -> String {
+    const ELLIPSIS: &str = "…";
+    if frame.measure_text(text, metrics::FONT_BODY).width <= max_width {
+        return text.to_owned();
+    }
+    let budget = max_width - frame.measure_text(ELLIPSIS, metrics::FONT_BODY).width;
+    let mut kept = String::new();
+    for ch in text.chars() {
+        if frame
+            .measure_text(&format!("{kept}{ch}"), metrics::FONT_BODY)
+            .width
+            > budget
+        {
+            break;
+        }
+        kept.push(ch);
+    }
+    format!("{kept}{ELLIPSIS}")
 }
 
 /// Move keyboard focus to the widget built with `id` as its label (e.g. to
@@ -129,16 +199,6 @@ pub fn raw_icon(frame: &mut Frame, id: lens::sys::lens_icon_id, size: f32) {
 /// The "go to parent folder" glyph.
 pub fn parent_icon(frame: &mut Frame, size: f32) {
     raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_ARROW_UP, size);
-}
-
-/// The folder glyph for file-list rows.
-pub fn folder_icon(frame: &mut Frame, size: f32) {
-    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_FOLDER, size);
-}
-
-/// The plain file glyph for file-list rows.
-pub fn file_icon(frame: &mut Frame, size: f32) {
-    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_FILE, size);
 }
 
 /// The home glyph for the location toolbar.

@@ -6,21 +6,18 @@
 //! the dialog owns the real secret and its caret, renders bullet glyphs
 //! itself, and consumes text and editing keys straight from the per-frame
 //! input snapshot. The real value is zeroized on drop and never reaches the
-//! clipboard.
+//! clipboard. IME compositions are masked too, so a preedit never echoes
+//! the secret's content.
 
 use aegis_portal_prompter::{PromptResult, SecretRequest, SecretResponse};
-use lens::{Align, Frame, Input, LayoutOpts, key};
+use lens::{Frame, Input, LayoutOpts, key};
 use zeroize::Zeroizing;
 
 use super::edit;
-use super::style;
+use super::style::{self, metrics};
 use super::{
-    close_window, command_held, committed_text, display_size, escape_pressed, key_down,
-    key_pressed, run_window, window_title,
+    close_window, display_size, escape_pressed, key_pressed, preedit, run_window, window_title,
 };
-
-/// The mask glyph drawn per typed character.
-const MASK: &str = "•";
 
 struct State {
     request: SecretRequest,
@@ -56,11 +53,11 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
         return;
     }
 
-    let width = display_size(input).0 - 32.0;
+    let width = display_size(input).0 - 2.0 * metrics::SPACE_L;
     f.column_ex(
         &LayoutOpts {
-            gap: 10.0,
-            pad: 16.0,
+            gap: metrics::SPACE_M,
+            pad: metrics::SPACE_L,
             ..Default::default()
         },
         |f| {
@@ -79,39 +76,20 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                 f.pop_style();
             }
 
-            let palette = style::palette(state.dark);
-            let field = LayoutOpts {
-                height: 34.0,
-                pad: 8.0,
-                cross: Align::Center,
-                bg: palette.field,
-                border: if state.focused {
-                    palette.accent
-                } else {
-                    palette.border
+            let composition = if state.focused { preedit(input) } else { None };
+            let response = edit::edit_surface(
+                f,
+                state.dark,
+                edit::EditSurface {
+                    id: "secret-field",
+                    text: &state.secret,
+                    caret: state.caret,
+                    placeholder: "Password",
+                    focused: state.focused,
+                    preedit: composition.as_ref(),
+                    masked: true,
                 },
-                border_width: 1.0,
-                radius: 8.0,
-                ..Default::default()
-            };
-            let (response, ()) = f.pressable_row("secret-field", "", &field, |f, _| {
-                let before = state.secret[..state.caret].chars().count();
-                let after = state.secret[state.caret..].chars().count();
-                if before + after == 0 {
-                    f.push_style(style::muted_style(state.dark));
-                    f.label("Password");
-                    f.pop_style();
-                }
-                if before > 0 {
-                    f.label(&MASK.repeat(before));
-                }
-                if state.focused {
-                    f.row_ex(&edit::caret_bar(palette.text), |_| {});
-                }
-                if after > 0 {
-                    f.label(&MASK.repeat(after));
-                }
-            });
+            );
 
             // Focus follows the pointer: clicking the field focuses it,
             // clicking anywhere else unfocuses it.
@@ -127,15 +105,15 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
 
             f.row_ex(
                 &LayoutOpts {
-                    gap: 8.0,
-                    cross: Align::Center,
+                    gap: metrics::SPACE_S,
+                    cross: lens::Align::Center,
                     ..Default::default()
                 },
                 |f| {
                     f.flex(1.0);
                     f.spacer(0.0);
 
-                    f.size_next(88.0, 30.0);
+                    f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                     f.push_style(style::secondary_button_style(state.dark));
                     let cancel = f.button("Cancel");
                     f.pop_style();
@@ -144,7 +122,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         return;
                     }
 
-                    f.size_next(96.0, 30.0);
+                    f.size_next(metrics::ACCEPT_WIDTH, metrics::CONTROL_HEIGHT);
                     if f.button("Unlock") && state.done.is_none() {
                         submit(state);
                     }
@@ -161,36 +139,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
     }
 }
 
-/// Apply this frame's text and editing keys to the owned secret.
+/// Apply this frame's input to the owned secret.
 fn edit_secret(state: &mut State, f: &mut Frame, input: &Input) {
-    let text = committed_text(input);
-    if !text.is_empty() {
-        edit::insert(&mut state.secret, &mut state.caret, &text);
-    }
-    if key_down(input, key::BACKSPACE) {
-        edit::delete_backward(&mut state.secret, &mut state.caret);
-    }
-    if key_down(input, key::DELETE) {
-        edit::delete_forward(&mut state.secret, &mut state.caret);
-    }
-    if key_down(input, key::LEFT) {
-        state.caret = edit::prev_boundary(&state.secret, state.caret);
-    }
-    if key_down(input, key::RIGHT) {
-        state.caret = edit::next_boundary(&state.secret, state.caret);
-    }
-    if key_down(input, key::HOME) {
-        state.caret = 0;
-    }
-    if key_down(input, key::END) {
-        state.caret = state.secret.len();
-    }
-    if command_held(input) && key_pressed(input, 'v' as i32) {
-        f.request_paste();
-    }
-    if let Some(paste) = f.take_paste() {
-        edit::insert(&mut state.secret, &mut state.caret, &paste);
-    }
+    edit::edit_keys(&mut state.secret, &mut state.caret, f, input);
     if key_pressed(input, key::RETURN) && state.done.is_none() {
         submit(state);
     }
