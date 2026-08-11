@@ -29,9 +29,8 @@ All notable changes to this project are documented in this file.
   per-directory scroll position (back/forward restores it); IME preedit
   and candidate-window anchoring on those fields now come from the
   toolkit itself. The dialog's headless interaction tests drive the real
-  build path on a `Ui::headless` with synthetic input. Note: this
-  consumes optics APIs added after v0.0.13, so local optics mode
-  (`.cargo/config.toml`) is required until the next optics tag.
+  build path on a `Ui::headless` with synthetic input. These APIs ship
+  in the tagged optics v0.0.14 release.
 - Put the prompter dialogs on one design-token grid (`ui::style::metrics`):
   a 4 px spacing scale, paired control heights (text fields 36, buttons
   and toolbar buttons 32, listing and sidebar rows 32 minimum), a single
