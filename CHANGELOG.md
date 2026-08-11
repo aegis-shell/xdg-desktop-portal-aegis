@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-08-11
+
 ### Added
 
 - Rework the FileChooser dialog after GTK's file chooser. A places
@@ -208,7 +210,8 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.8
 [0.0.7]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.7
 [0.0.6]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.6
 [0.0.5]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.5
