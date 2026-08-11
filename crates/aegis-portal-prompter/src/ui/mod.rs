@@ -2,8 +2,9 @@
 //! wrapper, per-frame input helpers, and the small `unsafe` island every
 //! raw FFI call is funneled through.
 
-pub mod chooser;
 pub mod confirm;
+pub mod edit;
+pub mod file_chooser;
 pub mod secret;
 pub mod style;
 
@@ -102,6 +103,21 @@ pub fn close_window() {
     unsafe { iris::sys::iris_window_close() };
 }
 
+/// Move keyboard focus to the widget built with `id` as its label (e.g. to
+/// focus a text field the frame it appears). The dialogs build no
+/// `push_id` scopes, so the flat label resolves to the widget's id hash.
+pub fn focus_widget(frame: &mut Frame, id: &str) {
+    let Ok(id) = std::ffi::CString::new(id) else {
+        return;
+    };
+    // SAFETY: the frame is live for the build callback; `id` outlives both
+    // calls.
+    unsafe {
+        let widget = lens::sys::lens_current_id(frame.as_raw(), id.as_ptr());
+        lens::sys::lens_set_focus(frame.as_raw(), widget);
+    }
+}
+
 /// Draw an icon from the full C icon set that the safe `lens::Icon` enum
 /// does not surface (folders, files, navigation arrows).
 pub fn raw_icon(frame: &mut Frame, id: lens::sys::lens_icon_id, size: f32) {
@@ -128,4 +144,29 @@ pub fn file_icon(frame: &mut Frame, size: f32) {
 /// The home glyph for the location toolbar.
 pub fn home_icon(frame: &mut Frame, size: f32) {
     raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_HOME, size);
+}
+
+/// The "back in history" glyph for the location toolbar.
+pub fn back_icon(frame: &mut Frame, size: f32) {
+    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_ARROW_LEFT, size);
+}
+
+/// The "forward in history" glyph for the location toolbar.
+pub fn forward_icon(frame: &mut Frame, size: f32) {
+    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_ARROW_RIGHT, size);
+}
+
+/// The "create folder" glyph for the location toolbar.
+pub fn new_folder_icon(frame: &mut Frame, size: f32) {
+    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_FOLDER_PLUS, size);
+}
+
+/// The pencil glyph for the "type a path" toggle.
+pub fn edit_icon(frame: &mut Frame, size: f32) {
+    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_EDIT_2, size);
+}
+
+/// The drive glyph for the filesystem root (breadcrumb and places).
+pub fn computer_icon(frame: &mut Frame, size: f32) {
+    raw_icon(frame, lens::sys::lens_icon_id::LENS_ICON_HARD_DRIVE, size);
 }

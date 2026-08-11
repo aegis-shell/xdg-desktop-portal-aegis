@@ -46,7 +46,7 @@ the window. No bus, daemon, or display server setup is required.
 A confirmation dialog:
 
 ```bash
-printf '%s' '{"version":2,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
+printf '%s' '{"version":3,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -54,20 +54,28 @@ A secret prompt (masked editing: typing, Backspace, caret keys, Ctrl+V,
 Enter to submit):
 
 ```bash
-printf '%s' '{"version":2,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
+printf '%s' '{"version":3,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
 A file chooser with a filter and multi-selection:
 
 ```bash
-printf '%s' '{"version":2,"prompt":{"kind":"selection","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
+printf '%s' '{"version":3,"prompt":{"kind":"file_chooser","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
-Selection requests also accept `open_directory` and `save_files` (the
-latter requires a non-empty `files` list of suggested basenames), plus a
-`save_file` mode with `current_name` and embedded `choices`. Set
+A save dialog — the download-location prompt a browser raises before
+writing a download — with a suggested file name:
+
+```bash
+printf '%s' '{"version":3,"prompt":{"kind":"file_chooser","request":{"mode":"save_file","app_id":"dev.aegis.Test","title":"Save Download","accept_label":null,"modal":false,"parent_window":null,"multiple":false,"current_folder":null,"current_name":"report.pdf","current_file":null,"filters":[],"current_filter":null,"choices":[],"files":[]}}}' \
+  | ./target/debug/aegis-portal-prompter; echo
+```
+
+File chooser requests also accept `open_directory` and `save_files` (the
+latter requires a non-empty `files` list of suggested basenames), and
+any mode can embed `choices` controls. Set
 `RUST_LOG=debug` to trace failures; the dialog reports a `failed`
 response instead of crashing when no Wayland display is available.
 
@@ -85,6 +93,23 @@ The fake prompter records every request the daemon issues as
 `request-N.json` in its fixture directory. Capture one of those files to
 replay a realistic, backend-generated request through the real UI in the
 direct setup above.
+
+### Synthetic Interaction Tests
+
+To verify buttons and keyboard interaction in the real lens dialog (not
+just rendering), drive it through the compositor's Agent Interaction
+Domain (`aegis-mcp serve`, see the Aegis repository's `aegis-mcp`
+reference): launch the prompter from the direct setup, transfer its
+window into the domain with `interaction_domain_transfer_window`, then
+cycle `interaction_domain_observe` → `interaction_domain_input` batches
+and confirm with `interaction_domain_capture`. Input is window-local:
+pointer actions take logical pixel coordinates relative to the window's
+reported local extent, and `key_press` actions take Linux evdev codes
+(single press+release only — modifier chords cannot be composed, so
+prefer flows that do not need Ctrl/Shift). Each input call must carry the
+single-use token from the immediately preceding observation; captures
+invalidate observations asynchronously, so leave a beat between a capture
+and the next input batch.
 
 ## Compositor Chrome Tests
 
@@ -109,19 +134,37 @@ AEGIS_PORTAL_PROMPTER=$PWD/target/debug/aegis-portal-prompter \
 
 The daemon still connects to the running compositor's IPC socket for
 compositor-owned requests, so run this inside the session under test.
-Issue real portal calls and interact with the window:
+
+Every impl method takes its request handle as the first argument: the
+caller chooses the object path, and reusing an active path is rejected.
+The public frontend normally synthesizes these paths from `handle_token`
+options; a direct impl call supplies them explicitly. Issue real portal
+calls and interact with the window:
 
 ```bash
 # Prompter: file browser and confirmation dialog
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
   -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.FileChooser.OpenFile \
-  "" "Open File" "{'handle_token': <'t1'>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/t1' \
+  'dev.aegis.Test' '' 'Open File' {}
 
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
   -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.Account.GetUserInformation \
-  "" "{'handle_token': <'t2'>, 'reason': <'smoke'>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/t2' \
+  'dev.aegis.Test' '' "{'reason': <'smoke'>}"
+```
+
+The save dialog — the download-location prompt — is `SaveFile` with a
+suggested name:
+
+```bash
+gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
+  -o /org/freedesktop/portal/desktop \
+  -m org.freedesktop.impl.portal.FileChooser.SaveFile \
+  '/org/freedesktop/portal/desktop/request/gdbus/t5' \
+  'dev.aegis.Test' '' 'Save Download' {'current_name': <'report.pdf'>}
 ```
 
 ```bash
@@ -129,35 +172,46 @@ gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
   -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.Screenshot.Screenshot \
-  "" "{'handle_token': <'t3'>, 'interactive': <true>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/t3' \
+  'dev.aegis.Test' '' "{'interactive': <true>}"
 
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
   -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.Screenshot.PickColor \
-  "" "{'handle_token': <'t4'>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/t4' \
+  'dev.aegis.Test' '' {}
 ```
 
 The ScreenCast picker requires the session dance before the compositor
-chrome appears at `SelectSources`:
+chrome appears at `SelectSources`. The session handle is the second
+argument to both calls:
 
 ```bash
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
   -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.ScreenCast.CreateSession \
-  "{'handle_token': <'s1'>, 'session_handle_token': <'s1'>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/s1' \
+  '/org/freedesktop/portal/desktop/session/gdbus/s1' \
+  'dev.aegis.Test' {}
 
 gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
-  -o /org/freedesktop/portal/desktop/request/... \
+  -o /org/freedesktop/portal/desktop \
   -m org.freedesktop.impl.portal.ScreenCast.SelectSources \
-  /org/freedesktop/portal/desktop/session/... \
-  "{'handle_token': <'s2'>}"
+  '/org/freedesktop/portal/desktop/request/gdbus/s2' \
+  '/org/freedesktop/portal/desktop/session/gdbus/s1' \
+  'dev.aegis.Test' {}
 ```
 
-Portal results arrive asynchronously as `Request.Response` signals;
-observe them with
-`dbus-monitor "interface='org.freedesktop.impl.portal.Request'"` while
-answering the dialog. Read the session and request object paths from the
-signal payloads or the daemon log.
+Each impl method returns its `(response, results)` tuple once the dialog
+closes, so `gdbus` prints the outcome directly. To exercise cancellation,
+call `Close` on the request handle from a second shell while the dialog
+is open:
+
+```bash
+gdbus call --session -d org.freedesktop.impl.portal.desktop.aegis \
+  -o /org/freedesktop/portal/desktop/request/gdbus/t1 \
+  -m org.freedesktop.impl.portal.Request.Close
+```
 
 ## What Each Setup Covers
 

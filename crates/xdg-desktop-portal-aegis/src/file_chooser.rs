@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
 use aegis_portal_prompter::{
-    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PromptResult, PrompterRequest,
-    SelectionMode, SelectionRequest, SelectionResponse,
+    BytePath, Choice, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter,
+    FilterRule, FilterRuleKind, PromptResult, PrompterRequest,
 };
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
 use zbus::zvariant::{ObjectPath, Value};
@@ -26,7 +26,7 @@ const MAX_ACTIVE_FILE_CHOOSERS: usize = 32;
 pub(crate) enum FileChooserJob {
     Choose {
         request_path: String,
-        request: SelectionRequest,
+        request: FileChooserRequest,
         reply: ResponseSender,
     },
 }
@@ -48,11 +48,11 @@ impl FileChooserIface {
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        let request = SelectionRequest {
+        let request = FileChooserRequest {
             mode: if parsed.directory {
-                SelectionMode::OpenDirectory
+                FileChooserMode::OpenDirectory
             } else {
-                SelectionMode::OpenFile
+                FileChooserMode::OpenFile
             },
             app_id: app_id.to_owned(),
             title: title.to_owned(),
@@ -80,8 +80,8 @@ impl FileChooserIface {
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        let request = SelectionRequest {
-            mode: SelectionMode::SaveFile,
+        let request = FileChooserRequest {
+            mode: FileChooserMode::SaveFile,
             app_id: app_id.to_owned(),
             title: title.to_owned(),
             accept_label: parsed.accept_label,
@@ -108,8 +108,8 @@ impl FileChooserIface {
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let parsed = parse_options(&options);
-        let request = SelectionRequest {
-            mode: SelectionMode::SaveFiles,
+        let request = FileChooserRequest {
+            mode: FileChooserMode::SaveFiles,
             app_id: app_id.to_owned(),
             title: title.to_owned(),
             accept_label: parsed.accept_label,
@@ -132,7 +132,7 @@ impl FileChooserIface {
     async fn choose(
         &self,
         handle: ObjectPath<'_>,
-        request: SelectionRequest,
+        request: FileChooserRequest,
     ) -> zbus::fdo::Result<PortalResponse> {
         let path = handle.as_str().to_owned();
         log::info!(
@@ -176,7 +176,7 @@ impl FileChooserIface {
 
 /// Validate before enqueueing so a hostile request cannot multiply a large
 /// D-Bus payload across the bounded worker queue.
-fn validate_request(request: &SelectionRequest) -> Result<(), String> {
+fn validate_request(request: &FileChooserRequest) -> Result<(), String> {
     request.validate()?;
     let encoded = serde_json::to_vec(request)
         .map_err(|error| format!("could not encode FileChooser request: {error}"))?;
@@ -234,7 +234,7 @@ pub(crate) fn file_chooser_worker(
 fn run_pick(
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
-    request: SelectionRequest,
+    request: FileChooserRequest,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if tracker.lock().unwrap().was_closed(request_path) {
         return cancelled();
@@ -246,7 +246,7 @@ fn run_pick(
 
     let app_id = request.app_id.clone();
     match invoke_prompter(tracker, request_path, &request) {
-        Ok(response @ SelectionResponse::Selected { .. }) => {
+        Ok(response @ FileChooserResponse::Selected { .. }) => {
             // Request.Close wins a race with a completed child response.
             if tracker.lock().unwrap().was_closed(request_path) {
                 return cancelled();
@@ -255,7 +255,7 @@ fn run_pick(
                 log::warn!("portal: invalid FileChooser response for '{app_id}': {error}");
                 return failed();
             }
-            let SelectionResponse::Selected {
+            let FileChooserResponse::Selected {
                 paths,
                 current_filter,
                 choices,
@@ -267,8 +267,8 @@ fn run_pick(
             log::info!("portal: FileChooser for '{app_id}' -> {count} uri(s)");
             (0, results)
         }
-        Ok(SelectionResponse::Cancelled) => cancelled(),
-        Ok(SelectionResponse::Failed { message }) | Err(message) => {
+        Ok(FileChooserResponse::Cancelled) => cancelled(),
+        Ok(FileChooserResponse::Failed { message }) | Err(message) => {
             log::warn!("portal: FileChooser for '{app_id}' failed: {message}");
             failed()
         }
@@ -278,16 +278,16 @@ fn run_pick(
 fn invoke_prompter(
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
-    request: &SelectionRequest,
-) -> Result<SelectionResponse, String> {
+    request: &FileChooserRequest,
+) -> Result<FileChooserResponse, String> {
     let cancelled = || tracker.lock().unwrap().was_closed(request_path);
     match prompter::invoke(
-        PrompterRequest::selection(request.clone()),
+        PrompterRequest::file_chooser(request.clone()),
         Some(&cancelled),
     ) {
-        Ok(PromptResult::Selection(response)) => Ok(response),
+        Ok(PromptResult::FileChooser(response)) => Ok(response),
         Ok(_) => Err("prompter returned the wrong response kind".into()),
-        Err(prompter::InvokeError::Cancelled) => Ok(SelectionResponse::Cancelled),
+        Err(prompter::InvokeError::Cancelled) => Ok(FileChooserResponse::Cancelled),
         Err(prompter::InvokeError::Failed(message)) => Err(message),
     }
 }
@@ -561,8 +561,8 @@ mod tests {
 
     #[test]
     fn oversized_request_is_rejected_before_enqueue() {
-        let request = SelectionRequest {
-            mode: SelectionMode::OpenFile,
+        let request = FileChooserRequest {
+            mode: FileChooserMode::OpenFile,
             app_id: "dev.aegis.Test".into(),
             title: "x".repeat(MAX_REQUEST_BYTES + 1),
             accept_label: None,

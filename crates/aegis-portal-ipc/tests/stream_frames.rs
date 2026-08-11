@@ -251,3 +251,157 @@ fn handshake_negotiates_down_to_a_legacy_server() {
         aegis_portal_ipc::MIN_PROTOCOL_VERSION
     );
 }
+
+/// The compositor publishes the stream lane before it writes the
+/// `StreamOutputStarted` reply, so an already-produced frame can reach the
+/// client first. The client must buffer it and still complete the start.
+struct RacyStream;
+
+impl Handler for RacyStream {
+    fn stream_output_start(
+        &self,
+        _connection: u64,
+        _max_fps: Option<u32>,
+        _target: StreamTarget,
+        _dmabuf: Option<bool>,
+    ) -> Result<StreamInfo, String> {
+        Ok(StreamInfo {
+            stream_id: 7,
+            width: 2,
+            height: 2,
+            format: StreamPixelFormat::Bgra8,
+            slots: None,
+        })
+    }
+
+    fn frames_before_started(
+        &self,
+        stream_id: u64,
+    ) -> Vec<aegis_portal_ipc::testing::StreamFramePayload> {
+        vec![aegis_portal_ipc::testing::StreamFramePayload {
+            stream_id,
+            sequence: 1,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: StreamPixelFormat::Bgra8,
+            damage: vec![],
+            dropped: 0,
+            pixels: Arc::from(&[0x5a_u8; 16][..]),
+        }]
+    }
+}
+
+#[test]
+fn a_frame_racing_ahead_of_started_is_buffered() {
+    let server =
+        Server::start(&socket_path("racy-start"), Arc::new(RacyStream)).expect("bind test server");
+    let mut client = Client::connect_with_timeout(
+        server.path(),
+        ConnectionCapabilities::QUERY,
+        Duration::from_secs(5),
+    )
+    .expect("handshake");
+
+    let started = client
+        .start_output_stream_target(None, StreamTarget::Output)
+        .expect("stream start despite the early frame");
+    assert_eq!(started.stream_id, 7);
+
+    let message = client.next_stream_message().expect("buffered frame");
+    let StreamMessage::Frame(frame) = message else {
+        panic!("expected the early frame, got {message:?}");
+    };
+    assert_eq!(frame.sequence, 1);
+    let aegis_portal_ipc::StreamPayload::Memfd(mut file) = frame.payload else {
+        panic!("SHM frames must carry a memfd payload");
+    };
+    let mut received = Vec::new();
+    file.read_to_end(&mut received).unwrap();
+    assert_eq!(received, [0x5a_u8; 16]);
+}
+
+/// Same race on a protocol-25 dmabuf slot stream: the early frame is
+/// buffered and the slot table that follows the reply is still received.
+struct RacySlotStream {
+    slot_files: std::sync::Mutex<Vec<std::fs::File>>,
+}
+
+impl Handler for RacySlotStream {
+    fn stream_output_start(
+        &self,
+        _connection: u64,
+        _max_fps: Option<u32>,
+        _target: StreamTarget,
+        dmabuf: Option<bool>,
+    ) -> Result<StreamInfo, String> {
+        if dmabuf != Some(true) {
+            return Err("expected the dmabuf opt-in".into());
+        }
+        let mut files = Vec::new();
+        let mut infos = Vec::new();
+        for _ in 0..3 {
+            let file = unsealed_memfd(&[0_u8; 16]);
+            infos.push(aegis_portal_ipc::testing::StreamSlotInfo {
+                fd: file.as_raw_fd(),
+                stride: 8,
+                byte_len: 16,
+            });
+            files.push(file);
+        }
+        *self.slot_files.lock().unwrap() = files;
+        Ok(StreamInfo {
+            stream_id: 7,
+            width: 2,
+            height: 2,
+            format: StreamPixelFormat::Dmabuf {
+                drm_format: DRM_FORMAT_XRGB8888,
+                modifier: MOD_LINEAR,
+            },
+            slots: Some(infos),
+        })
+    }
+
+    fn frames_before_started(
+        &self,
+        stream_id: u64,
+    ) -> Vec<aegis_portal_ipc::testing::StreamFramePayload> {
+        vec![aegis_portal_ipc::testing::StreamFramePayload {
+            stream_id,
+            sequence: 1,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: StreamPixelFormat::Bgra8,
+            damage: vec![],
+            dropped: 0,
+            pixels: Arc::from(&[0x5a_u8; 16][..]),
+        }]
+    }
+}
+
+#[test]
+fn a_frame_racing_ahead_of_a_slot_stream_start_is_buffered() {
+    let handler = Arc::new(RacySlotStream {
+        slot_files: std::sync::Mutex::new(Vec::new()),
+    });
+    let server = Server::start(&socket_path("racy-slot-start"), handler).expect("bind test server");
+    let mut client = Client::connect_with_timeout(
+        server.path(),
+        ConnectionCapabilities::QUERY,
+        Duration::from_secs(5),
+    )
+    .expect("handshake");
+
+    let started = client
+        .start_output_stream(None, StreamTarget::Output, true)
+        .expect("stream start despite the early frame");
+    let slots = started.slots.expect("a slot table");
+    assert_eq!(slots.len(), 3);
+
+    let message = client.next_stream_message().expect("buffered frame");
+    let StreamMessage::Frame(frame) = message else {
+        panic!("expected the early frame, got {message:?}");
+    };
+    assert_eq!(frame.sequence, 1);
+}

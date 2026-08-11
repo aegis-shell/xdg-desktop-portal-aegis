@@ -89,11 +89,30 @@ pub(crate) fn receive_memfd_file(stream: &UnixStream, expected_len: u64) -> io::
 }
 
 /// Receive a single-plane dmabuf descriptor. dmabufs cannot carry memfd
-/// seals; the fixed buffer size is the only integrity property the receiver
-/// can check. Contents remain GPU-owned and may change between frames, which
-/// is inherent to dmabuf sharing.
+/// seals and do not stat as regular files; the allocation size floor is the
+/// only integrity property the receiver can check. Contents remain
+/// GPU-owned and may change between frames, which is inherent to dmabuf
+/// sharing.
 pub(crate) fn receive_dmabuf_file(stream: &UnixStream, expected_len: u64) -> io::Result<File> {
-    receive_validated_fd(stream, expected_len)
+    validate_len(expected_len)?;
+    let fd = receive_fd(stream)?;
+    // SAFETY: `receive_fd` returns a newly received owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    // The announced plane size is stride*height; the allocation behind the
+    // descriptor may be larger (GPU granularity), so only a short
+    // descriptor is invalid.
+    if metadata.len() < expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "capture descriptor is shorter than announced (expected {expected_len}, got {})",
+                metadata.len()
+            ),
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 fn receive_validated_fd(stream: &UnixStream, expected_len: u64) -> io::Result<File> {
@@ -106,7 +125,9 @@ fn receive_validated_fd(stream: &UnixStream, expected_len: u64) -> io::Result<Fi
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "capture descriptor length/type mismatch (expected {expected_len}, got {})",
+                "capture descriptor is not a regular file of {expected_len} bytes \
+                 (regular file: {}, length: {})",
+                metadata.file_type().is_file(),
                 metadata.len()
             ),
         ));
@@ -229,7 +250,9 @@ mod tests {
     }
 
     /// A memfd without seals stands in for a dmabuf: both are plain
-    /// descriptors without seal support on the wire.
+    /// descriptors without seal support on the wire. A memfd still stats as
+    /// a regular file; the anonymous-inode file type of a real dmabuf cannot
+    /// be emulated here.
     fn unsealed_memfd(bytes: &[u8]) -> File {
         // SAFETY: the name is static and NUL-terminated; the returned fd is
         // checked before ownership is constructed.
@@ -252,6 +275,18 @@ mod tests {
         received.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"gpu plane");
         file.seek(SeekFrom::Start(0)).ok();
+    }
+
+    #[test]
+    fn dmabuf_receive_accepts_a_larger_allocation() {
+        // GPU allocations may exceed the announced plane bytes.
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let file = unsealed_memfd(b"gpu plane with slack");
+        send_fd(&sender, file.as_raw_fd()).unwrap();
+        let mut received = receive_dmabuf_file(&receiver, 9).unwrap();
+        let mut bytes = Vec::new();
+        received.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"gpu plane with slack");
     }
 
     #[test]

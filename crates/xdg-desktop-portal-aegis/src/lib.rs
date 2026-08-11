@@ -19,8 +19,8 @@
 //! `aegis-portal` named scope with a sealed-memfd blob transfer
 //! transport, screencast frames arrive through the same scope's output-frame
 //! stream and are republished as a PipeWire producer stream. Account consent,
-//! file selection, and password-mode vault unlock are Portal-owned UI and do
-//! not cross compositor IPC. No Wayland capture protocol is added anywhere.
+//! the file chooser, and password-mode vault unlock are Portal-owned UI and
+//! do not cross compositor IPC. No Wayland capture protocol is added anywhere.
 //!
 //! The process uses zbus's blocking API on the session bus and plain
 //! `std::thread` workers without an async runtime. Method dispatch runs on

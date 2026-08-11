@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Rework the FileChooser dialog after GTK's file chooser. A places
+  sidebar (Home, the configured XDG user dirs, and the filesystem root)
+  offers one-click jumps; the breadcrumb bar renders as clickable chips
+  with the current folder highlighted; back/forward buttons walk the
+  navigation history; a create-folder action makes a directory and enters
+  it. Ctrl+L, the pencil button, or typing `/`/`~` opens a type-a-path
+  location field with Tab completion that accepts `~`, relative, and
+  absolute paths — directories navigate, an existing file selects it, and
+  in save mode the tail seeds the name field. The listing is fully
+  keyboard-driven: arrows/Home/End move a cursor with selection
+  following, Ctrl+Space toggles in multiple mode, typing selects by name,
+  Enter activates (or accepts), Backspace and Alt+Up walk up, and saving
+  over an existing file asks for overwrite confirmation first. The
+  location and save-name fields are app-owned editing surfaces (the
+  secret prompt's pattern) so the caret stays at the end across
+  programmatic edits, with Left/Right/Home/End, Delete, and Ctrl+V
+  editing.
+
+### Changed
+
+- Rename the prompter process contract's `selection` prompt kind to
+  `file_chooser`, aligning the private wire name with the public
+  `FileChooser` portal interface: `SelectionRequest`, `SelectionResponse`,
+  and `SelectionMode` are now `FileChooserRequest`, `FileChooserResponse`,
+  and `FileChooserMode`. The contract version rises from 2 to 3; a
+  mismatched backend/prompter pair keeps refusing to interpret each
+  other's fields.
+
+### Fixed
+
+- Keep the FileChooser footer visible: the root layout column now fills
+  the window so the flexible listing absorbs any deficit — previously a
+  long places list or directory listing pushed the Cancel/accept buttons
+  below the window's bottom edge.
+- Accept the compositor's dmabuf stream descriptors. They are anonymous
+  inodes — never regular files — and their allocation may exceed the
+  announced stride*height plane bytes, so the dmabuf receive path now
+  validates only the size floor instead of demanding a regular file of
+  exactly the announced length. The sealed-memfd path keeps its
+  exact-length regular-file contract. This was the visible
+  `capture descriptor length/type mismatch` ScreenCast failure.
+- Buffer stream frames that race ahead of `StreamOutputStarted`. The
+  compositor publishes the stream lane before it queues the reply, so an
+  already-produced frame can legitimately precede it; the client now
+  demultiplexes events from responses during stream start/stop and drains
+  buffered frames from `next_stream_message` in arrival order instead of
+  failing the start with an `unknown variant` parse error.
+
 ## [0.0.7] - 2026-08-10
 
 ### Changed

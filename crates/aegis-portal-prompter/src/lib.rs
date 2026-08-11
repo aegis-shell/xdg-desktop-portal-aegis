@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// Version of the private stdin/stdout contract. The backend and prompter
 /// reject mismatches instead of interpreting fields using different schemas.
-pub const PROCESS_CONTRACT_VERSION: u32 = 2;
+pub const PROCESS_CONTRACT_VERSION: u32 = 3;
 
 /// Versioned wire envelope sent to a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,15 +25,15 @@ pub struct PrompterRequest {
 
 impl PrompterRequest {
     #[must_use]
-    pub fn new(selection: SelectionRequest) -> Self {
-        Self::selection(selection)
+    pub fn new(request: FileChooserRequest) -> Self {
+        Self::file_chooser(request)
     }
 
     #[must_use]
-    pub fn selection(selection: SelectionRequest) -> Self {
+    pub fn file_chooser(request: FileChooserRequest) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
-            prompt: PromptRequest::Selection(selection),
+            prompt: PromptRequest::FileChooser(request),
         }
     }
 
@@ -64,10 +64,10 @@ impl PrompterRequest {
         Ok(self.prompt)
     }
 
-    pub fn into_selection(self) -> Result<SelectionRequest, String> {
+    pub fn into_file_chooser(self) -> Result<FileChooserRequest, String> {
         match self.into_prompt()? {
-            PromptRequest::Selection(selection) => Ok(selection),
-            _ => Err("prompter request is not a file selection".into()),
+            PromptRequest::FileChooser(request) => Ok(request),
+            _ => Err("prompter request is not a file chooser request".into()),
         }
     }
 }
@@ -75,7 +75,7 @@ impl PrompterRequest {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
 pub enum PromptRequest {
-    Selection(SelectionRequest),
+    FileChooser(FileChooserRequest),
     Confirm(ConfirmRequest),
     Secret(SecretRequest),
 }
@@ -83,7 +83,7 @@ pub enum PromptRequest {
 impl PromptRequest {
     fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Selection(selection) => selection.validate(),
+            Self::FileChooser(request) => request.validate(),
             Self::Confirm(confirm) => confirm.validate(),
             Self::Secret(secret) => secret.validate(),
         }
@@ -100,10 +100,10 @@ pub struct PrompterResponse {
 
 impl PrompterResponse {
     #[must_use]
-    pub fn new(selection: SelectionResponse) -> Self {
+    pub fn new(request: FileChooserResponse) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
-            result: PromptResult::Selection(selection),
+            result: PromptResult::FileChooser(request),
         }
     }
 
@@ -141,11 +141,11 @@ impl PrompterResponse {
         Ok(self.result)
     }
 
-    pub fn into_selection(self) -> Result<SelectionResponse, String> {
+    pub fn into_file_chooser(self) -> Result<FileChooserResponse, String> {
         match self.into_result()? {
-            PromptResult::Selection(selection) => Ok(selection),
+            PromptResult::FileChooser(request) => Ok(request),
             PromptResult::Failed { message } => Err(message),
-            _ => Err("prompter response is not a file selection".into()),
+            _ => Err("prompter response is not a file chooser response".into()),
         }
     }
 }
@@ -153,7 +153,7 @@ impl PrompterResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "response", rename_all = "snake_case")]
 pub enum PromptResult {
-    Selection(SelectionResponse),
+    FileChooser(FileChooserResponse),
     Confirm(ConfirmResponse),
     Secret(SecretResponse),
     Failed { message: String },
@@ -285,7 +285,7 @@ impl From<PathBuf> for BytePath {
 /// The FileChooser operation represented by one prompter process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SelectionMode {
+pub enum FileChooserMode {
     OpenFile,
     OpenDirectory,
     SaveFile,
@@ -326,8 +326,8 @@ pub struct Choice {
 
 /// One complete request sent from the D-Bus backend to the prompter.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SelectionRequest {
-    pub mode: SelectionMode,
+pub struct FileChooserRequest {
+    pub mode: FileChooserMode,
     pub app_id: String,
     pub title: String,
     pub accept_label: Option<String>,
@@ -344,7 +344,7 @@ pub struct SelectionRequest {
     pub files: Vec<BytePath>,
 }
 
-impl SelectionRequest {
+impl FileChooserRequest {
     /// Reject malformed values before any dialog or filesystem access.
     pub fn validate(&self) -> Result<(), String> {
         for (name, path) in [
@@ -355,10 +355,10 @@ impl SelectionRequest {
                 validate_absolute_path(name, &path.to_path_buf())?;
             }
         }
-        if self.mode != SelectionMode::SaveFiles && !self.files.is_empty() {
+        if self.mode != FileChooserMode::SaveFiles && !self.files.is_empty() {
             return Err("suggested files are valid only for SaveFiles".into());
         }
-        if self.mode == SelectionMode::SaveFiles && self.files.is_empty() {
+        if self.mode == FileChooserMode::SaveFiles && self.files.is_empty() {
             return Err("SaveFiles requires at least one suggested basename".into());
         }
         for name in &self.files {
@@ -414,7 +414,7 @@ impl SelectionRequest {
     /// Apply `SaveFiles` basename and collision semantics to the selected
     /// folder. Other modes return the selected paths unchanged.
     pub fn finish_paths(&self, selected: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
-        if self.mode != SelectionMode::SaveFiles {
+        if self.mode != FileChooserMode::SaveFiles {
             return Ok(selected);
         }
         let folder = selected
@@ -435,7 +435,7 @@ impl SelectionRequest {
 /// The one response emitted by a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum SelectionResponse {
+pub enum FileChooserResponse {
     Selected {
         paths: Vec<BytePath>,
         current_filter: Option<FileFilter>,
@@ -447,11 +447,11 @@ pub enum SelectionResponse {
     },
 }
 
-impl SelectionResponse {
+impl FileChooserResponse {
     /// Validate the child result against the exact request before exposing it
     /// as a portal response. The prompter is a fault boundary, not a trusted
     /// source of arbitrarily shaped paths or choice values.
-    pub fn validate_for(&self, request: &SelectionRequest) -> Result<(), String> {
+    pub fn validate_for(&self, request: &FileChooserRequest) -> Result<(), String> {
         let Self::Selected {
             paths,
             current_filter,
@@ -462,10 +462,12 @@ impl SelectionResponse {
         };
 
         let expected_paths = match request.mode {
-            SelectionMode::SaveFile => Some(1),
-            SelectionMode::SaveFiles => Some(request.files.len()),
-            SelectionMode::OpenFile | SelectionMode::OpenDirectory if !request.multiple => Some(1),
-            SelectionMode::OpenFile | SelectionMode::OpenDirectory => None,
+            FileChooserMode::SaveFile => Some(1),
+            FileChooserMode::SaveFiles => Some(request.files.len()),
+            FileChooserMode::OpenFile | FileChooserMode::OpenDirectory if !request.multiple => {
+                Some(1)
+            }
+            FileChooserMode::OpenFile | FileChooserMode::OpenDirectory => None,
         };
         if paths.is_empty() || expected_paths.is_some_and(|expected| paths.len() != expected) {
             return Err(format!(
@@ -584,8 +586,8 @@ fn split_extension(name: &[u8]) -> (&[u8], Option<&[u8]>) {
 mod tests {
     use super::*;
 
-    fn request(mode: SelectionMode) -> SelectionRequest {
-        SelectionRequest {
+    fn request(mode: FileChooserMode) -> FileChooserRequest {
+        FileChooserRequest {
             mode,
             app_id: "dev.aegis.Test".into(),
             title: "Choose".into(),
@@ -615,14 +617,14 @@ mod tests {
     fn process_contract_rejects_version_mismatches() {
         let envelope = PrompterRequest {
             version: PROCESS_CONTRACT_VERSION + 1,
-            prompt: PromptRequest::Selection(request(SelectionMode::OpenFile)),
+            prompt: PromptRequest::FileChooser(request(FileChooserMode::OpenFile)),
         };
-        assert!(envelope.into_selection().is_err());
+        assert!(envelope.into_file_chooser().is_err());
         let envelope = PrompterResponse {
             version: PROCESS_CONTRACT_VERSION + 1,
-            result: PromptResult::Selection(SelectionResponse::Cancelled),
+            result: PromptResult::FileChooser(FileChooserResponse::Cancelled),
         };
-        assert!(envelope.into_selection().is_err());
+        assert!(envelope.into_file_chooser().is_err());
     }
 
     #[test]
@@ -676,7 +678,7 @@ mod tests {
     #[test]
     fn save_files_rejects_paths_and_parent_components() {
         for name in ["", ".", "..", "a/b", "/absolute"] {
-            let mut req = request(SelectionMode::SaveFiles);
+            let mut req = request(FileChooserMode::SaveFiles);
             req.files.push(BytePath::from_path(name));
             assert!(req.validate().is_err(), "{name:?} must be rejected");
         }
@@ -684,7 +686,7 @@ mod tests {
 
     #[test]
     fn request_rejects_non_absolute_locations_and_empty_filter_rules() {
-        let mut req = request(SelectionMode::OpenFile);
+        let mut req = request(FileChooserMode::OpenFile);
         req.current_folder = Some(BytePath::from_path("relative"));
         assert!(req.validate().is_err());
 
@@ -713,7 +715,7 @@ mod tests {
         std::fs::write(folder.join("report.txt"), b"old").unwrap();
         std::fs::write(folder.join("report(1).txt"), b"old").unwrap();
 
-        let mut req = request(SelectionMode::SaveFiles);
+        let mut req = request(FileChooserMode::SaveFiles);
         req.files = vec![
             BytePath::from_path("report.txt"),
             BytePath::from_path("image.png"),
@@ -726,7 +728,7 @@ mod tests {
 
     #[test]
     fn duplicate_choice_ids_are_rejected() {
-        let mut req = request(SelectionMode::OpenFile);
+        let mut req = request(FileChooserMode::OpenFile);
         req.choices = vec![
             Choice {
                 id: "encoding".into(),
@@ -746,21 +748,21 @@ mod tests {
 
     #[test]
     fn selected_response_is_checked_against_the_request() {
-        let mut req = request(SelectionMode::OpenFile);
+        let mut req = request(FileChooserMode::OpenFile);
         req.choices.push(Choice {
             id: "encoding".into(),
             label: "Encoding".into(),
             options: vec![("utf8".into(), "UTF-8".into())],
             selected: "utf8".into(),
         });
-        let valid = SelectionResponse::Selected {
+        let valid = FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("/tmp/file.txt")],
             current_filter: None,
             choices: vec![("encoding".into(), "utf8".into())],
         };
         assert!(valid.validate_for(&req).is_ok());
 
-        let invalid = SelectionResponse::Selected {
+        let invalid = FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("relative")],
             current_filter: None,
             choices: vec![("encoding".into(), "unknown".into())],
@@ -773,7 +775,7 @@ mod tests {
         let folder =
             std::env::temp_dir().join(format!("aegis-prompter-duplicates-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
-        let mut req = request(SelectionMode::SaveFiles);
+        let mut req = request(FileChooserMode::SaveFiles);
         req.files = vec![
             BytePath::from_path("same.txt"),
             BytePath::from_path("same.txt"),

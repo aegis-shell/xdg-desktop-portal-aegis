@@ -1,7 +1,7 @@
 //! One-shot optics (iris/lens) host for portal prompt requests.
 //!
 //! The backend writes one versioned JSON request to stdin; this process shows
-//! the matching native dialog (file selection, confirmation, or secret
+//! the matching native dialog (file chooser, confirmation, or secret
 //! password) and writes one versioned JSON response to stdout. The wire
 //! contract lives in `aegis_portal_prompter`; this binary only renders it.
 
@@ -58,7 +58,7 @@ fn write_response(response: &PrompterResponse) -> Result<(), String> {
 
 fn run_dialog(request: PromptRequest) -> Result<PrompterResponse, String> {
     let result = match request {
-        PromptRequest::Selection(request) => ui::chooser::run(request)?,
+        PromptRequest::FileChooser(request) => ui::file_chooser::run(request)?,
         PromptRequest::Confirm(request) => ui::confirm::run(request)?,
         PromptRequest::Secret(request) => ui::secret::run(request)?,
     };

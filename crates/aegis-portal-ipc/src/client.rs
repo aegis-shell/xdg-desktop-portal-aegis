@@ -1,5 +1,6 @@
 //! Synchronous client for the Portal-owned Aegis IPC v24 projection.
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -78,6 +79,10 @@ pub struct Client {
     lease: Option<LeaseGrant>,
     /// The protocol version both ends speak after the handshake.
     version: u32,
+    /// Stream events that raced ahead of a request reply: the compositor
+    /// publishes a stream before writing `StreamOutputStarted`, so frames
+    /// can legitimately precede it. Drained before the socket is read again.
+    pending: VecDeque<StreamMessage>,
 }
 
 impl Client {
@@ -151,6 +156,7 @@ impl Client {
                 caps,
                 lease,
                 version: replied,
+                pending: VecDeque::new(),
             }),
             Response::Hello { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -303,7 +309,21 @@ impl Client {
                 dmabuf: dmabuf.then_some(true),
             },
         )?;
-        match read_msg::<_, Response>(&mut self.stream)? {
+        // The compositor publishes the stream lane before it writes the
+        // reply, so frames (or a stream end) may already be on the wire.
+        // Buffer them in arrival order; they surface from
+        // `next_stream_message` after the start completes.
+        let started = loop {
+            let value: serde_json::Value = read_msg(&mut self.stream)?;
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("StreamOutputStarted")
+            {
+                break serde_json::from_value::<Response>(value).map_err(json_error)?;
+            }
+            if let Some(message) = self.stream_message(value)? {
+                self.pending.push_back(message);
+            }
+        };
+        match started {
             Response::StreamOutputStarted {
                 stream_id,
                 width,
@@ -370,10 +390,24 @@ impl Client {
 
     pub fn stop_output_stream(&mut self, stream_id: u64) -> io::Result<()> {
         write_msg(&mut self.stream, &Request::StreamOutputStop { stream_id })?;
-        match read_msg::<_, Response>(&mut self.stream)? {
-            Response::StreamOutputStopped { stream_id: stopped } if stopped == stream_id => Ok(()),
-            Response::Error { message } => Err(io::Error::other(message)),
-            other => Err(unexpected("StreamOutputStopped", &other)),
+        // Frames already in flight may precede the reply; buffer them so a
+        // later reader still observes them in arrival order.
+        loop {
+            let value: serde_json::Value = read_msg(&mut self.stream)?;
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("StreamOutputStopped")
+            {
+                match serde_json::from_value::<Response>(value).map_err(json_error)? {
+                    Response::StreamOutputStopped { stream_id: stopped }
+                        if stopped == stream_id =>
+                    {
+                        return Ok(());
+                    }
+                    other => return Err(unexpected("StreamOutputStopped", &other)),
+                }
+            }
+            if let Some(message) = self.stream_message(value)? {
+                self.pending.push_back(message);
+            }
         }
     }
 
@@ -382,83 +416,90 @@ impl Client {
     }
 
     pub fn next_stream_message(&mut self) -> io::Result<StreamMessage> {
+        if let Some(message) = self.pending.pop_front() {
+            return Ok(message);
+        }
         loop {
             let value: serde_json::Value = read_msg(&mut self.stream)?;
-            match value.get("type").and_then(serde_json::Value::as_str) {
-                Some("StreamFrame") => {
-                    let event: Event = serde_json::from_value(value).map_err(json_error)?;
-                    let Event::StreamFrame {
-                        stream_id,
-                        sequence,
-                        width,
-                        height,
-                        stride,
-                        format,
-                        damage,
-                        dropped,
-                        byte_len,
-                        slot,
-                    } = event
-                    else {
-                        unreachable!();
-                    };
-                    let payload = match slot {
-                        Some(_) => StreamPayload::Slot,
-                        None => match format {
-                            StreamPixelFormat::Bgra8 | StreamPixelFormat::Rgba8 => {
-                                StreamPayload::Memfd(blob::receive_memfd_file(
-                                    &self.stream,
-                                    byte_len,
-                                )?)
-                            }
-                            StreamPixelFormat::Dmabuf { .. } => StreamPayload::Dmabuf(
-                                blob::receive_dmabuf_file(&self.stream, byte_len)?,
-                            ),
-                        },
-                    };
-                    return Ok(StreamMessage::Frame(StreamFrame {
-                        stream_id,
-                        sequence,
-                        width,
-                        height,
-                        stride,
-                        format,
-                        damage,
-                        dropped,
-                        slot,
-                        payload,
-                    }));
-                }
-                Some("StreamEnded") => {
-                    let event: Event = serde_json::from_value(value).map_err(json_error)?;
-                    let Event::StreamEnded { stream_id, reason } = event else {
-                        unreachable!();
-                    };
-                    return Ok(StreamMessage::Ended { stream_id, reason });
-                }
-                Some("LeaseRenewed") => {
-                    let response: Response = serde_json::from_value(value).map_err(json_error)?;
-                    let Response::LeaseRenewed { lease } = response else {
-                        unreachable!();
-                    };
-                    self.lease = Some(lease);
-                    return Ok(StreamMessage::LeaseRenewed);
-                }
-                Some("Error") => {
-                    let response: Response = serde_json::from_value(value).map_err(json_error)?;
-                    let Response::Error { message } = response else {
-                        unreachable!();
-                    };
-                    return Err(io::Error::other(message));
-                }
-                Some(_) => continue,
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Aegis IPC stream message has no type",
-                    ));
-                }
+            if let Some(message) = self.stream_message(value)? {
+                return Ok(message);
             }
+        }
+    }
+
+    /// Parse one wire message into a stream event, consuming the descriptor
+    /// that follows a frame header. Returns `None` for messages the stream
+    /// reader skips (slot-release replies and unrelated traffic).
+    fn stream_message(&mut self, value: serde_json::Value) -> io::Result<Option<StreamMessage>> {
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("StreamFrame") => {
+                let event: Event = serde_json::from_value(value).map_err(json_error)?;
+                let Event::StreamFrame {
+                    stream_id,
+                    sequence,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    damage,
+                    dropped,
+                    byte_len,
+                    slot,
+                } = event
+                else {
+                    unreachable!();
+                };
+                let payload = match slot {
+                    Some(_) => StreamPayload::Slot,
+                    None => match format {
+                        StreamPixelFormat::Bgra8 | StreamPixelFormat::Rgba8 => {
+                            StreamPayload::Memfd(blob::receive_memfd_file(&self.stream, byte_len)?)
+                        }
+                        StreamPixelFormat::Dmabuf { .. } => StreamPayload::Dmabuf(
+                            blob::receive_dmabuf_file(&self.stream, byte_len)?,
+                        ),
+                    },
+                };
+                Ok(Some(StreamMessage::Frame(StreamFrame {
+                    stream_id,
+                    sequence,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    damage,
+                    dropped,
+                    slot,
+                    payload,
+                })))
+            }
+            Some("StreamEnded") => {
+                let event: Event = serde_json::from_value(value).map_err(json_error)?;
+                let Event::StreamEnded { stream_id, reason } = event else {
+                    unreachable!();
+                };
+                Ok(Some(StreamMessage::Ended { stream_id, reason }))
+            }
+            Some("LeaseRenewed") => {
+                let response: Response = serde_json::from_value(value).map_err(json_error)?;
+                let Response::LeaseRenewed { lease } = response else {
+                    unreachable!();
+                };
+                self.lease = Some(lease);
+                Ok(Some(StreamMessage::LeaseRenewed))
+            }
+            Some("Error") => {
+                let response: Response = serde_json::from_value(value).map_err(json_error)?;
+                let Response::Error { message } = response else {
+                    unreachable!();
+                };
+                Err(io::Error::other(message))
+            }
+            Some(_) => Ok(None),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Aegis IPC stream message has no type",
+            )),
         }
     }
 }

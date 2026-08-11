@@ -7,7 +7,7 @@ use std::process::Command;
 
 use aegis_portal_prompter::{
     BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PromptRequest, PrompterResponse,
-    SelectionMode, SelectionRequest, SelectionResponse,
+    FileChooserMode, FileChooserRequest, FileChooserResponse,
 };
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
@@ -50,13 +50,13 @@ fn result_uris(results: &HashMap<String, OwnedValue>) -> Vec<String> {
     Vec::<String>::try_from(Value::from(uris.clone())).expect("uris is a string array")
 }
 
-fn write_response(directory: &Path, index: u32, response: &SelectionResponse) {
+fn write_response(directory: &Path, index: u32, response: &FileChooserResponse) {
     write_prompter_response(directory, index, &PrompterResponse::new(response.clone()));
 }
 
-fn read_request(directory: &Path, index: u32) -> SelectionRequest {
-    let PromptRequest::Selection(request) = read_prompter_request(directory, index) else {
-        panic!("FileChooser must issue a selection prompt");
+fn read_request(directory: &Path, index: u32) -> FileChooserRequest {
+    let PromptRequest::FileChooser(request) = read_prompter_request(directory, index) else {
+        panic!("FileChooser must issue a file chooser prompt");
     };
     request
 }
@@ -89,7 +89,7 @@ fn file_chooser_end_to_end() {
     write_response(
         &fixture_dir,
         1,
-        &SelectionResponse::Selected {
+        &FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("/tmp/fake-chosen.png")],
             current_filter: Some(image_filter.clone()),
             choices: vec![("encoding".into(), "utf8".into())],
@@ -98,7 +98,7 @@ fn file_chooser_end_to_end() {
     write_response(
         &fixture_dir,
         2,
-        &SelectionResponse::Selected {
+        &FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("/tmp/fake-save.png")],
             current_filter: None,
             choices: Vec::new(),
@@ -107,7 +107,7 @@ fn file_chooser_end_to_end() {
     write_response(
         &fixture_dir,
         3,
-        &SelectionResponse::Selected {
+        &FileChooserResponse::Selected {
             // SaveFiles collision/name processing belongs to the prompter;
             // the backend receives final paths only.
             paths: vec![
@@ -118,11 +118,11 @@ fn file_chooser_end_to_end() {
             choices: Vec::new(),
         },
     );
-    write_response(&fixture_dir, 4, &SelectionResponse::Cancelled);
+    write_response(&fixture_dir, 4, &FileChooserResponse::Cancelled);
     write_response(
         &fixture_dir,
         6,
-        &SelectionResponse::Selected {
+        &FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("/tmp/concurrent.txt")],
             current_filter: None,
             choices: Vec::new(),
@@ -173,7 +173,7 @@ fn file_chooser_end_to_end() {
     assert!(results.contains_key("current_filter"));
     assert!(results.contains_key("choices"));
     let request = read_request(&fixture_dir, 1);
-    assert_eq!(request.mode, SelectionMode::OpenFile);
+    assert_eq!(request.mode, FileChooserMode::OpenFile);
     assert_eq!(
         request.parent_window.as_deref(),
         Some("wayland:parent-token")
@@ -203,7 +203,7 @@ fn file_chooser_end_to_end() {
     assert_eq!(response, 0, "SaveFile must succeed: {results:?}");
     assert_eq!(result_uris(&results), ["file:///tmp/fake-save.png"]);
     let request = read_request(&fixture_dir, 2);
-    assert_eq!(request.mode, SelectionMode::SaveFile);
+    assert_eq!(request.mode, FileChooserMode::SaveFile);
     assert_eq!(
         request.current_file.unwrap().to_path_buf(),
         Path::new("/tmp/existing.png")
@@ -222,7 +222,7 @@ fn file_chooser_end_to_end() {
         ["file:///chosen/dir/one.txt", "file:///chosen/dir/two.txt"]
     );
     let request = read_request(&fixture_dir, 3);
-    assert_eq!(request.mode, SelectionMode::SaveFiles);
+    assert_eq!(request.mode, FileChooserMode::SaveFiles);
     assert_eq!(
         request
             .files
@@ -357,7 +357,7 @@ fn public_frontend_routes_file_chooser_and_returns_response() {
     write_response(
         &fixture_dir,
         1,
-        &SelectionResponse::Selected {
+        &FileChooserResponse::Selected {
             paths: vec![BytePath::from_path("/tmp/public-file-chooser.txt")],
             current_filter: None,
             choices: Vec::new(),
@@ -458,7 +458,7 @@ fn public_frontend_routes_file_chooser_and_returns_response() {
         ["file:///tmp/public-file-chooser.txt"]
     );
     let recorded = read_request(&fixture_dir, 1);
-    assert_eq!(recorded.mode, SelectionMode::OpenFile);
+    assert_eq!(recorded.mode, FileChooserMode::OpenFile);
     assert_eq!(recorded.title, "Choose through frontend");
 
     std::fs::remove_dir_all(root).ok();

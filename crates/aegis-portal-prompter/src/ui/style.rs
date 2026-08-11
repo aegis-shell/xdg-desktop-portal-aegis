@@ -81,6 +81,15 @@ pub fn secondary_button_style(dark: bool) -> Style {
     Style::new().with_bg(palette(dark).hover)
 }
 
+/// The inert primary action while the dialog state is not acceptable:
+/// muted text on the quiet secondary surface, no accent.
+pub fn disabled_button_style(dark: bool) -> Style {
+    let palette = palette(dark);
+    Style::new()
+        .with_bg(palette.hover)
+        .with_fg(palette.text_muted)
+}
+
 /// Strip the GTK mnemonic underscore from a button label (`"_Share"` →
 /// `"Share"`); lens has no mnemonic concept.
 pub fn plain_label(label: &str) -> &str {

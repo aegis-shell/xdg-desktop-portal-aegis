@@ -106,6 +106,14 @@ pub trait Handler: Send + Sync + 'static {
         Err("streaming is not implemented by this test server".into())
     }
 
+    /// Frames written to the connection BEFORE the `StreamOutputStarted`
+    /// reply. The real compositor publishes the stream lane before it queues
+    /// the reply, so an already-produced frame can legitimately precede it;
+    /// tests use this hook to reproduce that race deterministically.
+    fn frames_before_started(&self, _stream_id: u64) -> Vec<StreamFramePayload> {
+        Vec::new()
+    }
+
     fn stream_output_stop(&self, _stream_id: u64) {}
 
     /// Protocol-25 slot release from the client.
@@ -447,28 +455,58 @@ fn serve_connection(
                         // hold the writer for the whole sequence and
                         // register the delivery lane only afterwards, so a
                         // concurrently pushed frame cannot interleave.
+                        // `frames_before_started` is the deliberate
+                        // exception: it reproduces the real compositor's
+                        // race, where a produced frame precedes the reply.
                         let result = {
                             let mut guard = writer.lock().unwrap();
-                            write_msg(
-                                &mut *guard,
-                                &Response::StreamOutputStarted {
-                                    stream_id: info.stream_id,
-                                    width: info.width,
-                                    height: info.height,
-                                    format: info.format,
-                                    slots,
-                                    slot_stride,
-                                    slot_bytes,
-                                },
-                            )
-                            .and_then(|()| {
-                                if let Some(table) = info.slots {
-                                    for slot in table {
-                                        crate::blob::send_fd(&guard, slot.fd)?;
-                                    }
+                            let mut wrote = Ok(());
+                            for frame in handler.frames_before_started(info.stream_id) {
+                                wrote = SealedBlob::new(&frame.pixels).and_then(|blob| {
+                                    write_msg(
+                                        &mut *guard,
+                                        &Event::StreamFrame {
+                                            stream_id: frame.stream_id,
+                                            sequence: frame.sequence,
+                                            width: frame.width,
+                                            height: frame.height,
+                                            stride: frame.stride,
+                                            format: frame.format,
+                                            damage: frame.damage,
+                                            dropped: frame.dropped,
+                                            byte_len: blob.len(),
+                                            slot: None,
+                                        },
+                                    )
+                                    .and_then(|()| blob.send(&guard))
+                                });
+                                if wrote.is_err() {
+                                    break;
                                 }
-                                Ok(())
-                            })
+                            }
+                            wrote
+                                .and_then(|()| {
+                                    write_msg(
+                                        &mut *guard,
+                                        &Response::StreamOutputStarted {
+                                            stream_id: info.stream_id,
+                                            width: info.width,
+                                            height: info.height,
+                                            format: info.format,
+                                            slots,
+                                            slot_stride,
+                                            slot_bytes,
+                                        },
+                                    )
+                                })
+                                .and_then(|()| {
+                                    if let Some(table) = info.slots {
+                                        for slot in table {
+                                            crate::blob::send_fd(&guard, slot.fd)?;
+                                        }
+                                    }
+                                    Ok(())
+                                })
                         };
                         if result.is_ok() {
                             streams

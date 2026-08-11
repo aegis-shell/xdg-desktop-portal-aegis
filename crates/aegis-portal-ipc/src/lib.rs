@@ -2,7 +2,7 @@
 //! resources.
 //!
 //! The crate implements the Aegis IPC v24 wire contract independently and
-//! deliberately exposes no compositor-internal types. File selection,
+//! deliberately exposes no compositor-internal types. The file chooser,
 //! account consent, secrets, email, and other Portal-owned resources do not
 //! belong on this boundary.
 
