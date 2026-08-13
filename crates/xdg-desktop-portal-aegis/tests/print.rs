@@ -1,23 +1,22 @@
-//! Routing regression: AppChooser is served by Aegis.
+//! Routing regression: Print is served by Aegis.
 
 const PORTAL_FILE: &str = include_str!("../../../contrib/xdg-desktop-portal/portals/aegis.portal");
 const PORTALS_CONF: &str = include_str!("../../../contrib/xdg-desktop-portal/aegis-portals.conf");
 
 #[test]
-fn app_chooser_is_served_by_aegis() {
+fn print_is_served_by_aegis() {
+    let interface = "org.freedesktop.impl.portal.Print";
     let interfaces = PORTAL_FILE
         .lines()
         .find_map(|line| line.strip_prefix("Interfaces="))
         .expect("portal metadata must declare Interfaces");
     assert!(
-        interfaces
-            .split(';')
-            .any(|interface| interface == "org.freedesktop.impl.portal.AppChooser"),
-        "the Portal-owned AppChooser must be advertised"
+        interfaces.split(';').any(|entry| entry == interface),
+        "the lp-backed Print must be advertised"
     );
     assert!(
         PORTALS_CONF
             .lines()
-            .any(|line| line == "org.freedesktop.impl.portal.AppChooser=aegis")
+            .any(|line| line == format!("{interface}=aegis"))
     );
 }

@@ -46,7 +46,7 @@ DESTDIR="$PWD/stage-pam" meson install -C build-package
 ```
 
 Confirm executable modes, the configured D-Bus `Exec` path, the portal
-metadata interface list, the GTK fallback routing, and the PAM module's
+metadata interface list, the interface routing, and the PAM module's
 distribution license before publishing artifacts.
 
 ## Release Metadata

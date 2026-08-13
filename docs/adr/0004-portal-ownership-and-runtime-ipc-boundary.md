@@ -1,6 +1,6 @@
 # ADR-0004: Portal ownership and runtime IPC boundary
 
-- Status: Accepted
+- Status: Accepted (interface boundary extended by [ADR-0007](0007-full-stack-interface-ownership.md))
 - Date: 2026-08-04
 - Supersedes: [ADR-0003](0003-production-interface-boundary.md)
 

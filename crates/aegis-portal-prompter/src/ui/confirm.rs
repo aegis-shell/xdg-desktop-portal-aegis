@@ -66,7 +66,13 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
                     f.push_style(style::secondary_button_style(state.dark));
-                    let cancel = f.button("Cancel");
+                    let deny = state
+                        .request
+                        .deny_label
+                        .as_deref()
+                        .map(style::plain_label)
+                        .unwrap_or("Cancel");
+                    let cancel = f.button(deny);
                     f.pop_style();
                     if cancel {
                         finish(state, ConfirmResponse::Cancelled);

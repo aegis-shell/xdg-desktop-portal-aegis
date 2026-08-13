@@ -1,14 +1,15 @@
-//! Descriptor transport for screenshot and screencast payloads.
+//! Descriptor transport for screenshot, screencast, and wallpaper payloads.
 //!
 //! Every payload crosses the socket as one SCM_RIGHTS descriptor behind a
 //! `0xfd` marker byte. SHM payloads are sealed memfds whose contents the
 //! sender can no longer modify; dmabuf payloads are single-plane GPU
 //! buffers, which cannot carry memfd seals and are validated by size only.
 //! A dmabuf has a fixed size for its lifetime, so the size check bounds the
-//! receiver's mapping the same way the seal check does for memfds.
+//! receiver's mapping the same way the seal check does for memfds. The
+//! transport is direction-agnostic: captures flow server-to-client, the
+//! wallpaper image (protocol 26) flows client-to-server.
 
 use std::fs::File;
-#[cfg(any(test, feature = "test-server"))]
 use std::io::Write;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::mem::{size_of, zeroed};
@@ -20,13 +21,14 @@ pub(crate) const MAX_BLOB_BYTES: u64 = 288 * 1024 * 1024;
 const REQUIRED_SEALS: libc::c_int =
     libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
 
-#[cfg(any(test, feature = "test-server"))]
+/// A sealed, immutable in-memory payload ready to send. The sender seals
+/// before the descriptor crosses the socket, so the receiver can trust the
+/// contents never change underneath it.
 pub(crate) struct SealedBlob {
     file: File,
     len: u64,
 }
 
-#[cfg(any(test, feature = "test-server"))]
 impl SealedBlob {
     pub(crate) fn new(bytes: &[u8]) -> io::Result<Self> {
         let len = u64::try_from(bytes.len())
@@ -146,7 +148,6 @@ fn validate_len(length: u64) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-server"))]
 pub(crate) fn send_fd(stream: &UnixStream, fd: RawFd) -> io::Result<()> {
     let mut marker = BLOB_MARKER;
     let mut iov = libc::iovec {

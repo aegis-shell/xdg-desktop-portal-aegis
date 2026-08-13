@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod notify;
+
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -13,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// Version of the private stdin/stdout contract. The backend and prompter
 /// reject mismatches instead of interpreting fields using different schemas.
-pub const PROCESS_CONTRACT_VERSION: u32 = 3;
+pub const PROCESS_CONTRACT_VERSION: u32 = 4;
 
 /// Versioned wire envelope sent to a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -53,6 +55,22 @@ impl PrompterRequest {
         }
     }
 
+    #[must_use]
+    pub fn choose_app(choose_app: ChooseAppRequest) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::ChooseApp(choose_app),
+        }
+    }
+
+    #[must_use]
+    pub fn launcher_edit(launcher_edit: LauncherEditRequest) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::LauncherEdit(launcher_edit),
+        }
+    }
+
     pub fn into_prompt(self) -> Result<PromptRequest, String> {
         if self.version != PROCESS_CONTRACT_VERSION {
             return Err(format!(
@@ -78,6 +96,8 @@ pub enum PromptRequest {
     FileChooser(FileChooserRequest),
     Confirm(ConfirmRequest),
     Secret(SecretRequest),
+    ChooseApp(ChooseAppRequest),
+    LauncherEdit(LauncherEditRequest),
 }
 
 impl PromptRequest {
@@ -86,6 +106,8 @@ impl PromptRequest {
             Self::FileChooser(request) => request.validate(),
             Self::Confirm(confirm) => confirm.validate(),
             Self::Secret(secret) => secret.validate(),
+            Self::ChooseApp(choose_app) => choose_app.validate(),
+            Self::LauncherEdit(launcher_edit) => launcher_edit.validate(),
         }
     }
 }
@@ -124,6 +146,22 @@ impl PrompterResponse {
     }
 
     #[must_use]
+    pub fn choose_app(choose_app: ChooseAppResponse) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::ChooseApp(choose_app),
+        }
+    }
+
+    #[must_use]
+    pub fn launcher_edit(launcher_edit: LauncherEditResponse) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::LauncherEdit(launcher_edit),
+        }
+    }
+
+    #[must_use]
     pub fn failed(message: String) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
@@ -156,6 +194,8 @@ pub enum PromptResult {
     FileChooser(FileChooserResponse),
     Confirm(ConfirmResponse),
     Secret(SecretResponse),
+    ChooseApp(ChooseAppResponse),
+    LauncherEdit(LauncherEditResponse),
     Failed { message: String },
 }
 
@@ -167,16 +207,23 @@ pub struct ConfirmRequest {
     pub title: String,
     pub body: String,
     pub accept_label: Option<String>,
+    pub deny_label: Option<String>,
     pub modal: bool,
     pub parent_window: Option<String>,
 }
 
 impl ConfirmRequest {
-    fn validate(&self) -> Result<(), String> {
+    /// Reject malformed values before any dialog is shown. Public so the
+    /// backend can double-check a composed body against the contract's
+    /// text cap before enqueueing.
+    pub fn validate(&self) -> Result<(), String> {
         validate_prompt_text("confirmation title", &self.title, false)?;
         validate_prompt_text("confirmation body", &self.body, false)?;
         if let Some(label) = self.accept_label.as_deref() {
             validate_prompt_text("confirmation accept label", label, false)?;
+        }
+        if let Some(label) = self.deny_label.as_deref() {
+            validate_prompt_text("confirmation deny label", label, true)?;
         }
         if let Some(parent) = self.parent_window.as_deref() {
             validate_prompt_text("confirmation parent window", parent, true)?;
@@ -252,6 +299,245 @@ fn validate_prompt_text(name: &str, value: &str, allow_empty: bool) -> Result<()
         return Err(format!("{name} is empty, oversized, or contains NUL"));
     }
     Ok(())
+}
+
+/// The choice-list validation shared by FileChooser and AppChooser: unique
+/// non-empty ids and labels, non-empty unique option pairs, and a selected
+/// value that names an offered option (or `true`/`false` for a boolean
+/// check button).
+fn validate_choices(choices: &[Choice]) -> Result<(), String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for choice in choices {
+        if choice.id.is_empty() || choice.label.is_empty() {
+            return Err("choice ids and labels must not be empty".into());
+        }
+        if !ids.insert(choice.id.as_str()) {
+            return Err(format!("duplicate choice id {:?}", choice.id));
+        }
+        if choice
+            .options
+            .iter()
+            .any(|(id, label)| id.is_empty() || label.is_empty())
+        {
+            return Err(format!("choice {:?} contains an empty option", choice.id));
+        }
+        let mut option_ids = std::collections::BTreeSet::new();
+        if choice
+            .options
+            .iter()
+            .any(|(id, _)| !option_ids.insert(id.as_str()))
+        {
+            return Err(format!("choice {:?} has duplicate option ids", choice.id));
+        }
+        if choice.options.is_empty() {
+            if !matches!(choice.selected.as_str(), "" | "true" | "false") {
+                return Err(format!(
+                    "boolean choice {:?} has invalid value {:?}",
+                    choice.id, choice.selected
+                ));
+            }
+        } else if !choice.selected.is_empty()
+            && !choice.options.iter().any(|(id, _)| id == &choice.selected)
+        {
+            return Err(format!(
+                "choice {:?} selects unknown option {:?}",
+                choice.id, choice.selected
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The response-side choice check shared by FileChooser and AppChooser: the
+/// prompter must answer exactly the offered choices, in order, with values
+/// from each choice's option set (`true`/`false` for booleans).
+fn validate_choice_answers(answers: &[(String, String)], choices: &[Choice]) -> Result<(), String> {
+    if answers.len() != choices.len() {
+        return Err("prompter returned the wrong number of choices".into());
+    }
+    for ((id, selected), requested) in answers.iter().zip(choices) {
+        if id != &requested.id {
+            return Err(format!("prompter returned unexpected choice id {id:?}"));
+        }
+        let valid = if requested.options.is_empty() {
+            matches!(selected.as_str(), "true" | "false")
+        } else {
+            requested.options.iter().any(|(value, _)| value == selected)
+        };
+        if !valid {
+            return Err(format!(
+                "prompter returned invalid value {selected:?} for choice {id:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One application offered by an AppChooser dialog.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppChoice {
+    /// The desktop file id (`org.foo.Bar.desktop`); also the value the
+    /// portal response reports as the choice.
+    pub id: String,
+    pub name: String,
+    /// The themed icon name from the desktop entry. The dialog renders
+    /// names only; the field rides the contract so a future icon-capable
+    /// dialog needs no version bump.
+    pub icon: Option<String>,
+}
+
+/// One complete AppChooser request sent from the D-Bus backend to the
+/// prompter. `choices` carries the FileChooser-style embedded controls; an
+/// empty-options choice is a boolean checkbox (the backend uses one for
+/// "remember this choice").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChooseAppRequest {
+    pub app_id: String,
+    pub title: String,
+    pub content_type: String,
+    pub parent_window: Option<String>,
+    pub apps: Vec<AppChoice>,
+    pub choices: Vec<Choice>,
+}
+
+/// AppChooser dialog list cap: one screen of candidates, and far below the
+/// process contract's byte limit.
+const MAX_CHOOSE_APP_CANDIDATES: usize = 64;
+
+impl ChooseAppRequest {
+    /// Reject malformed values before any dialog is shown.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_prompt_text("app chooser title", &self.title, false)?;
+        validate_prompt_text("app chooser content type", &self.content_type, false)?;
+        if let Some(parent) = self.parent_window.as_deref() {
+            validate_prompt_text("app chooser parent window", parent, true)?;
+        }
+        if self.apps.is_empty() || self.apps.len() > MAX_CHOOSE_APP_CANDIDATES {
+            return Err(format!(
+                "app chooser needs 1..={MAX_CHOOSE_APP_CANDIDATES} candidates"
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for app in &self.apps {
+            if app.id.is_empty() || app.id.len() > MAX_PROMPT_TEXT_BYTES || app.id.contains('\0') {
+                return Err("app ids must be non-empty, bounded, and NUL-free".into());
+            }
+            if !ids.insert(app.id.as_str()) {
+                return Err(format!("duplicate app id {:?}", app.id));
+            }
+            validate_prompt_text("app name", &app.name, false)?;
+            if let Some(icon) = app.icon.as_deref() {
+                validate_prompt_text("app icon", icon, true)?;
+            }
+        }
+        validate_choices(&self.choices)
+    }
+}
+
+/// The one response an AppChooser prompter process emits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ChooseAppResponse {
+    Selected {
+        /// The desktop file id of the chosen application.
+        app: String,
+        choices: Vec<(String, String)>,
+    },
+    Cancelled,
+}
+
+impl ChooseAppResponse {
+    /// Validate the child result against the exact request before exposing
+    /// it as a portal response: the chosen app must have been offered and
+    /// the choice answers must match the offered controls.
+    pub fn validate_for(&self, request: &ChooseAppRequest) -> Result<(), String> {
+        let Self::Selected { app, choices } = self else {
+            return Ok(());
+        };
+        if !request.apps.iter().any(|offered| &offered.id == app) {
+            return Err(format!(
+                "prompter returned an app that was not offered: {app:?}"
+            ));
+        }
+        validate_choice_answers(choices, &request.choices)
+    }
+}
+
+/// A launcher name is short user-facing text; 1 KiB is generous in every
+/// script the dialog can receive.
+const MAX_LAUNCHER_NAME_BYTES: usize = 1024;
+
+/// One DynamicLauncher PrepareInstall request sent from the D-Bus backend
+/// to the prompter: the user reviews the proposed launcher name (editing
+/// it when `editable_name`), then confirms or cancels the installation.
+///
+/// The icon itself never crosses the pipe: the dialog cannot decode
+/// arbitrary image bytes into a lens texture, so the backend echoes the
+/// icon variant back in the portal results verbatim and only a short
+/// human-readable label (the themed name, or a generic note) is shown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LauncherEditRequest {
+    pub app_id: String,
+    pub title: String,
+    /// The proposed name; may be empty only when `editable_name` is set
+    /// (the field then starts blank and the user must type one).
+    pub name: String,
+    pub editable_name: bool,
+    /// The web app's URL, displayed when the launcher type is Webapp.
+    pub target: Option<String>,
+    /// A short description of the proposed icon, if any (see the docs).
+    pub icon_label: Option<String>,
+    pub modal: bool,
+    pub parent_window: Option<String>,
+}
+
+impl LauncherEditRequest {
+    /// Reject malformed values before any dialog is shown.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_prompt_text("launcher editor title", &self.title, false)?;
+        if self.name.len() > MAX_LAUNCHER_NAME_BYTES || self.name.contains('\0') {
+            return Err("launcher name is oversized or contains NUL".into());
+        }
+        if !self.editable_name && self.name.trim().is_empty() {
+            return Err("a non-editable launcher name must not be empty".into());
+        }
+        if let Some(target) = self.target.as_deref() {
+            validate_prompt_text("launcher target", target, false)?;
+        }
+        if let Some(icon_label) = self.icon_label.as_deref() {
+            validate_prompt_text("launcher icon label", icon_label, false)?;
+        }
+        if let Some(parent) = self.parent_window.as_deref() {
+            validate_prompt_text("launcher parent window", parent, true)?;
+        }
+        Ok(())
+    }
+}
+
+/// The one response a launcher-editor prompter process emits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LauncherEditResponse {
+    Saved { name: String },
+    Cancelled,
+}
+
+impl LauncherEditResponse {
+    /// Validate the child result against the exact request: the saved name
+    /// must be non-empty and bounded, and a non-editable name must come
+    /// back unchanged.
+    pub fn validate_for(&self, request: &LauncherEditRequest) -> Result<(), String> {
+        let Self::Saved { name } = self else {
+            return Ok(());
+        };
+        if name.trim().is_empty() || name.len() > MAX_LAUNCHER_NAME_BYTES || name.contains('\0') {
+            return Err("prompter returned an empty, oversized, or NUL name".into());
+        }
+        if !request.editable_name && name != &request.name {
+            return Err("prompter changed a non-editable launcher name".into());
+        }
+        Ok(())
+    }
 }
 
 /// One filesystem path encoded as its native Unix bytes.
@@ -369,46 +655,7 @@ impl FileChooserRequest {
                 return Err("filter labels and rules must not be empty".into());
             }
         }
-        let mut ids = std::collections::BTreeSet::new();
-        for choice in &self.choices {
-            if choice.id.is_empty() || choice.label.is_empty() {
-                return Err("choice ids and labels must not be empty".into());
-            }
-            if !ids.insert(choice.id.as_str()) {
-                return Err(format!("duplicate choice id {:?}", choice.id));
-            }
-            if choice
-                .options
-                .iter()
-                .any(|(id, label)| id.is_empty() || label.is_empty())
-            {
-                return Err(format!("choice {:?} contains an empty option", choice.id));
-            }
-            let mut option_ids = std::collections::BTreeSet::new();
-            if choice
-                .options
-                .iter()
-                .any(|(id, _)| !option_ids.insert(id.as_str()))
-            {
-                return Err(format!("choice {:?} has duplicate option ids", choice.id));
-            }
-            if choice.options.is_empty() {
-                if !matches!(choice.selected.as_str(), "" | "true" | "false") {
-                    return Err(format!(
-                        "boolean choice {:?} has invalid value {:?}",
-                        choice.id, choice.selected
-                    ));
-                }
-            } else if !choice.selected.is_empty()
-                && !choice.options.iter().any(|(id, _)| id == &choice.selected)
-            {
-                return Err(format!(
-                    "choice {:?} selects unknown option {:?}",
-                    choice.id, choice.selected
-                ));
-            }
-        }
-        Ok(())
+        validate_choices(&self.choices)
     }
 
     /// Apply `SaveFiles` basename and collision semantics to the selected
@@ -491,25 +738,7 @@ impl FileChooserResponse {
             }
         }
 
-        if choices.len() != request.choices.len() {
-            return Err("prompter returned the wrong number of choices".into());
-        }
-        for ((id, selected), requested) in choices.iter().zip(&request.choices) {
-            if id != &requested.id {
-                return Err(format!("prompter returned unexpected choice id {id:?}"));
-            }
-            let valid = if requested.options.is_empty() {
-                matches!(selected.as_str(), "true" | "false")
-            } else {
-                requested.options.iter().any(|(value, _)| value == selected)
-            };
-            if !valid {
-                return Err(format!(
-                    "prompter returned invalid value {selected:?} for choice {id:?}"
-                ));
-            }
-        }
-        Ok(())
+        validate_choice_answers(choices, &request.choices)
     }
 }
 
@@ -633,6 +862,7 @@ mod tests {
             title: "Share".into(),
             body: "Share account information?".into(),
             accept_label: Some("_Share".into()),
+            deny_label: Some("_Refuse".into()),
             modal: true,
             parent_window: Some("wayland:parent".into()),
         });
@@ -663,6 +893,7 @@ mod tests {
             title: String::new(),
             body: "Body".into(),
             accept_label: None,
+            deny_label: None,
             modal: true,
             parent_window: None,
         });
@@ -783,5 +1014,182 @@ mod tests {
         let paths = req.finish_paths(vec![folder.clone()]).unwrap();
         assert_eq!(paths, [folder.join("same.txt"), folder.join("same(1).txt")]);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    fn choose_app_request() -> ChooseAppRequest {
+        ChooseAppRequest {
+            app_id: "dev.aegis.Test".into(),
+            title: "Open with".into(),
+            content_type: "text/plain".into(),
+            parent_window: Some("wayland:parent".into()),
+            apps: vec![
+                AppChoice {
+                    id: "org.foo.Editor.desktop".into(),
+                    name: "Foo Editor".into(),
+                    icon: Some("foo-editor".into()),
+                },
+                AppChoice {
+                    id: "org.bar.Notes.desktop".into(),
+                    name: "Bar Notes".into(),
+                    icon: None,
+                },
+            ],
+            choices: vec![Choice {
+                id: "remember".into(),
+                label: "Remember this choice".into(),
+                options: Vec::new(),
+                selected: "false".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn choose_app_contract_round_trips() {
+        let request = PrompterRequest::choose_app(choose_app_request());
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["version"], PROCESS_CONTRACT_VERSION);
+        assert_eq!(value["prompt"]["kind"], "choose_app");
+        assert!(matches!(
+            serde_json::from_value::<PrompterRequest>(value)
+                .unwrap()
+                .into_prompt()
+                .unwrap(),
+            PromptRequest::ChooseApp(_)
+        ));
+
+        let response = PrompterResponse::choose_app(ChooseAppResponse::Selected {
+            app: "org.bar.Notes.desktop".into(),
+            choices: vec![("remember".into(), "true".into())],
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["result"]["kind"], "choose_app");
+        assert_eq!(encoded["result"]["response"]["status"], "selected");
+        let PromptResult::ChooseApp(decoded) = serde_json::from_value::<PrompterResponse>(encoded)
+            .unwrap()
+            .into_result()
+            .unwrap()
+        else {
+            panic!("expected a choose_app result");
+        };
+        assert!(decoded.validate_for(&choose_app_request()).is_ok());
+    }
+
+    #[test]
+    fn choose_app_request_validation_is_bounded() {
+        let mut request = choose_app_request();
+
+        let mut no_apps = request.clone();
+        no_apps.apps.clear();
+        assert!(no_apps.validate().is_err());
+
+        let mut duplicate = request.clone();
+        duplicate.apps.push(duplicate.apps[0].clone());
+        assert!(duplicate.validate().is_err());
+
+        let mut unnamed = request.clone();
+        unnamed.apps[0].name.clear();
+        assert!(unnamed.validate().is_err());
+
+        request.choices[0].selected = "maybe".into();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn choose_app_response_is_checked_against_the_request() {
+        let request = choose_app_request();
+        let unknown_app = ChooseAppResponse::Selected {
+            app: "org.evil.NotOffered.desktop".into(),
+            choices: vec![("remember".into(), "false".into())],
+        };
+        assert!(unknown_app.validate_for(&request).is_err());
+
+        let wrong_choice = ChooseAppResponse::Selected {
+            app: "org.foo.Editor.desktop".into(),
+            choices: vec![("remember".into(), "yes".into())],
+        };
+        assert!(wrong_choice.validate_for(&request).is_err());
+
+        assert!(ChooseAppResponse::Cancelled.validate_for(&request).is_ok());
+    }
+
+    fn launcher_edit_request() -> LauncherEditRequest {
+        LauncherEditRequest {
+            app_id: "dev.aegis.Test".into(),
+            title: "Install Launcher".into(),
+            name: "Cool App".into(),
+            editable_name: true,
+            target: None,
+            icon_label: Some("cool-app".into()),
+            modal: true,
+            parent_window: Some("wayland:parent".into()),
+        }
+    }
+
+    #[test]
+    fn launcher_edit_contract_round_trips() {
+        let request = PrompterRequest::launcher_edit(launcher_edit_request());
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["version"], PROCESS_CONTRACT_VERSION);
+        assert_eq!(value["prompt"]["kind"], "launcher_edit");
+        assert!(matches!(
+            serde_json::from_value::<PrompterRequest>(value)
+                .unwrap()
+                .into_prompt()
+                .unwrap(),
+            PromptRequest::LauncherEdit(_)
+        ));
+
+        let response = PrompterResponse::launcher_edit(LauncherEditResponse::Saved {
+            name: "Renamed App".into(),
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["result"]["kind"], "launcher_edit");
+        assert_eq!(encoded["result"]["response"]["status"], "saved");
+        let PromptResult::LauncherEdit(decoded) =
+            serde_json::from_value::<PrompterResponse>(encoded)
+                .unwrap()
+                .into_result()
+                .unwrap()
+        else {
+            panic!("expected a launcher_edit result");
+        };
+        assert!(decoded.validate_for(&launcher_edit_request()).is_ok());
+    }
+
+    #[test]
+    fn launcher_edit_names_are_bounded_and_edit_rules_hold() {
+        let mut request = launcher_edit_request();
+        // An empty proposed name is valid only when the user can type one.
+        request.name.clear();
+        assert!(request.validate().is_ok());
+        request.editable_name = false;
+        assert!(request.validate().is_err());
+
+        let mut request = launcher_edit_request();
+        request.name = "x".repeat(1025);
+        assert!(request.validate().is_err());
+
+        let request = launcher_edit_request();
+        let empty = LauncherEditResponse::Saved { name: " ".into() };
+        assert!(empty.validate_for(&request).is_err());
+
+        // A non-editable name must come back unchanged.
+        let request = LauncherEditRequest {
+            editable_name: false,
+            ..launcher_edit_request()
+        };
+        let renamed = LauncherEditResponse::Saved {
+            name: "Sneaky".into(),
+        };
+        assert!(renamed.validate_for(&request).is_err());
+        let unchanged = LauncherEditResponse::Saved {
+            name: "Cool App".into(),
+        };
+        assert!(unchanged.validate_for(&request).is_ok());
+        assert!(
+            LauncherEditResponse::Cancelled
+                .validate_for(&request)
+                .is_ok()
+        );
     }
 }

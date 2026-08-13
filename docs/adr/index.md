@@ -5,6 +5,7 @@
 | [0001](0001-repository-and-compatibility-boundary.md) | Repository and compatibility boundary | Superseded by [0002](0002-resource-authority-and-file-chooser-process-boundary.md) |
 | [0002](0002-resource-authority-and-file-chooser-process-boundary.md) | Resource authority and FileChooser process boundary | Superseded by [0003](0003-production-interface-boundary.md) |
 | [0003](0003-production-interface-boundary.md) | Production interface and secret boundary | Superseded by [0004](0004-portal-ownership-and-runtime-ipc-boundary.md) |
-| [0004](0004-portal-ownership-and-runtime-ipc-boundary.md) | Portal ownership and runtime IPC boundary | Accepted |
+| [0004](0004-portal-ownership-and-runtime-ipc-boundary.md) | Portal ownership and runtime IPC boundary | Accepted (interface boundary extended by [0007](0007-full-stack-interface-ownership.md)) |
 | [0005](0005-screencast-dmabuf-slot-protocol.md) | ScreenCast dmabuf transport and the slot protocol | Accepted (fallback amended by [0006](0006-shm-consumers-switch-to-readback-transport.md)) |
 | [0006](0006-shm-consumers-switch-to-readback-transport.md) | SHM consumers switch the compositor stream to the readback transport | Accepted |
+| [0007](0007-full-stack-interface-ownership.md) | Full-stack interface ownership | Accepted |

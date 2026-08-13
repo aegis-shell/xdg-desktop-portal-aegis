@@ -1,4 +1,4 @@
-//! Portal-owned projection of Aegis IPC protocol version 24.
+//! Portal-owned projection of Aegis IPC protocol version 26.
 //!
 //! Only compositor-owned portal resources belong here. The wire types are
 //! implemented independently from the compositor's Rust model so an internal
@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Newest protocol version this projection speaks. The handshake asks for
 /// this version and accepts a downgrade to [`MIN_PROTOCOL_VERSION`] when the
 /// compositor is older (version-gated features, such as dmabuf slot
-/// streaming at 25, key off the negotiated version).
-pub const PROTOCOL_VERSION: u32 = 25;
+/// streaming at 25 and wallpaper application at 26, key off the negotiated
+/// version).
+pub const PROTOCOL_VERSION: u32 = 26;
 /// Oldest protocol version this projection can negotiate down to.
 pub const MIN_PROTOCOL_VERSION: u32 = 24;
 pub const LOCAL_PORTAL_SCOPE: &str = "aegis-portal";
@@ -213,6 +214,22 @@ pub enum ConfirmPickResult {
     Cancelled,
 }
 
+/// Where a wallpaper is applied (protocol 26). The wire names mirror the
+/// portal spec's `set-on` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WallpaperPlacement {
+    #[default]
+    Background,
+    Lockscreen,
+    Both,
+}
+
+/// The largest wallpaper image the `SetWallpaper` op transports. Smaller
+/// than the blob channel's own ceiling: a wallpaper is a still image, and
+/// 64 MiB covers 8K PNGs with headroom.
+pub const MAX_WALLPAPER_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -288,6 +305,17 @@ pub(crate) enum Request {
         body: String,
         accept_label: Option<String>,
     },
+    /// Set the desktop wallpaper (protocol 26). The image bytes follow the
+    /// request header on the blob channel as one sealed memfd — the same
+    /// transport `CaptureOutput` uses for its PNG payload, reversed. The
+    /// portal scope's existing `control` capability covers the op; no new
+    /// capability bit is added.
+    SetWallpaper {
+        placement: WallpaperPlacement,
+        /// Length of the sealed image blob that follows, 1..=
+        /// [`MAX_WALLPAPER_BYTES`].
+        image_bytes: u64,
+    },
 }
 
 /// Partial response projection. Unknown fields inside known responses are
@@ -337,6 +365,9 @@ pub(crate) enum Response {
     ConfirmPicked {
         result: ConfirmPickResult,
     },
+    /// Reply to [`Request::SetWallpaper`] (protocol 26): the image was
+    /// applied. Refusals arrive as `Error`.
+    WallpaperApplied,
     LeaseRenewed {
         lease: LeaseGrant,
     },
@@ -409,8 +440,10 @@ mod tests {
 
     #[test]
     fn hello_matches_the_v25_wire_shape() {
+        // The literal 25 keeps this fixture pinned to the v25 shape even
+        // though PROTOCOL_VERSION has moved on.
         let request = Request::Hello {
-            version: PROTOCOL_VERSION,
+            version: 25,
             caps: ConnectionCapabilities::QUERY,
             scope: None,
             lease: None,
@@ -430,6 +463,59 @@ mod tests {
                 "scope": null
             })
         );
+    }
+
+    #[test]
+    fn hello_matches_the_v26_wire_shape() {
+        let request = Request::Hello {
+            version: PROTOCOL_VERSION,
+            caps: ConnectionCapabilities::QUERY,
+            scope: None,
+            lease: None,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type": "Hello",
+                "version": 26,
+                "caps": {
+                    "query": true,
+                    "control": false,
+                    "input": false,
+                    "session": false,
+                    "interaction_domain": false
+                },
+                "scope": null
+            })
+        );
+    }
+
+    #[test]
+    fn wallpaper_operations_match_the_v26_wire_fixtures() {
+        let request = Request::SetWallpaper {
+            placement: WallpaperPlacement::Both,
+            image_bytes: 4096,
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "type": "SetWallpaper",
+                "placement": "both",
+                "image_bytes": 4096
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(WallpaperPlacement::Background).unwrap(),
+            serde_json::json!("background")
+        );
+        assert_eq!(
+            serde_json::to_value(WallpaperPlacement::Lockscreen).unwrap(),
+            serde_json::json!("lockscreen")
+        );
+
+        let response: Response =
+            serde_json::from_value(serde_json::json!({ "type": "WallpaperApplied" })).unwrap();
+        assert_eq!(response, Response::WallpaperApplied);
     }
 
     #[test]

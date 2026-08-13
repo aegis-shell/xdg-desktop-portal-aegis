@@ -16,7 +16,7 @@ use crate::schema::{Request, Response};
 use crate::{
     ConfirmPickResult, ConnectionCapabilities, Event, LOCAL_PORTAL_SCOPE, LeaseGrant,
     PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
-    StreamTarget,
+    StreamTarget, WallpaperPlacement,
 };
 
 pub struct CaptureOutputPayload {
@@ -118,6 +118,17 @@ pub trait Handler: Send + Sync + 'static {
 
     /// Protocol-25 slot release from the client.
     fn stream_buffer_release(&self, _stream_id: u64, _slot: u32) {}
+
+    /// Protocol-26 wallpaper application. `image` is the sealed blob's
+    /// contents, already received by the server.
+    fn set_wallpaper(
+        &self,
+        _connection: u64,
+        _placement: WallpaperPlacement,
+        _image: Vec<u8>,
+    ) -> Result<(), String> {
+        Err("wallpaper is not implemented by this test server".into())
+    }
 
     fn streams_disconnected(&self, _connection: u64) {}
 }
@@ -527,6 +538,19 @@ fn serve_connection(
                 streams.lock().unwrap().remove(&stream_id);
                 handler.stream_output_stop(stream_id);
                 send(&writer, &Response::StreamOutputStopped { stream_id })
+            }
+            Request::SetWallpaper {
+                placement,
+                image_bytes,
+            } => {
+                // The sealed image blob follows the request header.
+                match crate::blob::receive(&reader, image_bytes) {
+                    Ok(image) => match handler.set_wallpaper(connection, placement, image) {
+                        Ok(()) => send(&writer, &Response::WallpaperApplied),
+                        Err(message) => send_error(&writer, message),
+                    },
+                    Err(error) => Err(error),
+                }
             }
         };
         if result.is_err() {

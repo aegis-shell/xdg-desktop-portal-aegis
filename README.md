@@ -4,19 +4,21 @@
 [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)
 backend for the Aegis desktop. It translates freedesktop portal D-Bus
 requests into Portal-owned services and, only for compositor resources, a
-narrow projection of Aegis IPC protocol 24. It publishes ScreenCast streams
+narrow projection of Aegis IPC (protocol 26, negotiating down to 24). It
+publishes ScreenCast streams
 through PipeWire and hosts the encrypted, per-application Secret portal.
 
-The repository builds a D-Bus-activated backend plus a disposable FileChooser
+The repository builds a D-Bus-activated backend plus an optics (iris/lens)
 UI host from a small Cargo workspace:
 
 - `xdg-desktop-portal-aegis` assembles the backend interfaces, IPC adapters,
   and workers.
-- `aegis-portal-ipc` implements the protocol-24 settings, capture, picking,
-  and streaming wire contract without depending on Aegis source crates.
+- `aegis-portal-ipc` implements the settings, capture, picking, streaming,
+  and wallpaper wire contract without depending on Aegis source crates.
 - `aegis-portal-prompter` runs one optics (iris/lens) interaction per
-  request. It owns file browsing, Account consent, and Secret password input
-  and never connects to compositor IPC.
+  request. It owns file browsing, consent dialogs, the application chooser,
+  the launcher name editor, and Secret password input, and it hosts the
+  long-lived notification daemon. It never connects to compositor IPC.
 - `aegis-portal-runtime` owns the shared portal Request lifecycle.
 - `aegis-portal-secret` owns the encrypted vault and native Secret backend.
 - `aegis-pam` optionally forwards a verified login password for vault
@@ -24,8 +26,9 @@ UI host from a small Cargo workspace:
 
 ## Compatibility
 
-Portal and Aegis releases have independent version sequences. Portal `v0.0.9`
-implements Aegis IPC protocol 24; its wire schema is
+Portal and Aegis releases have independent version sequences. The current
+workspace speaks Aegis IPC protocol 26 and negotiates down to 24; its wire
+schema is
 verified against Aegis `v0.0.11` and `v0.0.12`. This is a runtime
 compatibility contract, not a source dependency; see the
 [Compatibility Reference](docs/reference/compatibility.md).
@@ -53,8 +56,8 @@ Meson installs both private executables under `libexecdir`, generates the
 D-Bus activation file with that exact path, and installs the portal metadata
 and routing configuration. The optional PAM module is enabled with
 `-Dpam=true`; it requires PAM development files. A production installation
-also requires `xdg-desktop-portal-gtk` for interfaces intentionally delegated
-to the GTK backend. See [How to Install for Production](docs/how-to/install-production.md).
+needs no other portal backend: every routed interface is served natively.
+See [How to Install for Production](docs/how-to/install-production.md).
 
 The repository's own source is MIT-licensed. A binary package that includes
 the optional `pam_aegis.so` module must additionally declare GPL-3.0-only

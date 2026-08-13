@@ -9,7 +9,16 @@
 //! `org.freedesktop.impl.portal.Lockdown`,
 //! `org.freedesktop.impl.portal.FileChooser`,
 //! `org.freedesktop.impl.portal.Email`,
-//! and `org.freedesktop.impl.portal.Account` at
+//! `org.freedesktop.impl.portal.Account`,
+//! `org.freedesktop.impl.portal.Access` v1,
+//! and `org.freedesktop.impl.portal.AppChooser` v4,
+//! and `org.freedesktop.impl.portal.OpenURI` v3,
+//! and `org.freedesktop.impl.portal.Background` v1,
+//! and `org.freedesktop.impl.portal.DynamicLauncher` v1,
+//! and `org.freedesktop.impl.portal.Inhibit` v3,
+//! and `org.freedesktop.impl.portal.Notification` v2,
+//! and `org.freedesktop.impl.portal.Wallpaper` v1,
+//! and `org.freedesktop.impl.portal.Print` at
 //! `/org/freedesktop/portal/desktop` under the well-known name
 //! `org.freedesktop.impl.portal.desktop.aegis`. Secret is backed by an
 //! encrypted at-rest vault. FileChooser launches one portal-owned optics
@@ -19,8 +28,11 @@
 //! `aegis-portal` named scope with a sealed-memfd blob transfer
 //! transport, screencast frames arrive through the same scope's output-frame
 //! stream and are republished as a PipeWire producer stream. Account consent,
-//! the file chooser, and password-mode vault unlock are Portal-owned UI and
-//! do not cross compositor IPC. No Wayland capture protocol is added anywhere.
+//! the file chooser, password-mode vault unlock, and the app chooser
+//! (backed by the backend's own freedesktop desktop-file/mimeapps
+//! resolution, which also resolves and launches OpenURI targets) are
+//! Portal-owned UI and do not cross compositor IPC.
+//! No Wayland capture protocol is added anywhere.
 //!
 //! The process uses zbus's blocking API on the session bus and plain
 //! `std::thread` workers without an async runtime. Method dispatch runs on
@@ -30,18 +42,28 @@
 //! bus, and every screencast runs its own PipeWire main loop on a dedicated
 //! cast thread.
 
+mod access;
 mod account;
+mod app_chooser;
+mod apps;
+mod background;
 mod cast;
+mod dynamic_launcher;
 mod email;
 mod file_chooser;
 mod files;
+mod inhibit;
 mod ipc;
 mod lockdown;
+mod notification;
+mod open_uri;
+mod print;
 mod prompter;
 mod screencast;
 mod screenshot;
 mod session;
 mod settings;
+mod wallpaper;
 
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -131,6 +153,18 @@ pub fn run() -> Result<(), PortalError> {
     let (file_chooser_jobs, file_chooser_rx) =
         mpsc::sync_channel::<file_chooser::FileChooserJob>(MAX_QUEUED_REQUESTS);
     let (account_jobs, account_rx) = mpsc::sync_channel::<account::AccountJob>(MAX_QUEUED_REQUESTS);
+    let (access_jobs, access_rx) = mpsc::sync_channel::<access::AccessJob>(MAX_QUEUED_REQUESTS);
+    let (app_chooser_jobs, app_chooser_rx) =
+        mpsc::sync_channel::<app_chooser::AppChooserJob>(MAX_QUEUED_REQUESTS);
+    let (open_uri_jobs, open_uri_rx) =
+        mpsc::sync_channel::<open_uri::OpenUriJob>(MAX_QUEUED_REQUESTS);
+    let (background_jobs, background_rx) =
+        mpsc::sync_channel::<background::BackgroundJob>(MAX_QUEUED_REQUESTS);
+    let (dynamic_launcher_jobs, dynamic_launcher_rx) =
+        mpsc::sync_channel::<dynamic_launcher::DynamicLauncherJob>(MAX_QUEUED_REQUESTS);
+    let (wallpaper_jobs, wallpaper_rx) =
+        mpsc::sync_channel::<wallpaper::WallpaperJob>(MAX_QUEUED_REQUESTS);
+    let (print_jobs, print_rx) = mpsc::sync_channel::<print::PrintJob>(MAX_QUEUED_REQUESTS);
     let settings_store = SettingsStore::default();
     settings::prime_store(&socket, &settings_store);
 
@@ -187,6 +221,74 @@ pub fn run() -> Result<(), PortalError> {
             jobs: account_jobs.clone(),
         },
     )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        access::AccessIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: access_jobs.clone(),
+        },
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        app_chooser::AppChooserIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: app_chooser_jobs.clone(),
+        },
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        open_uri::OpenUriIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: open_uri_jobs.clone(),
+        },
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        background::BackgroundIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: background_jobs.clone(),
+        },
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        dynamic_launcher::DynamicLauncherIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: dynamic_launcher_jobs.clone(),
+        },
+    )?;
+    // Inhibit calls logind in-method (one fast system-bus round trip); no
+    // worker, no compositor IPC.
+    conn.object_server().at(
+        DESKTOP_PATH,
+        inhibit::InhibitIface::new(conn.inner().clone(), Arc::clone(&tracker)),
+    )?;
+    // Notification supervises the daemon-mode prompter itself (lazily
+    // spawned on the first AddNotification); no worker, no Request objects.
+    conn.object_server().at(
+        DESKTOP_PATH,
+        notification::NotificationIface::new(conn.clone()),
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        wallpaper::WallpaperIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: wallpaper_jobs.clone(),
+        },
+    )?;
+    conn.object_server().at(
+        DESKTOP_PATH,
+        print::PrintIface {
+            conn: conn.inner().clone(),
+            tracker: Arc::clone(&tracker),
+            jobs: print_jobs.clone(),
+        },
+    )?;
 
     secret_service.register_portal(&conn, Arc::clone(&tracker), DESKTOP_PATH)?;
     secret_service.start_pam_watcher();
@@ -241,12 +343,87 @@ pub fn run() -> Result<(), PortalError> {
             PortalError::Bus(zbus::Error::Failure(format!("spawn account worker: {e}")))
         })?;
 
+    let access_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-access".to_string())
+        .spawn(move || access::access_worker(access_rx, access_tracker))
+        .map_err(|e| PortalError::Bus(zbus::Error::Failure(format!("spawn access worker: {e}"))))?;
+
+    // AppChooser uses the same per-request supervised prompter pattern as
+    // Access; candidate resolution happens in the served method.
+    let app_chooser_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-app-chooser".to_string())
+        .spawn(move || app_chooser::app_chooser_worker(app_chooser_rx, app_chooser_tracker))
+        .map_err(|e| {
+            PortalError::Bus(zbus::Error::Failure(format!(
+                "spawn app chooser worker: {e}"
+            )))
+        })?;
+
+    // OpenURI launches resolved applications itself and reuses the
+    // AppChooser dialog when the user must pick one.
+    let open_uri_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-open-uri".to_string())
+        .spawn(move || open_uri::open_uri_worker(open_uri_rx, open_uri_tracker))
+        .map_err(|e| {
+            PortalError::Bus(zbus::Error::Failure(format!("spawn open uri worker: {e}")))
+        })?;
+
+    // Background consent uses the same supervised confirmation prompt as
+    // Access; the autostart entry write happens on the worker task.
+    let background_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-background".to_string())
+        .spawn(move || background::background_worker(background_rx, background_tracker))
+        .map_err(|e| {
+            PortalError::Bus(zbus::Error::Failure(format!(
+                "spawn background worker: {e}"
+            )))
+        })?;
+
+    // DynamicLauncher's backend surface is the install-confirmation dialog
+    // only; the frontend performs the actual installation.
+    let dynamic_launcher_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-dynamic-launcher".to_string())
+        .spawn(move || {
+            dynamic_launcher::dynamic_launcher_worker(dynamic_launcher_rx, dynamic_launcher_tracker)
+        })
+        .map_err(|e| {
+            PortalError::Bus(zbus::Error::Failure(format!(
+                "spawn dynamic launcher worker: {e}"
+            )))
+        })?;
+
+    // Wallpaper crosses the compositor IPC (protocol 26) and does slow
+    // image I/O, so it gets the standard per-request task worker.
+    let wallpaper_tracker = Arc::clone(&tracker);
+    let wallpaper_socket = socket.clone();
+    std::thread::Builder::new()
+        .name("aegis-portal-wallpaper".to_string())
+        .spawn(move || {
+            wallpaper::wallpaper_worker(wallpaper_rx, wallpaper_tracker, wallpaper_socket)
+        })
+        .map_err(|e| {
+            PortalError::Bus(zbus::Error::Failure(format!("spawn wallpaper worker: {e}")))
+        })?;
+
+    // Print spools the document and hands it to the system `lp` client
+    // (the email/xdg-email hand-off precedent).
+    let print_tracker = Arc::clone(&tracker);
+    std::thread::Builder::new()
+        .name("aegis-portal-print".to_string())
+        .spawn(move || print::print_worker(print_rx, print_tracker))
+        .map_err(|e| PortalError::Bus(zbus::Error::Failure(format!("spawn print worker: {e}"))))?;
+
     settings::spawn_watcher(conn.clone(), socket, settings_store).map_err(PortalError::Worker)?;
 
     conn.request_name(BUS_NAME)?;
 
     log::info!(
-        "portal: serving Settings+Screenshot+ScreenCast+Secret+Lockdown+FileChooser+Email+Account as {BUS_NAME}"
+        "portal: serving Settings+Screenshot+ScreenCast+Secret+Lockdown+FileChooser+Email+Account+Access+AppChooser+OpenURI+Background+DynamicLauncher+Inhibit+Notification+Wallpaper+Print as {BUS_NAME}"
     );
 
     // Keep the main thread tied to the bus connection. A disconnected
@@ -294,15 +471,28 @@ mod integration_metadata_tests {
                 "org.freedesktop.impl.portal.FileChooser",
                 "org.freedesktop.impl.portal.Email",
                 "org.freedesktop.impl.portal.Account",
+                "org.freedesktop.impl.portal.Access",
+                "org.freedesktop.impl.portal.AppChooser",
+                "org.freedesktop.impl.portal.OpenURI",
+                "org.freedesktop.impl.portal.Background",
+                "org.freedesktop.impl.portal.DynamicLauncher",
+                "org.freedesktop.impl.portal.Inhibit",
+                "org.freedesktop.impl.portal.Notification",
+                "org.freedesktop.impl.portal.Wallpaper",
+                "org.freedesktop.impl.portal.Print",
             ]
         );
     }
 
     #[test]
-    fn aegis_is_the_default_with_gtk_as_the_safety_net() {
+    fn aegis_is_the_sole_backend_without_a_gtk_fallback() {
         assert!(
-            PORTALS_CONF.lines().any(|line| line == "default=aegis;gtk"),
-            "the routing default is Aegis with the GTK safety net"
+            PORTALS_CONF.lines().any(|line| line == "default=aegis"),
+            "the routing default is Aegis alone"
+        );
+        assert!(
+            !PORTALS_CONF.to_lowercase().contains("gtk"),
+            "no GTK fallback route or comment remains in the routing config"
         );
         for interface in [
             "Settings",
@@ -313,6 +503,15 @@ mod integration_metadata_tests {
             "FileChooser",
             "Email",
             "Account",
+            "Access",
+            "AppChooser",
+            "OpenURI",
+            "Background",
+            "DynamicLauncher",
+            "Inhibit",
+            "Notification",
+            "Wallpaper",
+            "Print",
         ] {
             let route = format!("org.freedesktop.impl.portal.{interface}=aegis");
             assert!(
@@ -320,20 +519,14 @@ mod integration_metadata_tests {
                 "missing explicit Aegis route for {interface}"
             );
         }
-        assert!(!PORTALS_CONF.contains("Background=aegis"));
-        for interface in [
-            "Inhibit",
-            "AppChooser",
-            "Notification",
-            "DynamicLauncher",
-            "Wallpaper",
-        ] {
-            assert!(
-                PORTALS_CONF
-                    .lines()
-                    .any(|line| { line == format!("org.freedesktop.impl.portal.{interface}=gtk") }),
-                "{interface} must be explicitly delegated to the complete GTK backend"
-            );
+        // Every interface routes to Aegis alone; no fallback backend exists.
+        for line in PORTALS_CONF.lines() {
+            if line.starts_with("org.freedesktop.") {
+                assert!(
+                    line.ends_with("=aegis"),
+                    "unexpected non-Aegis route: {line}"
+                );
+            }
         }
     }
 

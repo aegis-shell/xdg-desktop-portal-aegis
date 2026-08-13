@@ -197,7 +197,9 @@ pub fn edit_surface(f: &mut Frame, dark: bool, surface: EditSurface<'_>) -> lens
         compose(
             before,
             after,
-            surface.preedit.map(|preedit| (preedit.text.as_str(), preedit.cursor)),
+            surface
+                .preedit
+                .map(|preedit| (preedit.text.as_str(), preedit.cursor)),
         )
     };
 

@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 use aegis_portal_prompter::{
-    BytePath, Choice, FileFilter, FilterRule, FilterRuleKind, PromptRequest, PrompterResponse,
-    FileChooserMode, FileChooserRequest, FileChooserResponse,
+    BytePath, Choice, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter,
+    FilterRule, FilterRuleKind, PromptRequest, PrompterResponse,
 };
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};

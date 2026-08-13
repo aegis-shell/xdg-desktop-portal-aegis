@@ -178,6 +178,7 @@ fn run_request(
             title: "Share Personal Information".to_string(),
             body,
             accept_label: Some("_Share".to_string()),
+            deny_label: None,
             modal: true,
             parent_window,
         }),

@@ -1,9 +1,14 @@
 //! One-shot optics (iris/lens) host for portal prompt requests.
 //!
 //! The backend writes one versioned JSON request to stdin; this process shows
-//! the matching native dialog (file chooser, confirmation, or secret
-//! password) and writes one versioned JSON response to stdout. The wire
-//! contract lives in `aegis_portal_prompter`; this binary only renders it.
+//! the matching native dialog (file chooser, confirmation, secret password,
+//! or application chooser) and writes one versioned JSON response to stdout.
+//! The wire contract lives in `aegis_portal_prompter`; this binary only
+//! renders it.
+//!
+//! With `--notification-daemon` the process instead runs the long-lived
+//! notification daemon (stream protocol in `aegis_portal_prompter::notify`,
+//! UI in `ui::notify`).
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -16,6 +21,9 @@ const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if std::env::args().nth(1).as_deref() == Some("--notification-daemon") {
+        return ui::notify::run_daemon();
+    }
     let response = match read_request().and_then(run_dialog) {
         Ok(response) => response,
         Err(message) => {
@@ -61,6 +69,8 @@ fn run_dialog(request: PromptRequest) -> Result<PrompterResponse, String> {
         PromptRequest::FileChooser(request) => ui::file_chooser::run(request)?,
         PromptRequest::Confirm(request) => ui::confirm::run(request)?,
         PromptRequest::Secret(request) => ui::secret::run(request)?,
+        PromptRequest::ChooseApp(request) => ui::choose_app::run(request)?,
+        PromptRequest::LauncherEdit(request) => ui::launcher_edit::run(request)?,
     };
     Ok(PrompterResponse {
         version: aegis_portal_prompter::PROCESS_CONTRACT_VERSION,

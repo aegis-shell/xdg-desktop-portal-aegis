@@ -5,7 +5,9 @@
 Install Rust 1.88 or newer, Meson, Ninja, `pkg-config`, the optics C
 libraries (flux, lens, and iris from the tagged `ming2k/optics` release),
 PipeWire and SPA development files, `xdg-desktop-portal`,
-`xdg-desktop-portal-gtk`, WirePlumber, and `xdg-email`. Install PAM
+WirePlumber, and `xdg-email`. Inhibit additionally uses logind and Print
+uses the CUPS `lp` client at runtime; both are ordinary session services,
+not build dependencies. Install PAM
 development files only when the optional PAM module is required.
 
 Install an Aegis runtime that implements the protocol version in the

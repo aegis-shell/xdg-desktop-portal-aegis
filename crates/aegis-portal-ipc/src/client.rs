@@ -11,9 +11,9 @@ use crate::blob;
 use crate::codec::{read_msg, write_msg};
 use crate::schema::{LeaseRequest, Request, Response};
 use crate::{
-    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
-    StreamTarget,
+    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MAX_WALLPAPER_BYTES,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot,
+    StreamPixelFormat, StreamTarget, WallpaperPlacement,
 };
 
 #[derive(Debug)]
@@ -279,6 +279,45 @@ impl Client {
             Response::ConfirmPicked { result } => Ok(result),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(unexpected("ConfirmPicked", &other)),
+        }
+    }
+
+    /// Apply a wallpaper image (protocol 26). The bytes cross as one sealed
+    /// memfd behind the request header — the capture blob transport in the
+    /// opposite direction. Older compositors answer with a clear
+    /// unsupported-version error before anything is sent.
+    pub fn set_wallpaper(&mut self, image: &[u8], placement: WallpaperPlacement) -> io::Result<()> {
+        if self.version < 26 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the compositor does not speak wallpaper (protocol 26; negotiated {})",
+                    self.version
+                ),
+            ));
+        }
+        if image.is_empty() || image.len() as u64 > MAX_WALLPAPER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "wallpaper image length {} is outside 1..={MAX_WALLPAPER_BYTES}",
+                    image.len()
+                ),
+            ));
+        }
+        let blob = blob::SealedBlob::new(image)?;
+        write_msg(
+            &mut self.stream,
+            &Request::SetWallpaper {
+                placement,
+                image_bytes: blob.len(),
+            },
+        )?;
+        blob.send(&self.stream)?;
+        match read_msg::<_, Response>(&mut self.stream)? {
+            Response::WallpaperApplied => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(unexpected("WallpaperApplied", &other)),
         }
     }
 

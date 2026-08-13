@@ -12,50 +12,57 @@
 | `org.freedesktop.impl.portal.FileChooser` | Current backend ABI | Open, save, directory, and multiple-file flows through a one-shot optics (iris/lens) process |
 | `org.freedesktop.impl.portal.Email` | Current backend ABI | `xdg-email` handoff, attachment URI validation, activation token forwarding |
 | `org.freedesktop.impl.portal.Account` | Current backend ABI | Name and optional avatar after explicit Portal-owned confirmation |
+| `org.freedesktop.impl.portal.Access` | Version 1 | Frontend-driven consent dialog through the one-shot prompter, honoring the supplied deny/grant labels |
+| `org.freedesktop.impl.portal.AppChooser` | Version 4 | Portal-owned chooser over in-process desktop-file/mimeapps resolution; live `UpdateChoices` acknowledged but not rendered; a "Remember this choice" checkbox writes `mimeapps.list` defaults |
+| `org.freedesktop.impl.portal.OpenURI` | Version 3 | In-process content-type (`globs2`) and default-app resolution; the `ask` flow reuses the chooser; `file://` targets only, other schemes resolve as `x-scheme-handler/*`; `Terminal=true` entries are refused; `writable`/`activation_token` ignored |
+| `org.freedesktop.impl.portal.Background` | Version 1 | Consent prompt on every request (no permission-store persistence); autostart writes `$XDG_CONFIG_HOME/autostart/<app_id>.desktop` atomically, mode 0644 |
+| `org.freedesktop.impl.portal.DynamicLauncher` | Version 1 | Portal-owned install-confirmation dialog with name editing (the icon is echoed verbatim, never edited); install tokens are never issued; Application and Webapp types |
+| `org.freedesktop.impl.portal.Inhibit` | Version 3 | logind-backed idle/suspend inhibition in `block` mode; logout and user-switch are tracked no-ops; monitors get one `StateChanged` (Running), and `QueryEndResponse` is an acknowledged no-op |
+| `org.freedesktop.impl.portal.Notification` | Version 2 | Portal-owned notification daemon window stacking cards (text and buttons only; icons, sounds, and action targets ignored); low/normal priority auto-dismisses after 5/10 seconds, high/urgent persists |
+| `org.freedesktop.impl.portal.Wallpaper` | Version 1 | Local `file://` images up to 64 MiB, optional textual preview confirmation; application over the protocol-26 `SetWallpaper` IPC op requires a protocol-26 compositor |
+| `org.freedesktop.impl.portal.Print` | Version 3 | `PreparePrint` echoes settings and page setup with a fresh token; `Print` spools to a private temp file and submits to the default printer through the system `lp` client |
 
 `FileChooser`, `Email`, and `Account` do not define a backend `version`
-property. The backend does not add one.
+property. The backend does not add one. The Print backend serves version 3:
+its impl interface XML defines no version property, so the property reports
+the local frontend contract level it implements.
 
-## Delegated Interfaces
+## Unserved Interfaces
 
-| Interface | Route | Reason |
-|-----------|-------|--------|
-| `Inhibit` | `gtk` | Aegis has no complete logout, switch-user, suspend, idle, and monitor contract |
-| `AppChooser` | `gtk` | Aegis has no complete live choice-update and activation-token contract |
-| `Notification` | `gtk` | Aegis notifications do not represent all portal actions and metadata |
-| `DynamicLauncher` | `gtk` | Aegis does not implement the complete editable launcher contract |
-| `Wallpaper` | `gtk` | Aegis does not implement every preview and destination option |
-
-All other unadvertised interfaces follow `default=aegis;gtk`; the portal
-frontend skips Aegis when `aegis.portal` does not advertise the requested
-interface.
+Every interface the routing configuration names is served natively by
+Aegis; the default route is `aegis` alone and no fallback backend is
+installed or required. Interfaces with no backend in this stack —
+Camera, RemoteDesktop, GlobalShortcuts, InputCapture, USB, Location, and
+Documents — are not advertised, and the portal frontend fails requests for
+them cleanly.
 
 ## Runtime Dependencies
 
 | Component | Purpose |
 |-----------|---------|
-| Aegis IPC protocol 24 | Compositor settings, screenshot capture and selection, capture consent, and ScreenCast frames |
+| Aegis IPC protocol 26 | Compositor settings, screenshot capture and selection, capture consent, ScreenCast frames, and wallpaper application |
 | `xdg-desktop-portal` | Public portal frontend |
-| `xdg-desktop-portal-gtk` | Complete fallback interfaces |
-| GTK 4.10 or newer | One-shot FileChooser, Account, and Secret prompter process |
+| Optics (flux, lens, iris) shared libraries | All prompter UI processes, from the tagged `ming2k/optics` release |
 | PipeWire and WirePlumber | ScreenCast transport and routing |
+| logind (`org.freedesktop.login1`) | Inhibit locks; without it Inhibit calls fail with a backend error |
+| `lp` (CUPS client) | Print submission; without it `Print` answers with a backend error |
 | `xdg-email` | Email handoff |
 | PAM | Optional login-time vault unlock only |
 
 The release gates exercise two production integration baselines:
 
-| Baseline | Frontend | GTK | PipeWire | WirePlumber |
-|----------|----------|-----|----------|-------------|
-| Ubuntu 24.04 | 1.18.4 | 4.14.5 | 1.0.5 | 0.4.17 |
-| Current development | 1.20.4 | 4.22.4 | 1.6.4 | 0.5.14 |
+| Baseline | Frontend | PipeWire | WirePlumber |
+|----------|----------|----------|-------------|
+| Ubuntu 24.04 | 1.18.4 | 1.0.5 | 0.4.17 |
+| Current development | 1.20.4 | 1.6.4 | 0.5.14 |
 
-Meson enforces GTK 4.10 or newer, `libpipewire-0.3` 0.3 or newer, and the
+Meson enforces `libpipewire-0.3` 0.3 or newer and the
 SPA 0.2 development ABI. The Ubuntu baseline is tested with Rust 1.88, the
 minimum supported Rust version. Compatible newer releases remain supported
 through their stable ABIs.
 
 See the [Compatibility Reference](compatibility.md) for the Aegis releases
-whose protocol-24 wire schemas are verified by the current Portal line.
+whose wire schemas are verified by the current Portal line.
 
 ## Persistent State
 

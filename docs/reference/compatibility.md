@@ -21,7 +21,7 @@ dependency.
 Portal `v0.0.9` builds and tests without an Aegis checkout. Its committed
 `Cargo.lock` contains no package from the Aegis repository. A production
 installation still needs a running Aegis compositor because Settings,
-Screenshot, color and target selection, and ScreenCast consume
+Screenshot, color and target selection, ScreenCast, and Wallpaper consume
 compositor-owned resources.
 
 Protocol 24 is verified against the `v0.0.11` and `v0.0.12` schemas. Portal `v0.0.6`
@@ -29,10 +29,13 @@ offers protocol 25 at the handshake and accepts a
 downgrade to 24, so it keeps working with protocol-24 compositors using the
 SHM transports while protocol-25 compositors additionally provide the
 zero-copy dmabuf slot stream (see
-[ADR-0005](../adr/0005-screencast-dmabuf-slot-protocol.md)). A future Aegis
+[ADR-0005](../adr/0005-screencast-dmabuf-slot-protocol.md)). The current
+workspace offers protocol 26; the wallpaper op it adds is used only when
+the negotiated version is 26. A future Aegis
 release is compatible when it preserves protocol 24 or implements the
-verified protocol-25 schema.
+verified protocol-26 schema.
 
-FileChooser, Account, Secret, Email, and Lockdown do not require compositor
-IPC. FileChooser, Account confirmation, and Secret password input use the
+Only Settings, Screenshot, ScreenCast, and Wallpaper require compositor
+IPC; every other served interface is Portal-owned. FileChooser, Account
+confirmation, and Secret password input use the
 versioned one-shot Portal prompter contract.

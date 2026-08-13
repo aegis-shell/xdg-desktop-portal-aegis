@@ -87,7 +87,7 @@ jobs:
             libfribidi-dev libxkbcommon-dev \
             mesa-vulkan-drivers pipewire wireplumber \
             gstreamer1.0-pipewire gstreamer1.0-tools \
-            xdg-desktop-portal xdg-desktop-portal-gtk xdg-utils
+            xdg-desktop-portal xdg-utils
       - name: Build and install optics C libraries
         run: |
           meson setup optics/build optics \

@@ -2,9 +2,12 @@
 //! wrapper, per-frame input helpers, and the small `unsafe` island every
 //! raw FFI call is funneled through.
 
+pub mod choose_app;
 pub mod confirm;
 pub mod edit;
 pub mod file_chooser;
+pub mod launcher_edit;
+pub mod notify;
 pub mod secret;
 pub mod style;
 
@@ -148,6 +151,24 @@ pub fn close_window() {
     // SAFETY: called from inside the per-frame build callback on the run
     // thread; outside a run it is a documented no-op.
     unsafe { iris::sys::iris_window_close() };
+}
+
+/// Wake the iris run loop from another thread so the next build callback
+/// runs soon. The notification daemon's stdin reader uses this: a command
+/// arriving while the window is idle must be observed without waiting for
+/// unrelated input. A no-op when no run loop is active (the post is
+/// dropped, and the main thread is blocked on the command channel anyway).
+pub fn wake_main_thread() {
+    unsafe extern "C" fn kick(_user: *mut std::ffi::c_void) {
+        // Runs on the iris main thread inside the active run: scheduling
+        // one frame is exactly the wake the poster wants.
+        iris::request_animation_frame();
+    }
+    // SAFETY: `kick` is a valid trampoline ignoring its (null) user
+    // pointer; posting is thread-safe per the iris contract.
+    unsafe {
+        iris::sys::iris_post_to_main_thread(Some(kick), std::ptr::null_mut());
+    }
 }
 
 /// Truncate `text` to fit `max_width` logical pixels at body size, adding

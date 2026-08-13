@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aegis_portal_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE};
+use aegis_portal_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE, WallpaperPlacement};
 
 /// Lease TTL requested at handshake and renewal; matches the reference
 /// client's default (`LeaseRequest::default`).
@@ -154,5 +154,25 @@ impl PortalCapture {
         let client = self.client()?;
         client.set_io_timeout(Some(INTERACTION_TIMEOUT))?;
         client.pick_confirm(title, body, accept_label)
+    }
+}
+
+/// Apply a wallpaper image through the compositor (protocol 26). Unlike
+/// capture, the connection is per call: wallpaper changes are rare, so a
+/// fresh handshake (its lease dies with the connection) beats carrying a
+/// renewing client on the worker. One reconnect + retry hides transient
+/// failures, matching [`PortalCapture`]'s discipline.
+pub(crate) fn set_wallpaper(
+    socket: &Path,
+    image: &[u8],
+    placement: WallpaperPlacement,
+) -> io::Result<()> {
+    let mut client = connect_compositor(socket, RPC_TIMEOUT)?;
+    match client.set_wallpaper(image, placement) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            log::info!("portal: wallpaper IPC failed ({first}); reconnecting IPC");
+            connect_compositor(socket, RPC_TIMEOUT)?.set_wallpaper(image, placement)
+        }
     }
 }

@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use aegis_portal_prompter::{
     BytePath, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter, PromptResult,
 };
-use lens::{Align, Color, Frame, Input, LayoutOpts, ModalOpts, TableColumn, TableOpts, TextBuf, key, mods};
+use lens::{
+    Align, Color, Frame, Input, LayoutOpts, ModalOpts, TableColumn, TableOpts, TextBuf, key, mods,
+};
 use model::{
     Entry, History, Place, PlaceIcon, breadcrumbs, common_prefix, expand_tilde, list_dir,
     normalize_lexical, split_dir_tail, typeahead_index, valid_filename,
@@ -35,8 +37,8 @@ use model::{
 use super::style::{self, metrics};
 use super::{
     back_icon, close_window, command_held, committed_text, computer_icon, edit_icon,
-    escape_pressed, focus_widget, forward_icon, home_icon, key_pressed, modifiers,
-    new_folder_icon, parent_icon, raw_icon, run_window, truncate_to_width, window_title,
+    escape_pressed, focus_widget, forward_icon, home_icon, key_pressed, modifiers, new_folder_icon,
+    parent_icon, raw_icon, run_window, truncate_to_width, window_title,
 };
 
 /// Double-click window for "activate" (navigate/open) gestures.
@@ -856,7 +858,11 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                             f.textfield_set_caret("location-path", u32::MAX);
                             state.location_caret_end = false;
                         }
-                        f.textfield_placeholder("location-path", &mut state.location, "Type a path");
+                        f.textfield_placeholder(
+                            "location-path",
+                            &mut state.location,
+                            "Type a path",
+                        );
                         let response = f.response();
                         state.location_field_focused = response.focused;
                         if !response.focused {
@@ -1616,10 +1622,7 @@ mod ui_tests {
         tap(&mut ui, &mut state, key::RETURN);
         match &state.done {
             Some(FileChooserResponse::Selected { paths, .. }) => {
-                assert_eq!(
-                    paths,
-                    &vec![BytePath::from(fixture.0.join("notes.txt"))]
-                );
+                assert_eq!(paths, &vec![BytePath::from(fixture.0.join("notes.txt"))]);
             }
             other => panic!("expected selection, got {other:?}"),
         }
@@ -1701,10 +1704,7 @@ mod ui_tests {
         tap(&mut ui, &mut state, key::RETURN);
         match &state.done {
             Some(FileChooserResponse::Selected { paths, .. }) => {
-                assert_eq!(
-                    paths,
-                    &vec![BytePath::from(fixture.0.join("report.pdfx"))]
-                );
+                assert_eq!(paths, &vec![BytePath::from(fixture.0.join("report.pdfx"))]);
             }
             other => panic!("expected selection, got {other:?}"),
         }

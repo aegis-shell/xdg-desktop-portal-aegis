@@ -4,6 +4,63 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Nine new native portal interfaces, completing full-stack ownership of
+  the routing table (see
+  [ADR-0007](docs/adr/0007-full-stack-interface-ownership.md)):
+  - `org.freedesktop.impl.portal.Access` v1, the generic consent dialog,
+    rendered by the one-shot prompter with the frontend's labels.
+  - `org.freedesktop.impl.portal.AppChooser` v4, a Portal-owned chooser
+    over in-process freedesktop desktop-entry, `mimeapps.list`, and
+    `globs2` resolution, with a "Remember this choice" checkbox that
+    records the default application. Live `UpdateChoices` is acknowledged
+    but not rendered by the one-shot dialog.
+  - `org.freedesktop.impl.portal.OpenURI` v3, launching the resolved
+    default application directly or through the chooser when asked;
+    `file://` targets take their content type from the shared-mime-info
+    glob databases, other schemes resolve as `x-scheme-handler/*`.
+  - `org.freedesktop.impl.portal.Background` v1, consent-prompted on every
+    request, writing login autostart entries under
+    `$XDG_CONFIG_HOME/autostart/`.
+  - `org.freedesktop.impl.portal.DynamicLauncher` v1, a Portal-owned
+    install-confirmation dialog with name editing; install tokens are
+    never issued.
+  - `org.freedesktop.impl.portal.Inhibit` v3, taking logind idle and
+    suspend locks in `block` mode; logout and user-switch inhibition are
+    tracked no-ops, and monitor sessions report the Running state.
+  - `org.freedesktop.impl.portal.Notification` v2, rendered by the
+    prompter's new daemon mode: a versioned newline-delimited JSON stream
+    drives a single window stacking notification cards, with priority-based
+    auto-dismiss and action buttons.
+  - `org.freedesktop.impl.portal.Wallpaper` v1, handing local images to
+    the compositor over the new protocol-26 `SetWallpaper` IPC operation
+    (sealed-memfd transport), with a textual confirmation for preview
+    requests.
+  - `org.freedesktop.impl.portal.Print`, echoing settings from
+    `PreparePrint` and submitting documents to the default printer through
+    the system `lp` client.
+
+### Changed
+
+- The prompter process contract is version 4, adding the confirmation
+  dialog's deny label, the application chooser, and the launcher editor
+  prompt kinds.
+- The `aegis-portal-ipc` projection speaks protocol 26 (negotiating down
+  to 24); protocol 26 adds the wallpaper operation under the portal
+  scope's existing `control` capability.
+- The routing configuration names no other backend: every interface routes
+  to `aegis` and the default is `aegis` alone. Interfaces without a
+  backend in this stack (Camera, RemoteDesktop, GlobalShortcuts,
+  InputCapture, USB, Location, Documents) stay unadvertised and fail
+  cleanly at the frontend.
+
+### Removed
+
+- The `xdg-desktop-portal-gtk` fallback dependency. Production
+  installations no longer install or require another portal backend.
+
+
 ## [0.0.9] - 2026-08-12
 
 ### Added

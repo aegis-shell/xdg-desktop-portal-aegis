@@ -115,7 +115,10 @@ fn terminate(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn executable() -> Result<PathBuf, String> {
+/// The prompter executable's path: `$AEGIS_PORTAL_PROMPTER`, then beside
+/// the backend, then the standard libexec directories. Shared by the
+/// one-shot invocation and the notification daemon spawn.
+pub(crate) fn executable() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os(PROMPTER_ENV).filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path));
     }
