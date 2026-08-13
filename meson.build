@@ -71,7 +71,6 @@ if get_option('pam')
     install_dir: get_option('prefix') / get_option('libdir') / 'security',
     install_mode: 'rwxr-xr-x',
   )
-  warning('pam_aegis links pamsm; packages enabling -Dpam=true are GPL-3.0-only')
 endif
 
 summary(

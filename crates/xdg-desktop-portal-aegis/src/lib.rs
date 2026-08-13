@@ -130,6 +130,26 @@ impl SecretPrompter for PortalSecretPrompter {
     }
 }
 
+/// Spawn one named long-lived worker thread; a spawn failure aborts
+/// startup before the bus name is claimed, so D-Bus activation reports
+/// the fault instead of exposing a silently unbacked interface. The join
+/// handle is dropped deliberately: workers are detached and live as long
+/// as the bus connection.
+fn spawn_worker(
+    name: &'static str,
+    task: impl FnOnce() + Send + 'static,
+) -> Result<(), PortalError> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(task)
+        .map_err(|error| {
+            PortalError::Bus(zbus::Error::Failure(format!(
+                "spawn {name} worker: {error}"
+            )))
+        })?;
+    Ok(())
+}
+
 /// Run the backend: serve all interfaces on the session bus and spawn the
 /// capture and screencast workers. The process is D-Bus-activated,
 /// stays resident while the bus is connected, and exits for reactivation
@@ -295,128 +315,85 @@ pub fn run() -> Result<(), PortalError> {
 
     let worker_tracker = Arc::clone(&tracker);
     let worker_socket = socket.clone();
-    std::thread::Builder::new()
-        .name("aegis-portal-capture".to_string())
-        .spawn(move || screenshot::capture_worker(rx, worker_tracker, worker_socket))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!("spawn capture worker: {e}")))
-        })?;
+    spawn_worker("aegis-portal-capture", move || {
+        screenshot::capture_worker(rx, worker_tracker, worker_socket)
+    })?;
 
     let cast_worker_conn = conn.clone();
     let cast_worker_tracker = Arc::clone(&tracker);
     let cast_worker_socket = socket.clone();
-    std::thread::Builder::new()
-        .name("aegis-portal-screencast".to_string())
-        .spawn(move || {
-            screencast::cast_worker(
-                cast_rx,
-                cast_jobs,
-                cast_worker_conn,
-                cast_worker_tracker,
-                sessions,
-                cast_worker_socket,
-            )
-        })
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn screencast worker: {e}"
-            )))
-        })?;
+    spawn_worker("aegis-portal-screencast", move || {
+        screencast::cast_worker(
+            cast_rx,
+            cast_jobs,
+            cast_worker_conn,
+            cast_worker_tracker,
+            sessions,
+            cast_worker_socket,
+        )
+    })?;
 
     // FileChooser dispatches one supervised UI task/process per request and
     // never shares the compositor capture worker.
     let file_chooser_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-file-chooser".to_string())
-        .spawn(move || file_chooser::file_chooser_worker(file_chooser_rx, file_chooser_tracker))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn file chooser worker: {e}"
-            )))
-        })?;
+    spawn_worker("aegis-portal-file-chooser", move || {
+        file_chooser::file_chooser_worker(file_chooser_rx, file_chooser_tracker)
+    })?;
 
     let account_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-account".to_string())
-        .spawn(move || account::account_worker(account_rx, account_tracker))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!("spawn account worker: {e}")))
-        })?;
+    spawn_worker("aegis-portal-account", move || {
+        account::account_worker(account_rx, account_tracker)
+    })?;
 
     let access_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-access".to_string())
-        .spawn(move || access::access_worker(access_rx, access_tracker))
-        .map_err(|e| PortalError::Bus(zbus::Error::Failure(format!("spawn access worker: {e}"))))?;
+    spawn_worker("aegis-portal-access", move || {
+        access::access_worker(access_rx, access_tracker)
+    })?;
 
     // AppChooser uses the same per-request supervised prompter pattern as
     // Access; candidate resolution happens in the served method.
     let app_chooser_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-app-chooser".to_string())
-        .spawn(move || app_chooser::app_chooser_worker(app_chooser_rx, app_chooser_tracker))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn app chooser worker: {e}"
-            )))
-        })?;
+    spawn_worker("aegis-portal-app-chooser", move || {
+        app_chooser::app_chooser_worker(app_chooser_rx, app_chooser_tracker)
+    })?;
 
     // OpenURI launches resolved applications itself and reuses the
     // AppChooser dialog when the user must pick one.
     let open_uri_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-open-uri".to_string())
-        .spawn(move || open_uri::open_uri_worker(open_uri_rx, open_uri_tracker))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!("spawn open uri worker: {e}")))
-        })?;
+    spawn_worker("aegis-portal-open-uri", move || {
+        open_uri::open_uri_worker(open_uri_rx, open_uri_tracker)
+    })?;
 
     // Background consent uses the same supervised confirmation prompt as
     // Access; the autostart entry write happens on the worker task.
     let background_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-background".to_string())
-        .spawn(move || background::background_worker(background_rx, background_tracker))
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn background worker: {e}"
-            )))
-        })?;
+    spawn_worker("aegis-portal-background", move || {
+        background::background_worker(background_rx, background_tracker)
+    })?;
 
     // DynamicLauncher's backend surface is the install-confirmation dialog
     // only; the frontend performs the actual installation.
     let dynamic_launcher_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-dynamic-launcher".to_string())
-        .spawn(move || {
-            dynamic_launcher::dynamic_launcher_worker(dynamic_launcher_rx, dynamic_launcher_tracker)
-        })
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn dynamic launcher worker: {e}"
-            )))
-        })?;
+    spawn_worker("aegis-portal-dynamic-launcher", move || {
+        dynamic_launcher::dynamic_launcher_worker(dynamic_launcher_rx, dynamic_launcher_tracker)
+    })?;
 
-    // Wallpaper crosses the compositor IPC (protocol 26) and does slow
-    // image I/O, so it gets the standard per-request task worker.
+    // Wallpaper crosses the compositor IPC and does slow image I/O, so it
+    // gets the standard per-request task worker. Staged wallpapers are
+    // session artifacts: wipe last session's staging directory now.
+    wallpaper::clean_staging();
     let wallpaper_tracker = Arc::clone(&tracker);
     let wallpaper_socket = socket.clone();
-    std::thread::Builder::new()
-        .name("aegis-portal-wallpaper".to_string())
-        .spawn(move || {
-            wallpaper::wallpaper_worker(wallpaper_rx, wallpaper_tracker, wallpaper_socket)
-        })
-        .map_err(|e| {
-            PortalError::Bus(zbus::Error::Failure(format!("spawn wallpaper worker: {e}")))
-        })?;
+    spawn_worker("aegis-portal-wallpaper", move || {
+        wallpaper::wallpaper_worker(wallpaper_rx, wallpaper_tracker, wallpaper_socket)
+    })?;
 
     // Print spools the document and hands it to the system `lp` client
     // (the email/xdg-email hand-off precedent).
     let print_tracker = Arc::clone(&tracker);
-    std::thread::Builder::new()
-        .name("aegis-portal-print".to_string())
-        .spawn(move || print::print_worker(print_rx, print_tracker))
-        .map_err(|e| PortalError::Bus(zbus::Error::Failure(format!("spawn print worker: {e}"))))?;
+    spawn_worker("aegis-portal-print", move || {
+        print::print_worker(print_rx, print_tracker)
+    })?;
 
     settings::spawn_watcher(conn.clone(), socket, settings_store).map_err(PortalError::Worker)?;
 

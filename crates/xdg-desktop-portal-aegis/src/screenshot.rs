@@ -29,7 +29,7 @@ use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
 use crate::ipc::PortalCapture;
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// The served interface version: 3 adds target selection.
 pub(crate) const SCREENSHOT_VERSION: u32 = 3;
@@ -312,7 +312,7 @@ fn run_job(
             permission_store_checked,
             ..
         } => {
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             // Interactive: the compositor's region picker decides what to
@@ -334,7 +334,7 @@ fn run_job(
             } else {
                 None
             };
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             // A non-interactive legacy capture has no picker interaction of
@@ -358,13 +358,13 @@ fn run_job(
                     }
                 }
             }
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             match capture_and_write(capture, token, region) {
                 Ok(uri) => {
                     // A Close racing the capture wins over a completed result.
-                    if tracker.lock().unwrap().was_closed(request_path) {
+                    if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                         return (1, HashMap::new());
                     }
                     log::info!("portal: screenshot for '{app_id}' → {uri}");
@@ -381,12 +381,12 @@ fn run_job(
             app_id,
             ..
         } => {
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             match capture.pick(aegis_portal_ipc::PickKind::Pixel) {
                 Ok(aegis_portal_ipc::PickResult::Pixel { rgb, .. }) => {
-                    if tracker.lock().unwrap().was_closed(request_path) {
+                    if sync::lock(tracker, "screenshot tracker").was_closed(request_path) {
                         return (1, HashMap::new());
                     }
                     log::info!(

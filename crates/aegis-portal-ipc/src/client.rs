@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use crate::blob;
 use crate::codec::{read_msg, write_msg};
-use crate::schema::{LeaseRequest, Request, Response};
+use crate::schema::{LeaseRequest, Request, Response, valid_wallpaper_path};
 use crate::{
-    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MAX_WALLPAPER_BYTES,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot,
-    StreamPixelFormat, StreamTarget, WallpaperPlacement,
+    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
+    StreamTarget,
 };
 
 #[derive(Debug)]
@@ -282,42 +282,33 @@ impl Client {
         }
     }
 
-    /// Apply a wallpaper image (protocol 26). The bytes cross as one sealed
-    /// memfd behind the request header — the capture blob transport in the
-    /// opposite direction. Older compositors answer with a clear
-    /// unsupported-version error before anything is sent.
-    pub fn set_wallpaper(&mut self, image: &[u8], placement: WallpaperPlacement) -> io::Result<()> {
-        if self.version < 26 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "the compositor does not speak wallpaper (protocol 26; negotiated {})",
-                    self.version
-                ),
-            ));
-        }
-        if image.is_empty() || image.len() as u64 > MAX_WALLPAPER_BYTES {
+    /// Replace the desktop wallpaper with the image at `path`. The op
+    /// predates this projection's version floor, so every negotiated
+    /// protocol speaks it. The compositor decodes the file itself and
+    /// answers with an authoritative receipt, so the caller must stage the
+    /// image at a path that stays alive for the session. The path rule
+    /// mirrors the compositor's own check (bounded, absolute, lexically
+    /// normalized) so a request it would reject never crosses the socket.
+    pub fn set_wallpaper(&mut self, path: &Path) -> io::Result<()> {
+        if !valid_wallpaper_path(path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "wallpaper image length {} is outside 1..={MAX_WALLPAPER_BYTES}",
-                    image.len()
+                    "wallpaper path {} must be bounded, absolute, and lexically normalized",
+                    path.display()
                 ),
             ));
         }
-        let blob = blob::SealedBlob::new(image)?;
         write_msg(
             &mut self.stream,
             &Request::SetWallpaper {
-                placement,
-                image_bytes: blob.len(),
+                path: path.to_path_buf(),
             },
         )?;
-        blob.send(&self.stream)?;
         match read_msg::<_, Response>(&mut self.stream)? {
-            Response::WallpaperApplied => Ok(()),
+            Response::WallpaperSet {} => Ok(()),
             Response::Error { message } => Err(io::Error::other(message)),
-            other => Err(unexpected("WallpaperApplied", &other)),
+            other => Err(unexpected("WallpaperSet", &other)),
         }
     }
 

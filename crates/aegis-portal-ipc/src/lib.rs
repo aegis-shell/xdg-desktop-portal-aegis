@@ -17,7 +17,7 @@ pub mod testing;
 pub use client::{Client, StreamFrame, StreamMessage, StreamPayload, StreamSlot, StreamStarted};
 pub use schema::{
     AccentColor, ColorScheme, ConfirmPickResult, ConnectionCapabilities, Contrast,
-    DesktopPreferences, Event, LOCAL_PORTAL_SCOPE, LeaseGrant, MAX_WALLPAPER_BYTES,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, PickKind, PickResult, Point, Rect, SettingsSnapshot,
-    Size, StreamPixelFormat, StreamTarget, WallpaperPlacement, WindowId,
+    DesktopPreferences, Event, LOCAL_PORTAL_SCOPE, LeaseGrant, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, PickKind, PickResult, Point, Rect, SettingsSnapshot, Size, StreamPixelFormat,
+    StreamTarget, WindowId,
 };

@@ -8,4 +8,10 @@
 | [0004](0004-portal-ownership-and-runtime-ipc-boundary.md) | Portal ownership and runtime IPC boundary | Accepted (interface boundary extended by [0007](0007-full-stack-interface-ownership.md)) |
 | [0005](0005-screencast-dmabuf-slot-protocol.md) | ScreenCast dmabuf transport and the slot protocol | Accepted (fallback amended by [0006](0006-shm-consumers-switch-to-readback-transport.md)) |
 | [0006](0006-shm-consumers-switch-to-readback-transport.md) | SHM consumers switch the compositor stream to the readback transport | Accepted |
-| [0007](0007-full-stack-interface-ownership.md) | Full-stack interface ownership | Accepted |
+| [0007](0007-full-stack-interface-ownership.md) | Full-stack interface ownership | Accepted (wallpaper design point superseded by [0011](0011-wallpaper-wire-reconciliation.md)) |
+| [0008](0008-optics-prompter-rewrite.md) | Prompter dialogs on the optics (iris/lens) stack | Accepted (retrospective) |
+| [0009](0009-vault-kdf-persistence-and-password-lifecycle.md) | Vault KDF persistence and the password lifecycle | Accepted (re-key write protocol superseded by [0013](0013-two-phase-vault-rekey.md)) |
+| [0010](0010-pam-confirmed-planting-and-libpam-abi.md) | PAM confirmed planting, vault re-key, and the libpam C ABI | Accepted |
+| [0011](0011-wallpaper-wire-reconciliation.md) | Wallpaper wire reconciliation and the protocol-25 baseline | Accepted |
+| [0012](0012-derived-key-pam-tokens.md) | Derived-key PAM unlock tokens | Accepted |
+| [0013](0013-two-phase-vault-rekey.md) | Crash-safe two-phase vault re-key | Accepted |

@@ -5,7 +5,9 @@ Before writing, modifying, or archiving documentation, read and follow
 `docs/dev/documentation/` and suggest changes, but must not modify files in
 that directory.
 
-Do not bypass Git hooks.
+Do not bypass Git hooks. Enable them once per clone with
+`scripts/setup-dev.sh` (idempotent; sets `core.hooksPath` to
+`.githooks`).
 
 Keep the Portal source and build graph independent from the Aegis repository:
 

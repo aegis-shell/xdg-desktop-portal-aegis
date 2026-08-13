@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aegis_portal_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE, WallpaperPlacement};
+use aegis_portal_ipc::{Client, ConnectionCapabilities, LOCAL_PORTAL_SCOPE};
 
 /// Lease TTL requested at handshake and renewal; matches the reference
 /// client's default (`LeaseRequest::default`).
@@ -157,22 +157,21 @@ impl PortalCapture {
     }
 }
 
-/// Apply a wallpaper image through the compositor (protocol 26). Unlike
-/// capture, the connection is per call: wallpaper changes are rare, so a
-/// fresh handshake (its lease dies with the connection) beats carrying a
-/// renewing client on the worker. One reconnect + retry hides transient
-/// failures, matching [`PortalCapture`]'s discipline.
-pub(crate) fn set_wallpaper(
-    socket: &Path,
-    image: &[u8],
-    placement: WallpaperPlacement,
-) -> io::Result<()> {
+/// Apply a staged wallpaper file through the compositor. The `SetWallpaper`
+/// op predates the projection's version floor, so every negotiated protocol
+/// speaks it; what the compositor's dispatch requires is what
+/// [`connect_compositor`] already enforces at the handshake: scoped `control`
+/// and a live renewable lease. Unlike capture, the connection is per call:
+/// wallpaper changes are rare, so a fresh handshake (its lease dies with the
+/// connection) beats carrying a renewing client on the worker. One reconnect
+/// + retry hides transient failures, matching [`PortalCapture`]'s discipline.
+pub(crate) fn set_wallpaper(socket: &Path, staged: &Path) -> io::Result<()> {
     let mut client = connect_compositor(socket, RPC_TIMEOUT)?;
-    match client.set_wallpaper(image, placement) {
+    match client.set_wallpaper(staged) {
         Ok(()) => Ok(()),
         Err(first) => {
             log::info!("portal: wallpaper IPC failed ({first}); reconnecting IPC");
-            connect_compositor(socket, RPC_TIMEOUT)?.set_wallpaper(image, placement)
+            connect_compositor(socket, RPC_TIMEOUT)?.set_wallpaper(staged)
         }
     }
 }

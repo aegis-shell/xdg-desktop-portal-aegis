@@ -15,7 +15,7 @@ use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptResult, Promp
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::prompter::{self, InvokeError};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 const MAX_DIALOG_TEXT_BYTES: usize = 16 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
@@ -204,11 +204,11 @@ fn run_dialog(
     app_id: &str,
     prompt: ConfirmRequest,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "access tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "access tracker").was_closed(request_path);
     let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), Some(&cancelled));
     match confirmed {
         Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => {

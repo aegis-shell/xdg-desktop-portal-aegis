@@ -19,7 +19,7 @@
 | `org.freedesktop.impl.portal.DynamicLauncher` | Version 1 | Portal-owned install-confirmation dialog with name editing (the icon is echoed verbatim, never edited); install tokens are never issued; Application and Webapp types |
 | `org.freedesktop.impl.portal.Inhibit` | Version 3 | logind-backed idle/suspend inhibition in `block` mode; logout and user-switch are tracked no-ops; monitors get one `StateChanged` (Running), and `QueryEndResponse` is an acknowledged no-op |
 | `org.freedesktop.impl.portal.Notification` | Version 2 | Portal-owned notification daemon window stacking cards (text and buttons only; icons, sounds, and action targets ignored); low/normal priority auto-dismisses after 5/10 seconds, high/urgent persists |
-| `org.freedesktop.impl.portal.Wallpaper` | Version 1 | Local `file://` images up to 64 MiB, optional textual preview confirmation; application over the protocol-26 `SetWallpaper` IPC op requires a protocol-26 compositor |
+| `org.freedesktop.impl.portal.Wallpaper` | Version 1 | Local `file://` images up to 64 MiB, optional textual preview confirmation; the image is staged at `$XDG_RUNTIME_DIR/aegis-portal/wallpaper/current.<ext>` (directory 0700, file 0600, atomic replace, kept after a successful swap) and applied through the compositor's path-based `SetWallpaper` op, which every supported compositor speaks; `set-on` is validated but not forwarded (single compositor wallpaper) |
 | `org.freedesktop.impl.portal.Print` | Version 3 | `PreparePrint` echoes settings and page setup with a fresh token; `Print` spools to a private temp file and submits to the default printer through the system `lp` client |
 
 `FileChooser`, `Email`, and `Account` do not define a backend `version`
@@ -40,14 +40,14 @@ them cleanly.
 
 | Component | Purpose |
 |-----------|---------|
-| Aegis IPC protocol 26 | Compositor settings, screenshot capture and selection, capture consent, ScreenCast frames, and wallpaper application |
+| Aegis IPC protocol 25 | Compositor settings, screenshot capture and selection, capture consent, ScreenCast frames, and wallpaper application |
 | `xdg-desktop-portal` | Public portal frontend |
 | Optics (flux, lens, iris) shared libraries | All prompter UI processes, from the tagged `ming2k/optics` release |
 | PipeWire and WirePlumber | ScreenCast transport and routing |
 | logind (`org.freedesktop.login1`) | Inhibit locks; without it Inhibit calls fail with a backend error |
 | `lp` (CUPS client) | Print submission; without it `Print` answers with a backend error |
 | `xdg-email` | Email handoff |
-| PAM | Optional login-time vault unlock only |
+| PAM | Optional login-time vault unlock (a derived vault-key token when a password-mode vault exists) and vault password propagation on login password changes |
 
 The release gates exercise two production integration baselines:
 
@@ -73,12 +73,17 @@ The default vault directory is
 | Path | Mode | Purpose |
 |------|------|---------|
 | `vault.key` | `0600` | Random master key for key-file mode |
-| `vault.salt` | Not group/other writable | Argon2id salt for password mode |
+| `vault.kdf` | Not group/other writable | Persisted Argon2id parameters and salt for password mode; authoritative when present |
+| `vault.salt` | Not group/other writable | Argon2id salt for legacy password-mode vaults; downgrade mirror once `vault.kdf` exists |
+| `vault.kdf.next`, `vault.salt.next` | Not group/other writable | Transient two-phase re-key state; adopted or cleaned up on the next successful password unlock |
 | `vault.enc` | `0600` | XChaCha20-Poly1305 encrypted vault |
 
 The directory is private to the user. Symlinks, unexpected owners, unsafe
 modes, oversized input, orphan ciphertext, and malformed encryption are
 startup errors. Back up all files together while the daemon is stopped.
+A bare `vault.salt` marks a legacy vault keyed with the crate-default
+Argon2id parameters; the first successful unlock backfills `vault.kdf`
+and keeps `vault.salt` as the downgrade mirror.
 
 The production per-application derivation differs from the shared secret
 returned by the pre-production `v0.0.1` implementation. The first production

@@ -26,7 +26,7 @@ use std::time::Duration;
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
-use aegis_portal_runtime::{PortalResponse, RequestTracker};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, sync};
 
 const MAX_ACTIVE_MAILERS: usize = 32;
 const MAX_RECIPIENTS: usize = 512;
@@ -69,7 +69,7 @@ fn compose(
     options: &HashMap<String, Value<'_>>,
     tracker: &Arc<Mutex<RequestTracker>>,
 ) -> zbus::fdo::Result<PortalResponse> {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "email tracker").was_closed(request_path) {
         return Ok((1, HashMap::new()));
     }
 

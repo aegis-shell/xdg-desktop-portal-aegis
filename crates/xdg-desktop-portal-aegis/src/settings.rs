@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use aegis_portal_ipc::{ColorScheme, Contrast, DesktopPreferences};
+use aegis_portal_runtime::sync;
 use zbus::zvariant::{OwnedValue, Str, Structure};
 
 pub(crate) const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
@@ -30,17 +31,11 @@ pub(crate) struct SettingsStore {
 
 impl SettingsStore {
     fn snapshot(&self) -> DesktopPreferences {
-        self.preferences
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        sync::read_lock(&self.preferences, "settings store").clone()
     }
 
     fn replace(&self, preferences: DesktopPreferences) -> DesktopPreferences {
-        let mut current = self
-            .preferences
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = sync::write_lock(&self.preferences, "settings store");
         std::mem::replace(&mut *current, preferences)
     }
 }

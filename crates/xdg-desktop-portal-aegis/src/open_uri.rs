@@ -38,7 +38,7 @@ use zbus::zvariant::{ObjectPath, OwnedFd, Value};
 use crate::apps::{self, AppDirs, AppInfo};
 use crate::prompter::{self, InvokeError};
 use crate::{app_chooser, files};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// URIs past this size are rejected outright.
 const MAX_URI_BYTES: usize = 8 * 1024;
@@ -350,7 +350,7 @@ fn run_open(
     parent_window: Option<String>,
     ask: bool,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "open uri tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
     let dirs = AppDirs::from_env();
@@ -409,7 +409,7 @@ fn run_chooser(
         return (2, HashMap::new());
     }
 
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "open uri tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::choose_app(request.clone()),
         Some(&cancelled),
@@ -417,7 +417,7 @@ fn run_chooser(
     match answered {
         Ok(PromptResult::ChooseApp(response)) => {
             // Request.Close wins a race with a completed child response.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "open uri tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             if let Err(error) = response.validate_for(&request) {

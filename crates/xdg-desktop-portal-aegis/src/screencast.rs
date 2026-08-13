@@ -32,7 +32,7 @@ use zbus::zvariant::{Array, Dict, ObjectPath, Structure, StructureBuilder, Value
 
 use crate::cast;
 use crate::session::{CastSource, SessionIface, SessionRegistry};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 const SESSION_IFACE: &str = "org.freedesktop.impl.portal.Session";
 
@@ -143,11 +143,12 @@ impl ScreenCastIface {
         let session_path = session_handle.as_str().to_string();
         aegis_portal_runtime::register(&self.conn, &self.tracker, &request_path).await?;
 
-        if self.tracker.lock().unwrap().was_closed(&request_path) {
+        if sync::lock(&self.tracker, "screencast tracker").was_closed(&request_path) {
             aegis_portal_runtime::finish(&self.conn, &self.tracker, &request_path).await;
             return Ok((1, HashMap::new()));
         }
-        let insert_result = { self.sessions.lock().unwrap().insert(&session_path, app_id) };
+        let insert_result =
+            { sync::lock(&self.sessions, "screencast sessions").insert(&session_path, app_id) };
         if let Err(error) = insert_result {
             log::warn!("portal: CreateSession refused: {error}");
             aegis_portal_runtime::finish(&self.conn, &self.tracker, &request_path).await;
@@ -167,13 +168,13 @@ impl ScreenCastIface {
         let inserted = match inserted {
             Ok(inserted) => inserted,
             Err(error) => {
-                let _ = self.sessions.lock().unwrap().remove(&session_path);
+                let _ = sync::lock(&self.sessions, "screencast sessions").remove(&session_path);
                 aegis_portal_runtime::finish(&self.conn, &self.tracker, &request_path).await;
                 return Err(zbus::fdo::Error::from(error));
             }
         };
         if !inserted {
-            let _ = self.sessions.lock().unwrap().remove(&session_path);
+            let _ = sync::lock(&self.sessions, "screencast sessions").remove(&session_path);
             aegis_portal_runtime::finish(&self.conn, &self.tracker, &request_path).await;
             return Ok((2, HashMap::new()));
         }
@@ -190,7 +191,7 @@ impl ScreenCastIface {
         options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let session_path = session_handle.as_str().to_string();
-        if !self.sessions.lock().unwrap().contains(&session_path) {
+        if !sync::lock(&self.sessions, "screencast sessions").contains(&session_path) {
             return Err(zbus::fdo::Error::Failed(format!(
                 "unknown session {session_path}"
             )));
@@ -239,7 +240,7 @@ impl ScreenCastIface {
         _options: HashMap<String, Value<'_>>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let session_path = session_handle.as_str().to_string();
-        if !self.sessions.lock().unwrap().contains(&session_path) {
+        if !sync::lock(&self.sessions, "screencast sessions").contains(&session_path) {
             return Err(zbus::fdo::Error::Failed(format!(
                 "unknown session {session_path}"
             )));
@@ -432,21 +433,22 @@ fn select_sources(
     _cursor_mode: u32,
     persist_mode: u32,
 ) -> u32 {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return 1;
     }
     let source = match pick_source(picker, source_types, app_id) {
         Ok(source) => source,
         Err(code) => return code,
     };
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return 1;
     }
-    match sessions
-        .lock()
-        .unwrap()
-        .mark_sources_selected(session_path, app_id, source, persist_mode)
-    {
+    match sync::lock(sessions, "screencast sessions").mark_sources_selected(
+        session_path,
+        app_id,
+        source,
+        persist_mode,
+    ) {
         Ok(()) => 0,
         Err(error) => {
             log::warn!("portal: SelectSources refused: {error}");
@@ -490,11 +492,11 @@ fn start_cast(
     session_path: &str,
     app_id: &str,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
     let (source, requested_persist_mode) = {
-        let mut sessions = sessions.lock().unwrap();
+        let mut sessions = sync::lock(sessions, "screencast sessions");
         match sessions.reserve_start(session_path, app_id) {
             Ok(selection) => selection,
             Err(error) => {
@@ -508,7 +510,7 @@ fn start_cast(
     let handle = match cast::spawn(socket.to_path_buf(), session_path.to_string(), jobs.clone()) {
         Ok(handle) => handle,
         Err(error) => {
-            sessions.lock().unwrap().clear_start(session_path);
+            sync::lock(sessions, "screencast sessions").clear_start(session_path);
             log::warn!("portal: could not spawn cast for {session_path}: {error}");
             return (2, HashMap::new());
         }
@@ -516,18 +518,17 @@ fn start_cast(
     match handle.started.recv_timeout(START_TIMEOUT) {
         Ok(Ok(started)) => {
             // A Close racing the negotiation wins over a started cast.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
                 drop(handle.stop);
                 let _ = handle.thread.join();
-                sessions.lock().unwrap().clear_start(session_path);
+                sync::lock(sessions, "screencast sessions").clear_start(session_path);
                 return (1, HashMap::new());
             }
-            if let Err((stop, thread)) =
-                sessions
-                    .lock()
-                    .unwrap()
-                    .mark_started(session_path, handle.stop, handle.thread)
-            {
+            if let Err((stop, thread)) = sync::lock(sessions, "screencast sessions").mark_started(
+                session_path,
+                handle.stop,
+                handle.thread,
+            ) {
                 drop(stop);
                 let _ = thread.join();
                 return (1, HashMap::new());
@@ -561,14 +562,14 @@ fn start_cast(
             log::warn!("portal: cast for {session_path} failed: {error}");
             drop(handle.stop);
             let _ = handle.thread.join();
-            sessions.lock().unwrap().clear_start(session_path);
+            sync::lock(sessions, "screencast sessions").clear_start(session_path);
             (2, HashMap::new())
         }
         Err(_) => {
             log::warn!("portal: cast for {session_path} timed out during negotiation");
             drop(handle.stop);
             let _ = handle.thread.join();
-            sessions.lock().unwrap().clear_start(session_path);
+            sync::lock(sessions, "screencast sessions").clear_start(session_path);
             (2, HashMap::new())
         }
     }
@@ -580,7 +581,7 @@ fn close_session(
     sessions: &Arc<Mutex<SessionRegistry>>,
     session_path: &str,
 ) {
-    let Some(session) = sessions.lock().unwrap().remove(session_path) else {
+    let Some(session) = sync::lock(sessions, "screencast sessions").remove(session_path) else {
         return;
     };
     crate::session::stop_cast(session);

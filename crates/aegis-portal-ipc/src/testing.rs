@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use crate::blob::SealedBlob;
 use crate::codec::{read_msg, write_msg};
-use crate::schema::{Request, Response};
+use crate::schema::{Request, Response, valid_wallpaper_path};
 use crate::{
     ConfirmPickResult, ConnectionCapabilities, Event, LOCAL_PORTAL_SCOPE, LeaseGrant,
     PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
-    StreamTarget, WallpaperPlacement,
+    StreamTarget,
 };
 
 pub struct CaptureOutputPayload {
@@ -119,14 +119,31 @@ pub trait Handler: Send + Sync + 'static {
     /// Protocol-25 slot release from the client.
     fn stream_buffer_release(&self, _stream_id: u64, _slot: u32) {}
 
-    /// Protocol-26 wallpaper application. `image` is the sealed blob's
-    /// contents, already received by the server.
-    fn set_wallpaper(
-        &self,
-        _connection: u64,
-        _placement: WallpaperPlacement,
-        _image: Vec<u8>,
-    ) -> Result<(), String> {
+    /// Lease policy: whether a `Hello` lease request is granted. Mirrors the
+    /// compositor's policy decision; returning `false` leaves the connection
+    /// leaseless, so privileged ops fail their live-lease gate.
+    fn grant_lease(&self) -> bool {
+        true
+    }
+
+    /// Extra scope names the server recognizes beyond the portal scope. They
+    /// handshake cleanly but carry no operations, so tests can exercise the
+    /// explicit-scope-op gates (the real dispatch's "out of scope" path).
+    fn known_scopes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Session lock state for mutation gates, mirroring the compositor's
+    /// lock/VT check. Default: the session is active.
+    fn session_active(&self) -> bool {
+        true
+    }
+
+    /// Wallpaper swap (the `SetWallpaper` op, gated like the real dispatch:
+    /// control, a live lease, an explicit scope op, a valid path, and an
+    /// active session). `path` names the staged image file; the reply is the
+    /// decode-and-swap receipt.
+    fn set_wallpaper(&self, _connection: u64, _path: PathBuf) -> Result<(), String> {
         Err("wallpaper is not implemented by this test server".into())
     }
 
@@ -359,12 +376,20 @@ fn serve_connection(
     };
     let writer = Arc::new(Mutex::new(stream));
     let mut handshaken = false;
+    // Per-connection authorization state, mirroring what the real dispatch
+    // consults: the granted capabilities, whether a live lease is held, and
+    // the connection's scope. The portal scope is the only one carrying the
+    // SetWallpaper op; handler-declared scopes and unscoped connections
+    // carry no ops.
+    let mut granted = ConnectionCapabilities::QUERY;
+    let mut lease_alive = false;
+    let mut scope: Option<String> = None;
     while let Ok(request) = read_msg::<_, Request>(&mut reader) {
         let result = match request {
             Request::Hello {
                 version,
                 caps,
-                scope,
+                scope: requested_scope,
                 lease,
             } if !handshaken => {
                 let accepted = match exact_version {
@@ -373,27 +398,33 @@ fn serve_connection(
                 };
                 if !accepted {
                     send_error(&writer, format!("unsupported protocol version {version}"))
-                } else if scope
-                    .as_deref()
-                    .is_some_and(|name| name != LOCAL_PORTAL_SCOPE)
-                {
+                } else if requested_scope.as_deref().is_some_and(|name| {
+                    name != LOCAL_PORTAL_SCOPE && !handler.known_scopes().contains(&name)
+                }) {
                     send_error(&writer, "unknown test scope".into())
                 } else {
                     handshaken = true;
-                    let caps = ConnectionCapabilities {
+                    granted = ConnectionCapabilities {
                         query: true,
                         ..caps
                     };
+                    let grant = if handler.grant_lease() {
+                        lease.map(|request| LeaseGrant {
+                            id: connection,
+                            ttl_ms: request.ttl_ms,
+                            renewable: true,
+                        })
+                    } else {
+                        None
+                    };
+                    lease_alive = grant.is_some();
+                    scope = requested_scope;
                     send(
                         &writer,
                         &Response::Hello {
                             version: version.min(PROTOCOL_VERSION),
-                            caps,
-                            lease: lease.map(|request| LeaseGrant {
-                                id: connection,
-                                ttl_ms: request.ttl_ms,
-                                renewable: true,
-                            }),
+                            caps: granted,
+                            lease: grant,
                         },
                     )
                 }
@@ -407,16 +438,24 @@ fn serve_connection(
                 },
             ),
             Request::Subscribe => send(&writer, &Response::Subscribed),
-            Request::RenewLease { ttl_ms } => send(
-                &writer,
-                &Response::LeaseRenewed {
-                    lease: LeaseGrant {
-                        id: connection,
-                        ttl_ms,
-                        renewable: true,
-                    },
-                },
-            ),
+            Request::RenewLease { ttl_ms } => {
+                // A lease cannot be created out of nothing: only a
+                // connection that already holds one renews it.
+                if lease_alive {
+                    send(
+                        &writer,
+                        &Response::LeaseRenewed {
+                            lease: LeaseGrant {
+                                id: connection,
+                                ttl_ms,
+                                renewable: true,
+                            },
+                        },
+                    )
+                } else {
+                    send_error(&writer, "no active lease to renew".into())
+                }
+            }
             Request::CaptureOutput { region } => match handler.capture_output(region) {
                 Ok(capture) => match SealedBlob::new(&capture.png) {
                     Ok(blob) => {
@@ -463,12 +502,18 @@ fn serve_connection(
                             _ => (None, None, None),
                         };
                         // Reply and slot descriptors must land contiguously:
-                        // hold the writer for the whole sequence and
-                        // register the delivery lane only afterwards, so a
-                        // concurrently pushed frame cannot interleave.
+                        // the writer is held for the whole sequence. The
+                        // delivery lane is registered BEFORE the reply, so
+                        // a concurrently pushed frame finds the lane and
+                        // queues on the writer mutex instead of being lost
+                        // to a lookup that ran before registration.
                         // `frames_before_started` is the deliberate
                         // exception: it reproduces the real compositor's
                         // race, where a produced frame precedes the reply.
+                        streams
+                            .lock()
+                            .unwrap()
+                            .insert(info.stream_id, (connection, Arc::clone(&writer)));
                         let result = {
                             let mut guard = writer.lock().unwrap();
                             let mut wrote = Ok(());
@@ -519,11 +564,10 @@ fn serve_connection(
                                     Ok(())
                                 })
                         };
-                        if result.is_ok() {
-                            streams
-                                .lock()
-                                .unwrap()
-                                .insert(info.stream_id, (connection, Arc::clone(&writer)));
+                        if result.is_err() {
+                            // The reply never landed; do not leave a dead
+                            // delivery lane registered.
+                            streams.lock().unwrap().remove(&info.stream_id);
                         }
                         result
                     }
@@ -539,17 +583,33 @@ fn serve_connection(
                 handler.stream_output_stop(stream_id);
                 send(&writer, &Response::StreamOutputStopped { stream_id })
             }
-            Request::SetWallpaper {
-                placement,
-                image_bytes,
-            } => {
-                // The sealed image blob follows the request header.
-                match crate::blob::receive(&reader, image_bytes) {
-                    Ok(image) => match handler.set_wallpaper(connection, placement, image) {
-                        Ok(()) => send(&writer, &Response::WallpaperApplied),
+            Request::SetWallpaper { path } => {
+                // The real dispatch's gate order: control, a live lease, an
+                // explicit SetWallpaper op in the connection's scope (never
+                // inherited), a valid path, then the lock/VT gate. The reply
+                // is the decode-and-swap receipt.
+                let op_allowed = scope.as_deref() == Some(LOCAL_PORTAL_SCOPE);
+                if !granted.control {
+                    send_error(
+                        &writer,
+                        "SetWallpaper requires the control capability".into(),
+                    )
+                } else if !lease_alive {
+                    send_error(&writer, "privileged capability lease expired".into())
+                } else if !op_allowed {
+                    send_error(&writer, "out of scope".into())
+                } else if !valid_wallpaper_path(&path) {
+                    send_error(
+                        &writer,
+                        "wallpaper path must be bounded, absolute, and lexically normalized".into(),
+                    )
+                } else if !handler.session_active() {
+                    send_error(&writer, "session is locked or inactive".into())
+                } else {
+                    match handler.set_wallpaper(connection, path) {
+                        Ok(()) => send(&writer, &Response::WallpaperSet {}),
                         Err(message) => send_error(&writer, message),
-                    },
-                    Err(error) => Err(error),
+                    }
                 }
             }
         };

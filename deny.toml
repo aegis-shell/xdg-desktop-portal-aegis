@@ -16,10 +16,6 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
 ]
-exceptions = [
-    { allow = ["GPL-3.0"], crate = "pamsm" },
-    { allow = ["GPL-3.0-only"], crate = "aegis-pam" },
-]
 
 [licenses.private]
 ignore = false

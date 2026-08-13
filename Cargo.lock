@@ -16,8 +16,8 @@ dependencies = [
 name = "aegis-pam"
 version = "0.0.9"
 dependencies = [
+ "aegis-portal-secret",
  "libc",
- "pamsm",
  "zeroize",
 ]
 
@@ -676,6 +676,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 [[package]]
 name = "flux"
 version = "0.1.1"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "flux-sys",
 ]
@@ -683,6 +684,7 @@ dependencies = [
 [[package]]
 name = "flux-sys"
 version = "0.1.1"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -833,6 +835,7 @@ dependencies = [
 [[package]]
 name = "iris"
 version = "0.1.0"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "iris-sys",
  "lens",
@@ -842,6 +845,7 @@ dependencies = [
 [[package]]
 name = "iris-sys"
 version = "0.1.0"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -918,6 +922,7 @@ dependencies = [
 [[package]]
 name = "lens"
 version = "0.1.0"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "flux",
  "lens-sys",
@@ -926,6 +931,7 @@ dependencies = [
 [[package]]
 name = "lens-sys"
 version = "0.1.0"
+source = "git+https://github.com/ming2k/optics?tag=v0.0.14#cd7b30e4918cd15a5911cf8719c836757267f52b"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -1084,12 +1090,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "pamsm"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4e447ce18309e2b197a0f5a4075ffe7638968a9199aa0e0df0c377ce504ac9b"
 
 [[package]]
 name = "parking"

@@ -33,32 +33,124 @@ All notable changes to this project are documented in this file.
     prompter's new daemon mode: a versioned newline-delimited JSON stream
     drives a single window stacking notification cards, with priority-based
     auto-dismiss and action buttons.
-  - `org.freedesktop.impl.portal.Wallpaper` v1, handing local images to
-    the compositor over the new protocol-26 `SetWallpaper` IPC operation
-    (sealed-memfd transport), with a textual confirmation for preview
-    requests.
+  - `org.freedesktop.impl.portal.Wallpaper` v1, staging local images for
+    the compositor's path-based `SetWallpaper` IPC operation, with a
+    textual confirmation for preview requests.
   - `org.freedesktop.impl.portal.Print`, echoing settings from
     `PreparePrint` and submitting documents to the default printer through
     the system `lp` client.
+- Password-mode vault lifecycle (see
+  [ADR-0009](docs/adr/0009-vault-kdf-persistence-and-password-lifecycle.md)):
+  the `vault.kdf` sidecar persists the exact Argon2id parameters and salt,
+  authoritative when present, so an argon2-crate default change can no
+  longer silently invalidate password-mode vaults. A legacy
+  `vault.salt`-only vault migrates on its first successful unlock and keeps
+  `vault.salt` as the downgrade mirror.
+  `SecretService::create_password_vault` and
+  `SecretService::change_password` create and re-key password-mode vaults,
+  and the prompter-free `rekey_password_vault_in` entry serves the PAM
+  password hook.
+- The `pam_aegis.so` `password` hook re-keys the user's password-mode
+  vault on login password changes (see
+  [ADR-0010](docs/adr/0010-pam-confirmed-planting-and-libpam-abi.md)), so
+  the vault password tracks the login password. Admin-initiated resets
+  skip the vault, which then falls back to the Portal's unlock prompt.
+- CONTRIBUTING.md and SECURITY.md: the contributor workflow and CI gates,
+  vulnerability reporting, and the threat model.
+- CI: a coverage artifact (`cargo llvm-cov`, lcov), pushes to the `dev`
+  branch, and a pinned `cargo-deny` release replacing the unpinned action.
 
 ### Changed
 
 - The prompter process contract is version 4, adding the confirmation
   dialog's deny label, the application chooser, and the launcher editor
   prompt kinds.
-- The `aegis-portal-ipc` projection speaks protocol 26 (negotiating down
-  to 24); protocol 26 adds the wallpaper operation under the portal
-  scope's existing `control` capability.
 - The routing configuration names no other backend: every interface routes
   to `aegis` and the default is `aegis` alone. Interfaces without a
   backend in this stack (Camera, RemoteDesktop, GlobalShortcuts,
   InputCapture, USB, Location, Documents) stay unadvertised and fail
   cleanly at the frontend.
+- The PAM module plants the vault-unlock token only once the login is
+  confirmed: `authenticate` stashes the authtok in PAM module data, and
+  the first committing `setcred` or `open_session` hook writes the token
+  file, the later hook retrying when the runtime directory does not exist
+  yet. Stacks that only authenticate — some screen lockers — no longer
+  plant a token and fall back to the Portal's unlock prompt (see
+  [ADR-0010](docs/adr/0010-pam-confirmed-planting-and-libpam-abi.md)).
+- `aegis-pam` is relicensed from GPL-3.0-only to MIT: the GPL obligation
+  came solely from the removed `pamsm` dependency, and libpam itself is
+  BSD-licensed. A binary package containing `pam_aegis.so` no longer
+  carries a GPL requirement.
+- The daemon survives a panicking worker: every non-test mutex and rwlock
+  acquisition in the daemon and the secret crate goes through
+  `aegis_portal_runtime::sync`, which recovers the inner state from a
+  poisoned lock with one warning instead of letting a re-panicked
+  `.lock().unwrap()` cascade-kill the D-Bus-activated daemon.
+- The `aegis-portal-ipc` projection is re-baselined to protocol 25
+  (negotiating down to 24): the dmabuf slot stream is the newest
+  projected feature, and upstream protocols 26 (`CaptureWindow`) and 27
+  (`LaunchApp`, `Focus.reveal`) are deliberately not projected (see
+  [ADR-0011](docs/adr/0011-wallpaper-wire-reconciliation.md)). The
+  verified Aegis mapping is corrected: `v0.0.11`–`v0.0.14` speak
+  protocol 24, `v0.0.15` speaks 25, and `v0.0.16`–`v0.0.21` speak 27.
+- Wallpaper's `set-on` option is still validated (unknown values answer
+  response 2) but no longer forwarded: the compositor has a single
+  wallpaper concept and the wire op carries no placement.
+
+### Fixed
+
+- The Wallpaper portal never worked against a real compositor: the
+  protocol-26 sealed-memfd `SetWallpaper` op was projected ahead of the
+  compositor and shipped in no Aegis release, so every wallpaper request
+  failed closed. The daemon now stages the image at
+  `$XDG_RUNTIME_DIR/aegis-portal/wallpaper/current.<ext>` (directory 0700,
+  file 0600, atomic replace, kept after a successful swap) and hands the
+  staged path to the compositor's actual `SetWallpaper` op — spoken since
+  protocol 17 — so wallpaper application works against every supported
+  Aegis release (see
+  [ADR-0011](docs/adr/0011-wallpaper-wire-reconciliation.md)).
 
 ### Removed
 
 - The `xdg-desktop-portal-gtk` fallback dependency. Production
   installations no longer install or require another portal backend.
+- The `pamsm` dependency. Its `pam_module!` macro types libpam's flags
+  argument as a Rust enum lacking the chauthtok phase values (and combined
+  flag values), so every password-hook call materialized an invalid enum
+  discriminant — undefined behavior exactly where the phase must be read;
+  the six PAM entry points are implemented against libpam's stable C ABI
+  instead.
+
+### Security
+
+- A failed login no longer plants the PAM token file: the authtok stays in
+  PAM module data behind a zeroizing cleanup until credentials are
+  committed or a session opens, and `pam_end` scrubs it otherwise.
+- The vault master key is heap-pinned and `mlock`ed on a best-effort
+  basis (an `mlock` failure never fails an unlock; the key is zeroized and
+  `munlock`ed on drop), and both binaries clear their dumpable flag
+  (`PR_SET_DUMPABLE`) at startup so process memory stays out of core
+  dumps.
+- On accounts with a password-mode vault, the PAM unlock token now carries
+  the Argon2id-derived vault master key (`aegis-key-v1:<hex>`) instead of
+  the raw login password, narrowing the at-rest tmpfs secret from the
+  reusable login password to the vault key (see
+  [ADR-0012](docs/adr/0012-derived-key-pam-tokens.md)). Keyfile-mode
+  vaults plant no token at all; legacy raw-password tokens stay accepted,
+  and malformed key material fails closed rather than falling through to
+  the password path.
+- The vault re-key is two-phase and self-healing (see
+  [ADR-0013](docs/adr/0013-two-phase-vault-rekey.md)): the new parameters
+  are staged as `vault.kdf.next`/`vault.salt.next`, the ciphertext is
+  swapped, and the pending pair is adopted; unlock tries every KDF
+  candidate in order and reconciles, so an interrupted re-key can no
+  longer leave the vault undecryptable.
+- Secret memory hygiene: the daemon pins PAM-token bytes, the
+  unlock-prompt password, and re-key working copies in mlock'd
+  `LockedBytes`; the prompter accumulates typed passwords in a fixed
+  256-byte mlock'd `SecretBuffer` that never reallocates, ending the
+  realloc smear of partial passwords; and the secret response is mlock'd
+  during serialization and after the daemon reads it.
 
 
 ## [0.0.9] - 2026-08-12

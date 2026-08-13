@@ -46,6 +46,7 @@ use aegis_portal_prompter::notify::{
     CommandFrame, EventFrame, Notification, NotifyButton, NotifyCommand, NotifyEvent, Priority,
     read_line_bounded,
 };
+use aegis_portal_runtime::sync;
 use zbus::zvariant::Value;
 
 use crate::prompter;
@@ -87,7 +88,7 @@ impl NotificationIface {
         log::info!("portal: AddNotification for '{app_id}' id '{id}'");
         let notification =
             parse_notification(app_id, id, &notification).map_err(zbus::fdo::Error::InvalidArgs)?;
-        self.daemon.lock().unwrap().notify(&self.conn, notification);
+        sync::lock(&self.daemon, "notification daemon").notify(&self.conn, notification);
         Ok(())
     }
 
@@ -97,7 +98,7 @@ impl NotificationIface {
             // Withdrawing a malformed or unknown id is a no-op success.
             return Ok(());
         }
-        self.daemon.lock().unwrap().close(app_id, id);
+        sync::lock(&self.daemon, "notification daemon").close(app_id, id);
         Ok(())
     }
 
@@ -329,17 +330,14 @@ impl DaemonManager {
     /// needed. AddNotification has no error return, so failures are logged
     /// and the notification dropped.
     fn notify(&mut self, conn: &zbus::blocking::Connection, notification: Notification) {
-        if self.live.lock().unwrap().total() >= MAX_TOTAL_IDS {
+        if sync::lock(&self.live, "live notifications").total() >= MAX_TOTAL_IDS {
             log::warn!(
                 "portal: notification limit of {MAX_TOTAL_IDS} reached; dropping id '{}'",
                 notification.id
             );
             return;
         }
-        let evicted = self
-            .live
-            .lock()
-            .unwrap()
+        let evicted = sync::lock(&self.live, "live notifications")
             .track(&notification.app_id, &notification.id);
         if let Some(evicted) = evicted {
             log::info!("portal: per-app notification cap; evicting oldest id '{evicted}'");
@@ -350,10 +348,7 @@ impl DaemonManager {
                     id: evicted.clone(),
                 }),
             );
-            self.live
-                .lock()
-                .unwrap()
-                .remove(&notification.app_id, &evicted);
+            sync::lock(&self.live, "live notifications").remove(&notification.app_id, &evicted);
         }
         let app_id = notification.app_id.clone();
         let id = notification.id.clone();
@@ -361,13 +356,13 @@ impl DaemonManager {
             conn,
             &CommandFrame::new(NotifyCommand::Notify(notification)),
         ) {
-            self.live.lock().unwrap().remove(&app_id, &id);
+            sync::lock(&self.live, "live notifications").remove(&app_id, &id);
         }
     }
 
     /// Withdraw one notification; unknown ids are a no-op.
     fn close(&mut self, app_id: &str, id: &str) {
-        if !self.live.lock().unwrap().remove(app_id, id) {
+        if !sync::lock(&self.live, "live notifications").remove(app_id, id) {
             return;
         }
         // Best effort: a dead daemon has nothing showing anyway.
@@ -510,10 +505,10 @@ fn event_pump(
         match event {
             NotifyEvent::ActionInvoked { app_id, id, action } => {
                 emit_action_invoked(&conn, &app_id, &id, &action);
-                live.lock().unwrap().remove(&app_id, &id);
+                sync::lock(&live, "live notifications").remove(&app_id, &id);
             }
             NotifyEvent::Closed { app_id, id } => {
-                live.lock().unwrap().remove(&app_id, &id);
+                sync::lock(&live, "live notifications").remove(&app_id, &id);
             }
         }
     }

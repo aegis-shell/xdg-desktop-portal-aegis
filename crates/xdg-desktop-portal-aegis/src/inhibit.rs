@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use zbus::zvariant::{ObjectPath, OwnedFd, Value};
 
-use aegis_portal_runtime::RequestTracker;
+use aegis_portal_runtime::{RequestTracker, sync};
 
 /// The freedesktop Inhibit flag values.
 pub(crate) const INHIBIT_LOGOUT: u32 = 1;
@@ -78,7 +78,7 @@ impl Logind {
 
 impl SystemInhibitor for Logind {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> Result<OwnedFd, String> {
-        let mut guard = self.conn.lock().unwrap();
+        let mut guard = sync::lock(&self.conn, "logind connection");
         if guard.is_none() {
             let conn = zbus::blocking::Connection::system()
                 .map_err(|error| format!("system bus unavailable: {error}"))?;
@@ -270,7 +270,7 @@ impl InhibitIface {
 
         let reason = parse_reason(&options).map_err(zbus::fdo::Error::InvalidArgs)?;
         {
-            let mut registry = self.registry.lock().unwrap();
+            let mut registry = sync::lock(&self.registry, "inhibit registry");
             apply_inhibit(
                 self.inhibitor.as_ref(),
                 &mut registry,
@@ -295,7 +295,7 @@ impl InhibitIface {
             .await
             .map_err(zbus::fdo::Error::from)?;
         if !inserted {
-            self.registry.lock().unwrap().remove_request(&path);
+            sync::lock(&self.registry, "inhibit registry").remove_request(&path);
             return Err(zbus::fdo::Error::Failed(format!(
                 "request handle {path} is already active"
             )));
@@ -329,7 +329,7 @@ impl InhibitIface {
     /// call for live monitor sessions and reject unknown ones.
     async fn query_end_response(&self, session_handle: ObjectPath<'_>) -> zbus::fdo::Result<()> {
         let path = session_handle.as_str();
-        if self.registry.lock().unwrap().is_monitor(path) {
+        if sync::lock(&self.registry, "inhibit registry").is_monitor(path) {
             log::debug!("portal: QueryEndResponse for {path} acknowledged (no-op)");
             Ok(())
         } else {
@@ -347,7 +347,8 @@ impl InhibitIface {
 
 impl InhibitIface {
     async fn create_monitor_inner(&self, session_path: &str) -> zbus::fdo::Result<u32> {
-        if let Err(error) = self.registry.lock().unwrap().add_monitor(session_path) {
+        if let Err(error) = sync::lock(&self.registry, "inhibit registry").add_monitor(session_path)
+        {
             log::warn!("portal: refusing monitor session: {error}");
             return Ok(2);
         }
@@ -365,7 +366,7 @@ impl InhibitIface {
             .await
             .map_err(zbus::fdo::Error::from)?;
         if !inserted {
-            self.registry.lock().unwrap().remove_monitor(session_path);
+            sync::lock(&self.registry, "inhibit registry").remove_monitor(session_path);
             return Ok(2);
         }
         // The one truthful state this stack can report: Running. Nothing
@@ -401,7 +402,7 @@ struct InhibitRequestIface {
 #[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
 impl InhibitRequestIface {
     async fn close(&self) -> zbus::fdo::Result<()> {
-        let released = self.registry.lock().unwrap().remove_request(&self.path);
+        let released = sync::lock(&self.registry, "inhibit registry").remove_request(&self.path);
         if let Some(record) = released {
             log::info!(
                 "portal: released inhibition of '{}' at {} (flags {:#x}, logind lock: {})",
@@ -440,7 +441,7 @@ struct InhibitSessionIface {
 impl InhibitSessionIface {
     async fn close(&self) -> zbus::fdo::Result<()> {
         log::info!("portal: monitor session {} closed by client", self.path);
-        self.registry.lock().unwrap().remove_monitor(&self.path);
+        sync::lock(&self.registry, "inhibit registry").remove_monitor(&self.path);
         if let Err(error) = self
             .conn
             .object_server()

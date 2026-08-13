@@ -57,7 +57,12 @@ pub(crate) fn invoke(
     drop(stdin);
 
     let reader = std::thread::spawn(move || {
-        let mut bytes = Zeroizing::new(Vec::new());
+        // Responses that carry secrets (passwords, choices) are small
+        // JSON documents, well under 1 KiB: reserving that upfront keeps
+        // them in a single allocation, so no growth reallocation can
+        // leave an unzeroized copy in freed heap. Larger no-secret
+        // responses (file lists) may still reallocate.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(1024));
         stdout
             .take(MAX_MESSAGE_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -98,6 +103,11 @@ pub(crate) fn invoke(
             "prompter exited with {status} and no response"
         )));
     }
+    // The read buffer has reached its final size and is only borrowed from
+    // here on; pin it against swapping while the response (which can carry
+    // a vault password) is parsed. Best effort: the guard is None when the
+    // platform or rlimit refuses, and parsing proceeds either way.
+    let _response_lock = MlockGuard::new(&bytes);
     let decoded = serde_json::from_slice(&bytes);
     let response: PrompterResponse = decoded.map_err(|error| {
         InvokeError::Failed(format!(
@@ -113,6 +123,49 @@ pub(crate) fn invoke(
 fn terminate(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Best-effort `mlock` guard for the prompter's response bytes, which can
+/// carry a vault password: pins the fully-read buffer against swapping
+/// while it is alive, `munlock`ing on drop. `None` from [`MlockGuard::new`]
+/// means the region is empty or the platform/rlimit refused; the caller
+/// proceeds without a lock in both cases.
+struct MlockGuard {
+    addr: *const libc::c_void,
+    len: usize,
+}
+
+impl MlockGuard {
+    fn new(bytes: &[u8]) -> Option<MlockGuard> {
+        if bytes.is_empty() {
+            return None;
+        }
+        // SAFETY: `bytes` is a valid readable region owned by this process;
+        // mlock only pins its pages against swapping. Failure (for example
+        // RLIMIT_MEMLOCK) is non-fatal.
+        let result = unsafe { libc::mlock(bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+        if result != 0 {
+            log::warn!(
+                "portal: could not mlock the prompter response: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(MlockGuard {
+            addr: bytes.as_ptr().cast::<libc::c_void>(),
+            len: bytes.len(),
+        })
+    }
+}
+
+impl Drop for MlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: the region was successfully mlock'd in `new`; the owning
+        // `Zeroizing<Vec<u8>>` is only read (never reallocated) while the
+        // guard is alive, so the recorded address is still exact, and the
+        // Vec's zeroize-on-drop runs after the guard is released.
+        unsafe { libc::munlock(self.addr, self.len) };
+    }
 }
 
 /// The prompter executable's path: `$AEGIS_PORTAL_PROMPTER`, then beside

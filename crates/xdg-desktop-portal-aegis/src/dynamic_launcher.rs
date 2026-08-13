@@ -33,7 +33,7 @@ use aegis_portal_prompter::{
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 use crate::prompter::{self, InvokeError};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// Bounds for the text the frontend supplies.
 const MAX_NAME_BYTES: usize = 1024;
@@ -275,11 +275,11 @@ fn run_prepare(
     request: LauncherEditRequest,
     icon: OwnedValue,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "dynamic launcher tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "dynamic launcher tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::launcher_edit(request.clone()),
         Some(&cancelled),
@@ -287,7 +287,7 @@ fn run_prepare(
     match answered {
         Ok(PromptResult::LauncherEdit(response)) => {
             // Request.Close wins a race with a completed child response.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "dynamic launcher tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             if let Err(error) = response.validate_for(&request) {

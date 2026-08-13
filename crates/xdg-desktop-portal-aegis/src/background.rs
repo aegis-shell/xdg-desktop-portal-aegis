@@ -28,7 +28,7 @@ use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptResult, Promp
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::prompter::{self, InvokeError};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// The app id becomes a filename, so it is bounded and separator-free.
 const MAX_APP_ID_BYTES: usize = 255;
@@ -342,16 +342,16 @@ fn run_request(
     prompt: ConfirmRequest,
     autostart: Option<AutostartSpec>,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "background tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "background tracker").was_closed(request_path);
     let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), Some(&cancelled));
     match confirmed {
         Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => {
             // Request.Close wins a race with a completed child response.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "background tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             let autostart_granted = match autostart {

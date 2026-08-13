@@ -84,6 +84,16 @@ requires it. A temporary development branch may coordinate both changes, but
 the Portal branch must remain buildable without fetching or locating the
 Aegis source tree.
 
+This ordering is a hard rule, not a courtesy. The projection once defined a
+wallpaper operation ahead of the compositor — sealed memfd, a placement
+field, a reply variant no Aegis release ever implemented — and every
+request against a real compositor failed closed (see
+[ADR-0011](../adr/0011-wallpaper-wire-reconciliation.md)). A projection
+must never define an operation ahead of the compositor: the compositor
+lands and tags first, and when any doubt arises the compositor's schema is
+the wire truth. Derive fixtures from that schema, never from the
+projection's own types.
+
 ## Release Validation
 
 Run the complete Portal graph from a clean checkout:

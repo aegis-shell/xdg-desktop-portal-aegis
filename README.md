@@ -4,7 +4,7 @@
 [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)
 backend for the Aegis desktop. It translates freedesktop portal D-Bus
 requests into Portal-owned services and, only for compositor resources, a
-narrow projection of Aegis IPC (protocol 26, negotiating down to 24). It
+narrow projection of Aegis IPC (protocol 25, negotiating down to 24). It
 publishes ScreenCast streams
 through PipeWire and hosts the encrypted, per-application Secret portal.
 
@@ -27,10 +27,13 @@ UI host from a small Cargo workspace:
 ## Compatibility
 
 Portal and Aegis releases have independent version sequences. The current
-workspace speaks Aegis IPC protocol 26 and negotiates down to 24; its wire
-schema is
-verified against Aegis `v0.0.11` and `v0.0.12`. This is a runtime
-compatibility contract, not a source dependency; see the
+workspace speaks Aegis IPC protocol 25 and negotiates down to 24. The
+protocol-24 wire schema is verified against Aegis `v0.0.11` and `v0.0.12`;
+Aegis `v0.0.15` provides protocol 25, and `v0.0.16`–`v0.0.21` speak
+protocol 27, which the handshake negotiates down. Wallpaper uses the
+compositor's long-standing `SetWallpaper` op, available in every
+supported release. This is a runtime compatibility contract, not a source
+dependency; see the
 [Compatibility Reference](docs/reference/compatibility.md).
 
 ## Build
@@ -59,9 +62,8 @@ and routing configuration. The optional PAM module is enabled with
 needs no other portal backend: every routed interface is served natively.
 See [How to Install for Production](docs/how-to/install-production.md).
 
-The repository's own source is MIT-licensed. A binary package that includes
-the optional `pam_aegis.so` module must additionally declare GPL-3.0-only
-because that module links the GPL-licensed `pamsm` dependency.
+The repository's own source is MIT-licensed, including the optional
+`pam_aegis.so` module.
 
 ## Protocol Development
 
@@ -86,3 +88,9 @@ for release coordination.
 - [Compatibility reference](docs/reference/compatibility.md)
 - [Architecture decisions](docs/adr/index.md)
 - [Contributor documentation](docs/dev/index.md)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build, test, and review
+workflow. Report security issues through the process in
+[SECURITY.md](SECURITY.md).

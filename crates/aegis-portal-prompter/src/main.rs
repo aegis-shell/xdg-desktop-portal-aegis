@@ -13,13 +13,46 @@
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use aegis_portal_prompter::{PromptRequest, PrompterRequest, PrompterResponse};
+use aegis_portal_prompter::{
+    PromptRequest, PromptResult, PrompterRequest, PrompterResponse, SecretResponse,
+};
 
 mod ui;
 
 const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 
+// This crate does not depend on libc (unlike the daemon crate); declare
+// the one syscall entry point needed to opt out of core dumps instead of
+// growing the manifest for a single call. Linux-only, like the iris/lens
+// stack this binary links.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn prctl(
+        option: std::ffi::c_int,
+        arg2: std::ffi::c_ulong,
+        arg3: std::ffi::c_ulong,
+        arg4: std::ffi::c_ulong,
+        arg5: std::ffi::c_ulong,
+    ) -> std::ffi::c_int;
+}
+
+/// Linux `PR_SET_DUMPABLE`: clear the process's dumpable flag.
+#[cfg(target_os = "linux")]
+const PR_SET_DUMPABLE: std::ffi::c_int = 4;
+
 fn main() -> ExitCode {
+    // Prompt requests can carry vault passwords through this process's
+    // memory; keep them out of core dumps. Best effort: a prctl failure
+    // (e.g. under a restrictive seccomp filter) warns and never aborts
+    // startup. The logger is not initialized yet, so the warning goes to
+    // stderr directly.
+    // SAFETY: PR_SET_DUMPABLE takes no pointer arguments; the remaining
+    // arguments are ignored (zeroed here).
+    #[cfg(target_os = "linux")]
+    if unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        eprintln!("aegis-portal-prompter: could not disable core dumps: {error}");
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     if std::env::args().nth(1).as_deref() == Some("--notification-daemon") {
         return ui::notify::run_daemon();
@@ -55,6 +88,17 @@ fn read_request() -> Result<PromptRequest, String> {
 }
 
 fn write_response(response: &PrompterResponse) -> Result<(), String> {
+    // Pin a secret response's password bytes against swapping for their
+    // short serialization lifetime. Best effort: the guard is None when the
+    // value is empty, the platform has no mlock, or the rlimit refuses, and
+    // serialization proceeds either way. serde reads the String in place,
+    // so its heap address is stable while the guard is held.
+    let _secret_lock = match &response.result {
+        PromptResult::Secret(SecretResponse::Secret { value }) => {
+            ui::secret_buffer::PageLock::new(value.as_bytes())
+        }
+        _ => None,
+    };
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, response)
         .map_err(|error| format!("could not encode response: {error}"))?;

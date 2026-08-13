@@ -5,18 +5,22 @@
 //! nonce prefix followed by the ciphertext. The format is byte-compatible
 //! with the wssp vault so an existing `vault.enc` keeps working.
 //!
-//! Startup uses keyfile mode (`vault.key` holding the master key as hex).
-//! The Argon2id password KDF (`derive_key`/`generate_salt`) is kept for the
-//! future password-unlock slice that lands together with the native
-//! prompter.
+//! Startup prefers keyfile mode (`vault.key` holding the master key as hex).
+//! Password mode derives the master key with Argon2id: the `vault.kdf`
+//! sidecar (JSON) persists the exact KDF parameters plus salt and is
+//! authoritative when present, while a bare `vault.salt` marks a legacy
+//! vault that implies the crate-default parameters. A successful legacy
+//! unlock backfills `vault.kdf` and keeps `vault.salt` as a downgrade
+//! mirror for older daemons, so an argon2-crate default change can never
+//! silently invalidate existing vaults.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use argon2::Argon2;
 use argon2::password_hash::SaltString;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
@@ -27,6 +31,25 @@ use zeroize::{Zeroize, Zeroizing};
 use super::SecretError;
 
 const MAX_VAULT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The only `vault.kdf` schema version this build reads and writes.
+const KDF_FILE_VERSION: u32 = 1;
+/// The only password KDF this build supports; every `Argon2` instance
+/// constructed here is Argon2id v1.3.
+const KDF_NAME: &str = "argon2id";
+
+/// The persisted `vault.kdf` sidecar: the exact Argon2id parameters and
+/// salt a password-mode vault is keyed with, recorded on disk so the
+/// derivation stays reproducible across argon2-crate default changes.
+#[derive(Serialize, Deserialize)]
+struct KdfFile {
+    version: u32,
+    kdf: String,
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+    salt: String,
+}
 
 /// The decrypted vault contents: every persisted collection and item.
 #[derive(Serialize, Deserialize, Zeroize)]
@@ -56,18 +79,54 @@ pub struct ItemData {
 /// An open vault: its file location plus the master key in memory.
 pub struct Vault {
     path: PathBuf,
-    master_key: [u8; 32],
+    // Heap-boxed so the mlock'd address stays valid when the Vault moves.
+    master_key: Box<[u8; 32]>,
+    mlocked: bool,
 }
 
 impl Drop for Vault {
     fn drop(&mut self) {
         self.master_key.zeroize();
+        if self.mlocked {
+            // SAFETY: the boxed key was successfully mlock'd in `new` and its
+            // heap address has not changed since; it is zeroized above before
+            // the pages are released.
+            unsafe {
+                libc::munlock(
+                    self.master_key.as_ptr().cast::<libc::c_void>(),
+                    self.master_key.len(),
+                );
+            }
+        }
     }
 }
 
 impl Vault {
     pub fn new(path: PathBuf, master_key: [u8; 32]) -> Self {
-        Self { path, master_key }
+        let mut vault = Self {
+            path,
+            master_key: Box::new(master_key),
+            mlocked: false,
+        };
+        // SAFETY: the boxed key is a valid readable 32-byte region owned by
+        // this process; mlock only pins its pages against swapping. Failure
+        // (for example RLIMIT_MEMLOCK) is non-fatal and reported below —
+        // an unlock must never fail over it.
+        let result = unsafe {
+            libc::mlock(
+                vault.master_key.as_ptr().cast::<libc::c_void>(),
+                vault.master_key.len(),
+            )
+        };
+        if result == 0 {
+            vault.mlocked = true;
+        } else {
+            log::warn!(
+                "portal: could not mlock the vault master key: {}",
+                io::Error::last_os_error()
+            );
+        }
+        vault
     }
 
     /// The in-memory master key. Callers must derive purpose-separated keys
@@ -76,12 +135,19 @@ impl Vault {
         &self.master_key
     }
 
-    /// Argon2id password KDF for password-mode vaults. Unused while startup
-    /// only supports keyfile mode; kept for the password-unlock slice.
-    pub fn derive_key(password: &str, salt_str: &str) -> Result<[u8; 32], SecretError> {
+    /// Argon2id password KDF under explicit parameters, as loaded from
+    /// `vault.kdf` (or chosen for a fresh vault). Legacy `vault.salt`-only
+    /// vaults and freshly keyed ones use `Params::default()`, the exact
+    /// equivalent of `Argon2::default()`; every keyed vault then records
+    /// its parameters in `vault.kdf`.
+    pub fn derive_key_with(
+        params: &Params,
+        password: &str,
+        salt_str: &str,
+    ) -> Result<[u8; 32], SecretError> {
         let salt = SaltString::from_b64(salt_str)
             .map_err(|e| SecretError::Crypto(format!("invalid salt: {e}")))?;
-        let argon2 = Argon2::default();
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
 
         let mut key = [0u8; 32];
         if let Err(error) =
@@ -94,8 +160,7 @@ impl Vault {
         Ok(key)
     }
 
-    /// Fresh Argon2id salt for password mode; see `derive_key`.
-    #[allow(dead_code)]
+    /// Fresh Argon2id salt for keying or re-keying a password-mode vault.
     pub fn generate_salt() -> String {
         SaltString::generate(&mut OsRng).as_str().to_string()
     }
@@ -151,10 +216,22 @@ impl Vault {
     }
 
     /// Encrypt and persist the vault contents (24-byte nonce prefix +
-    /// ciphertext).
+    /// ciphertext), replacing any previous version atomically.
     pub fn save(&self, data: &VaultData) -> Result<(), SecretError> {
+        atomic_replace(&self.path, &self.seal(data)?).map_err(SecretError::Io)
+    }
+
+    /// Encrypt and persist a brand-new vault, refusing to replace an
+    /// existing file (same first-start race discipline as `atomic_create`).
+    pub(crate) fn save_new(&self, data: &VaultData) -> Result<(), SecretError> {
+        atomic_create(&self.path, &self.seal(data)?).map_err(SecretError::Io)
+    }
+
+    /// Serialize and encrypt the vault contents: 24-byte nonce prefix +
+    /// XChaCha20-Poly1305 ciphertext.
+    fn seal(&self, data: &VaultData) -> Result<Vec<u8>, SecretError> {
         let serialized = Zeroizing::new(serde_json::to_vec(data)?);
-        let cipher = XChaCha20Poly1305::new(&self.master_key.into());
+        let cipher = XChaCha20Poly1305::new((&*self.master_key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, serialized.as_ref())
@@ -162,8 +239,7 @@ impl Vault {
 
         let mut final_data = nonce.to_vec();
         final_data.extend_from_slice(&ciphertext);
-
-        atomic_replace(&self.path, &final_data).map_err(SecretError::Io)
+        Ok(final_data)
     }
 
     /// Load and decrypt the vault. A missing file reads as an empty vault; a
@@ -181,7 +257,7 @@ impl Vault {
         let (nonce_bytes, ciphertext) = file_data.split_at(24);
         let nonce = XNonce::from_slice(nonce_bytes);
 
-        let cipher = XChaCha20Poly1305::new(&self.master_key.into());
+        let cipher = XChaCha20Poly1305::new((&*self.master_key).into());
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(nonce, ciphertext)
@@ -191,6 +267,45 @@ impl Vault {
         let data: VaultData = serde_json::from_slice(plaintext.as_ref())?;
         Ok(data)
     }
+}
+
+/// Serialize the `vault.kdf` sidecar from the parameters actually in use —
+/// never from hardcoded literals — plus the salt.
+pub(crate) fn encode_kdf(params: &Params, salt: &str) -> Result<Vec<u8>, SecretError> {
+    let kdf = KdfFile {
+        version: KDF_FILE_VERSION,
+        kdf: KDF_NAME.to_owned(),
+        m_cost: params.m_cost(),
+        t_cost: params.t_cost(),
+        p_cost: params.p_cost(),
+        salt: salt.to_owned(),
+    };
+    Ok(serde_json::to_vec(&kdf)?)
+}
+
+/// Parse a `vault.kdf` sidecar into the exact Argon2id parameters and salt
+/// it describes. Anything unknown — schema version, KDF name, out-of-range
+/// parameters, a malformed salt — fails closed.
+pub(crate) fn decode_kdf(bytes: &[u8]) -> Result<(Params, String), SecretError> {
+    let kdf: KdfFile = serde_json::from_slice(bytes)
+        .map_err(|e| SecretError::Vault(format!("vault.kdf is malformed: {e}")))?;
+    if kdf.version != KDF_FILE_VERSION {
+        return Err(SecretError::Vault(format!(
+            "unsupported vault.kdf version {}",
+            kdf.version
+        )));
+    }
+    if kdf.kdf != KDF_NAME {
+        return Err(SecretError::Vault(format!(
+            "unsupported vault.kdf algorithm {}",
+            kdf.kdf
+        )));
+    }
+    let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, None)
+        .map_err(|e| SecretError::Vault(format!("invalid vault.kdf parameters: {e}")))?;
+    SaltString::from_b64(&kdf.salt)
+        .map_err(|e| SecretError::Vault(format!("invalid vault.kdf salt: {e}")))?;
+    Ok((params, kdf.salt))
 }
 
 fn read_vault_file(path: &Path, missing_is_empty: bool) -> Result<Option<Vec<u8>>, SecretError> {
@@ -322,7 +437,8 @@ mod tests {
 
         let password = "super-secret-password";
         let salt = Vault::generate_salt();
-        let key = Vault::derive_key(password, &salt).expect("key derivation failed");
+        let key = Vault::derive_key_with(&Params::default(), password, &salt)
+            .expect("key derivation failed");
 
         let vault = Vault::new(vault_path.clone(), key);
         let data = VaultData {
@@ -347,6 +463,73 @@ mod tests {
         assert_eq!(loaded.collections[0].items[0].secret, b"hunter2");
 
         let _ = std::fs::remove_file(vault_path);
+    }
+
+    #[test]
+    fn kdf_sidecar_roundtrip_with_non_default_params() {
+        let params = Params::new(64, 3, 2, None).expect("valid custom parameters");
+        let salt = Vault::generate_salt();
+
+        let encoded = encode_kdf(&params, &salt).expect("encode vault.kdf");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["kdf"], "argon2id");
+        assert_eq!(json["m_cost"], 64);
+        assert_eq!(json["t_cost"], 3);
+        assert_eq!(json["p_cost"], 2);
+        assert_eq!(json["salt"].as_str().unwrap(), salt);
+
+        let (decoded_params, decoded_salt) = decode_kdf(&encoded).expect("decode vault.kdf");
+        assert_eq!(decoded_params, params);
+        assert_eq!(decoded_salt, salt);
+
+        let mut custom_key = Vault::derive_key_with(&params, "password", &salt).unwrap();
+        let mut decoded_key =
+            Vault::derive_key_with(&decoded_params, "password", &decoded_salt).unwrap();
+        assert_eq!(
+            custom_key, decoded_key,
+            "a decoded vault.kdf must derive the same key"
+        );
+        let mut default_key =
+            Vault::derive_key_with(&Params::default(), "password", &salt).unwrap();
+        assert_ne!(
+            custom_key, default_key,
+            "non-default parameters must actually change the derived key"
+        );
+        custom_key.zeroize();
+        decoded_key.zeroize();
+        default_key.zeroize();
+    }
+
+    #[test]
+    fn malformed_kdf_sidecars_fail_closed() {
+        let salt = Vault::generate_salt();
+        let valid = encode_kdf(&Params::default(), &salt).unwrap();
+        let (decoded_params, decoded_salt) =
+            decode_kdf(&valid).expect("a well-formed sidecar decodes");
+        assert_eq!(decoded_params, Params::default());
+        assert_eq!(decoded_salt, salt);
+
+        let cases: Vec<&[u8]> = vec![
+            // Unsupported schema version.
+            br#"{"version":2,"kdf":"argon2id","m_cost":19456,"t_cost":2,"p_cost":1,"salt":"c29tZXNhbHQ"}"#,
+            // Unknown KDF name.
+            br#"{"version":1,"kdf":"scrypt","m_cost":19456,"t_cost":2,"p_cost":1,"salt":"c29tZXNhbHQ"}"#,
+            // Out-of-range parameters (m_cost below the Argon2 minimum).
+            br#"{"version":1,"kdf":"argon2id","m_cost":1,"t_cost":2,"p_cost":1,"salt":"c29tZXNhbHQ"}"#,
+            // A salt that is not a valid SaltString body.
+            br#"{"version":1,"kdf":"argon2id","m_cost":19456,"t_cost":2,"p_cost":1,"salt":"!!!"}"#,
+            // Truncated JSON.
+            br#"{"version":1,"kdf":"arg"#,
+            // Empty file.
+            b"",
+        ];
+        for case in cases {
+            assert!(
+                decode_kdf(case).is_err(),
+                "malformed vault.kdf must fail closed: {case:?}"
+            );
+        }
     }
 
     #[test]

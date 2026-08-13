@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use zbus::zvariant::{ObjectPath, OwnedFd, Value};
 
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// Bounds for the settings/page-setup maps and the print payload.
 const MAX_MAP_ENTRIES: usize = 256;
@@ -354,7 +354,7 @@ fn run_print(
     fd: OwnedFd,
     token: u32,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "print tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
     let spool = match spool_fd(fd, &spool_dir()) {

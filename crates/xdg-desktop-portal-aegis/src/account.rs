@@ -20,7 +20,7 @@ use zbus::zvariant::{ObjectPath, Value};
 
 use crate::files;
 use crate::prompter::{self, InvokeError};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 const MAX_REASON_BYTES: usize = 16 * 1024;
 
@@ -160,7 +160,7 @@ fn run_request(
     parent_window: Option<String>,
     reason: Option<String>,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "account tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
@@ -172,7 +172,7 @@ fn run_request(
         body.push(' ');
         body.push_str(&reason);
     }
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "account tracker").was_closed(request_path);
     let confirmed = prompter::invoke(
         PrompterRequest::confirm(ConfirmRequest {
             title: "Share Personal Information".to_string(),
@@ -198,7 +198,7 @@ fn run_request(
             return (2, HashMap::new());
         }
     }
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "account tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 

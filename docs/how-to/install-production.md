@@ -44,16 +44,22 @@ meson compile -C build
 meson install -C build
 ```
 
-Add the following line after the PAM module that establishes the
-authentication token. The exact file is display-manager specific.
+Add the following lines to the PAM configuration. The `auth` line goes
+after the module that establishes the authentication token, the `session`
+line after the logind session module, and the `password` line after the
+module that sets the new authentication token. The exact files are
+display-manager specific.
 
 ```text
 auth optional pam_aegis.so
+session optional pam_aegis.so
+password optional pam_aegis.so
 ```
 
 Keep the control flag `optional`. `pam_aegis.so` never grants or denies
-authentication. A package containing it is GPL-3.0-only because it links the
-`pamsm` dependency; the rest of the workspace is MIT-licensed.
+authentication: the unlock token is planted only once the login is
+confirmed, and the `password` line lets the vault password follow login
+password changes.
 
 ## Restart the Portal Frontend
 
@@ -95,11 +101,37 @@ pw-dump
 wpctl status
 ```
 
+## Migrate From the GTK Fallback
+
+Releases before [ADR-0007](../adr/0007-full-stack-interface-ownership.md)
+delegated uncovered interfaces to `xdg-desktop-portal-gtk` through an
+`aegis;gtk` route. Migrate such a deployment before starting the new
+backend:
+
+1. Remove the `xdg-desktop-portal-gtk` package. Every interface the routing
+   configuration names is now served natively, so the fallback serves
+   nothing.
+2. Delete any portals configuration that still routes to `gtk`. Check for
+   `portals.conf` or `*-portals.conf` files naming `aegis;gtk` under
+   `/usr/share/xdg-desktop-portal/`, `/etc/xdg/xdg-desktop-portal/`, and
+   `~/.config/xdg-desktop-portal/`. The new package installs
+   `aegis-portals.conf` with `aegis`-only routes; remove hand-written
+   overrides rather than editing the packaged file.
+3. Install the new package as in [Build and Install](#build-and-install).
+4. Restart the frontend as in
+   [Restart the Portal Frontend](#restart-the-portal-frontend).
+5. Re-validate the interface list as in
+   [Validate the Installation](#validate-the-installation). The output must
+   list the native interfaces only; interfaces that used to fall back
+   (Inhibit, AppChooser, Notification, DynamicLauncher, Wallpaper, Access,
+   OpenURI, Background, Print) are now served by the Aegis backend itself.
+
 ## Back Up or Migrate Secrets
 
 Stop the portal frontend before copying the vault, and copy the entire
 `$XDG_DATA_HOME/aegis/secrets` directory as one unit. Never restore
-`vault.enc` without its matching `vault.key` or `vault.salt`.
+`vault.enc` without its matching `vault.key`, or its matching `vault.kdf`
+/`vault.salt` pair for a password-mode vault.
 
 The production per-application key derivation rotates the shared value from
 the pre-production `v0.0.1` implementation. Applications that encrypted data

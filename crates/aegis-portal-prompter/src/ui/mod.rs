@@ -9,6 +9,7 @@ pub mod file_chooser;
 pub mod launcher_edit;
 pub mod notify;
 pub mod secret;
+pub mod secret_buffer;
 pub mod style;
 
 use iris::{Application, Config, Frame, Input, PaintHost};

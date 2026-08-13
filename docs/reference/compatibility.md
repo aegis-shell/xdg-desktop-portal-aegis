@@ -8,9 +8,10 @@ dependency.
 
 | Portal line | Aegis runtime | IPC protocol | Aegis build dependency |
 |-------------|---------------|--------------|------------------------|
-| `v0.0.9` | `v0.0.15`–`v0.0.18` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
-| `v0.0.8` | `v0.0.15`–`v0.0.18` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
-| `v0.0.7` | `v0.0.15`–`v0.0.17` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
+| Current workspace (`v0.0.9` + Unreleased, [ADR-0011](../adr/0011-wallpaper-wire-reconciliation.md)) | `v0.0.16`–`v0.0.21` (27); `v0.0.15` (25); `v0.0.11`–`v0.0.14` (24) | 25, negotiates down to 24 | None |
+| `v0.0.9` | `v0.0.16`–`v0.0.18` (27); `v0.0.15` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
+| `v0.0.8` | `v0.0.16`–`v0.0.18` (27); `v0.0.15` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
+| `v0.0.7` | `v0.0.16`–`v0.0.17` (27); `v0.0.15` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
 | `v0.0.6` | `v0.0.15` (25); `v0.0.11`–`v0.0.12` (24) | 25, negotiates down to 24 | None |
 | `v0.0.5` | `v0.0.11`, `v0.0.12` | 24 | None |
 | `v0.0.4` | `v0.0.11`, `v0.0.12` | 24 | None |
@@ -30,10 +31,13 @@ downgrade to 24, so it keeps working with protocol-24 compositors using the
 SHM transports while protocol-25 compositors additionally provide the
 zero-copy dmabuf slot stream (see
 [ADR-0005](../adr/0005-screencast-dmabuf-slot-protocol.md)). The current
-workspace offers protocol 26; the wallpaper op it adds is used only when
-the negotiated version is 26. A future Aegis
-release is compatible when it preserves protocol 24 or implements the
-verified protocol-26 schema.
+workspace offers protocol 25 and negotiates down to 24; upstream protocols
+26 (`CaptureWindow`) and 27 (`LaunchApp`, `Focus.reveal`) are deliberately
+not projected. Wallpaper uses the compositor's path-based `SetWallpaper`
+op, which the compositor has spoken since protocol 17 — before this
+projection's floor — so it works against every listed Aegis release (see
+[ADR-0011](../adr/0011-wallpaper-wire-reconciliation.md)). A future Aegis
+release is compatible when it preserves protocol 24.
 
 Only Settings, Screenshot, ScreenCast, and Wallpaper require compositor
 IPC; every other served interface is Portal-owned. FileChooser, Account

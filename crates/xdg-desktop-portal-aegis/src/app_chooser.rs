@@ -36,7 +36,7 @@ use zbus::zvariant::{ObjectPath, Value};
 
 use crate::apps::{AppDirs, AppInfo};
 use crate::prompter::{self, InvokeError};
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
 /// Candidate and embedded-choice caps, mirroring the prompter contract.
 const MAX_CANDIDATES: usize = 64;
@@ -334,11 +334,11 @@ fn run_dialog(
     app_id: &str,
     request: ChooseAppRequest,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "app chooser tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "app chooser tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::choose_app(request.clone()),
         Some(&cancelled),
@@ -346,7 +346,7 @@ fn run_dialog(
     match answered {
         Ok(PromptResult::ChooseApp(response)) => {
             // Request.Close wins a race with a completed child response.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "app chooser tracker").was_closed(request_path) {
                 return (1, HashMap::new());
             }
             if let Err(error) = response.validate_for(&request) {

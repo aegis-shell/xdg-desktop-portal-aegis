@@ -1,17 +1,20 @@
-//! Portal-owned projection of Aegis IPC protocol version 26.
+//! Portal-owned projection of Aegis IPC protocol version 25.
 //!
 //! Only compositor-owned portal resources belong here. The wire types are
 //! implemented independently from the compositor's Rust model so an internal
 //! Aegis refactor cannot become a Portal build dependency.
+
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// Newest protocol version this projection speaks. The handshake asks for
 /// this version and accepts a downgrade to [`MIN_PROTOCOL_VERSION`] when the
 /// compositor is older (version-gated features, such as dmabuf slot
-/// streaming at 25 and wallpaper application at 26, key off the negotiated
-/// version).
-pub const PROTOCOL_VERSION: u32 = 26;
+/// streaming at 25, key off the negotiated version). Protocol 26
+/// (`CaptureWindow`) and 27 (`LaunchApp`, `Focus.reveal`) are deliberately
+/// not projected: no Portal interface needs them.
+pub const PROTOCOL_VERSION: u32 = 25;
 /// Oldest protocol version this projection can negotiate down to.
 pub const MIN_PROTOCOL_VERSION: u32 = 24;
 pub const LOCAL_PORTAL_SCOPE: &str = "aegis-portal";
@@ -214,21 +217,30 @@ pub enum ConfirmPickResult {
     Cancelled,
 }
 
-/// Where a wallpaper is applied (protocol 26). The wire names mirror the
-/// portal spec's `set-on` values.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WallpaperPlacement {
-    #[default]
-    Background,
-    Lockscreen,
-    Both,
+/// The compositor's `SetWallpaper` path rule
+/// (`ActorResource::FilesystemPath { access: Read }::validate`), mirrored so
+/// the client refuses a request the compositor would reject anyway: a
+/// bounded absolute path in its one canonical lexical spelling. The bound is
+/// 4_096 bytes, like the real check.
+pub(crate) fn valid_wallpaper_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    if !path.is_absolute()
+        || path.as_os_str().len() > 4_096
+        || path.as_os_str().as_bytes().contains(&0)
+    {
+        return false;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return false;
+    }
+    let normalized = path.components().collect::<PathBuf>();
+    normalized.as_os_str().as_bytes() == path.as_os_str().as_bytes()
 }
-
-/// The largest wallpaper image the `SetWallpaper` op transports. Smaller
-/// than the blob channel's own ceiling: a wallpaper is a still image, and
-/// 64 MiB covers 8K PNGs with headroom.
-pub const MAX_WALLPAPER_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -305,16 +317,16 @@ pub(crate) enum Request {
         body: String,
         accept_label: Option<String>,
     },
-    /// Set the desktop wallpaper (protocol 26). The image bytes follow the
-    /// request header on the blob channel as one sealed memfd — the same
-    /// transport `CaptureOutput` uses for its PNG payload, reversed. The
-    /// portal scope's existing `control` capability covers the op; no new
-    /// capability bit is added.
+    /// Replace the desktop wallpaper with the image at `path` (the
+    /// Wallpaper portal). The op predates this projection's version floor
+    /// (the compositor has spoken it since protocol 17), so no version gate
+    /// applies. The compositor decodes on its main loop and swaps live; the
+    /// reply is an authoritative receipt, not a queue acknowledgment. It is
+    /// fail-closed: `control`, a live lease, an explicit scope op, and a
+    /// bounded absolute lexically-normalized path
+    /// ([`valid_wallpaper_path`]).
     SetWallpaper {
-        placement: WallpaperPlacement,
-        /// Length of the sealed image blob that follows, 1..=
-        /// [`MAX_WALLPAPER_BYTES`].
-        image_bytes: u64,
+        path: PathBuf,
     },
 }
 
@@ -365,9 +377,10 @@ pub(crate) enum Response {
     ConfirmPicked {
         result: ConfirmPickResult,
     },
-    /// Reply to [`Request::SetWallpaper`] (protocol 26): the image was
-    /// applied. Refusals arrive as `Error`.
-    WallpaperApplied,
+    /// Reply to [`Request::SetWallpaper`]: the wallpaper was decoded and
+    /// swapped (an authoritative main-loop receipt). Refusals arrive as
+    /// `Error`.
+    WallpaperSet {},
     LeaseRenewed {
         lease: LeaseGrant,
     },
@@ -440,10 +453,10 @@ mod tests {
 
     #[test]
     fn hello_matches_the_v25_wire_shape() {
-        // The literal 25 keeps this fixture pinned to the v25 shape even
-        // though PROTOCOL_VERSION has moved on.
+        // The literal 25 pins this fixture to the v25 shape; PROTOCOL_VERSION
+        // must equal it.
         let request = Request::Hello {
-            version: 25,
+            version: PROTOCOL_VERSION,
             caps: ConnectionCapabilities::QUERY,
             scope: None,
             lease: None,
@@ -466,56 +479,59 @@ mod tests {
     }
 
     #[test]
-    fn hello_matches_the_v26_wire_shape() {
-        let request = Request::Hello {
-            version: PROTOCOL_VERSION,
-            caps: ConnectionCapabilities::QUERY,
-            scope: None,
-            lease: None,
-        };
-        assert_eq!(
-            serde_json::to_value(request).unwrap(),
-            serde_json::json!({
-                "type": "Hello",
-                "version": 26,
-                "caps": {
-                    "query": true,
-                    "control": false,
-                    "input": false,
-                    "session": false,
-                    "interaction_domain": false
-                },
-                "scope": null
-            })
-        );
-    }
-
-    #[test]
-    fn wallpaper_operations_match_the_v26_wire_fixtures() {
+    fn wallpaper_operations_match_the_real_wire_fixtures() {
+        // The literals below were produced by serializing the compositor's
+        // own schema types (aegis-ipc `Request`/`Response`) with serde_json,
+        // and deserialize against it in both directions.
         let request = Request::SetWallpaper {
-            placement: WallpaperPlacement::Both,
-            image_bytes: 4096,
+            path: PathBuf::from("/run/user/1000/aegis-portal/wallpaper/current.png"),
         };
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
                 "type": "SetWallpaper",
-                "placement": "both",
-                "image_bytes": 4096
+                "path": "/run/user/1000/aegis-portal/wallpaper/current.png"
             })
         );
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "type": "SetWallpaper",
+            "path": "/run/user/1000/aegis-portal/wallpaper/current.png"
+        }))
+        .unwrap();
         assert_eq!(
-            serde_json::to_value(WallpaperPlacement::Background).unwrap(),
-            serde_json::json!("background")
-        );
-        assert_eq!(
-            serde_json::to_value(WallpaperPlacement::Lockscreen).unwrap(),
-            serde_json::json!("lockscreen")
+            request,
+            Request::SetWallpaper {
+                path: PathBuf::from("/run/user/1000/aegis-portal/wallpaper/current.png"),
+            }
         );
 
+        assert_eq!(
+            serde_json::to_value(Response::WallpaperSet {}).unwrap(),
+            serde_json::json!({ "type": "WallpaperSet" })
+        );
         let response: Response =
-            serde_json::from_value(serde_json::json!({ "type": "WallpaperApplied" })).unwrap();
-        assert_eq!(response, Response::WallpaperApplied);
+            serde_json::from_value(serde_json::json!({ "type": "WallpaperSet" })).unwrap();
+        assert_eq!(response, Response::WallpaperSet {});
+    }
+
+    #[test]
+    fn wallpaper_path_validation_matches_the_compositor_rule() {
+        assert!(valid_wallpaper_path(Path::new(
+            "/run/user/1000/aegis-portal/wallpaper/current.png"
+        )));
+        assert!(valid_wallpaper_path(Path::new("/a")));
+        // Relative paths, dot components, redundant separators, trailing
+        // slashes, and oversized paths are all refused.
+        assert!(!valid_wallpaper_path(Path::new("wall.png")));
+        assert!(!valid_wallpaper_path(Path::new("relative/wall.png")));
+        assert!(!valid_wallpaper_path(Path::new("/run/../etc/wall.png")));
+        assert!(!valid_wallpaper_path(Path::new("/run/./wall.png")));
+        assert!(!valid_wallpaper_path(Path::new("/run//wall.png")));
+        assert!(!valid_wallpaper_path(Path::new("/run/wall.png/")));
+        let oversized = PathBuf::from(format!("/{}", "a".repeat(4_096)));
+        assert!(!valid_wallpaper_path(&oversized));
+        let at_bound = PathBuf::from(format!("/{}", "a".repeat(4_095)));
+        assert!(valid_wallpaper_path(&at_bound));
     }
 
     #[test]

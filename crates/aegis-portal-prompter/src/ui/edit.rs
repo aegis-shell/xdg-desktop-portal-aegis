@@ -18,6 +18,11 @@
 //! per-field content purpose; commit text caps at 31 bytes and the preedit
 //! at 63 bytes per frame; surrounding text is never reported to the IME.
 //! Raising any of these needs an optics release.
+//!
+//! The store behind a surface is pluggable ([`EditBuffer`]): `String`
+//! grows to fit, while the secret prompt's fixed page-locked
+//! [`SecretBuffer`](super::secret_buffer::SecretBuffer) takes only what
+//! fits and never reallocates.
 
 use lens::{Align, Color, Frame, Input, LayoutOpts, Rect, key};
 
@@ -26,6 +31,38 @@ use super::{Preedit, command_held, committed_text, ime_delete, key_down, key_pre
 
 /// The mask glyph drawn per typed character on secret surfaces.
 pub const MASK: &str = "•";
+
+/// The text store behind an app-owned edit surface: read as `&str`,
+/// inserted into at a byte index, removed from by byte range.
+/// Implementations keep the text valid UTF-8; a bounded store may take
+/// only part of an insertion, so [`EditBuffer::insert_str`] reports how
+/// many bytes were actually inserted and the caret advances by exactly
+/// that.
+pub trait EditBuffer {
+    /// The current text.
+    fn as_str(&self) -> &str;
+    /// Insert `s` at byte `index` (a char boundary); returns the number of
+    /// bytes inserted — a bounded store takes only the char-boundary
+    /// prefix of `s` that fits.
+    fn insert_str(&mut self, index: usize, s: &str) -> usize;
+    /// Remove the byte range (both ends on char boundaries).
+    fn remove_range(&mut self, range: std::ops::Range<usize>);
+}
+
+impl EditBuffer for String {
+    fn as_str(&self) -> &str {
+        self
+    }
+
+    fn insert_str(&mut self, index: usize, s: &str) -> usize {
+        String::insert_str(self, index, s);
+        s.len()
+    }
+
+    fn remove_range(&mut self, range: std::ops::Range<usize>) {
+        self.replace_range(range, "");
+    }
+}
 
 /// The caret bar drawn between text runs.
 pub fn caret_bar(color: Color) -> LayoutOpts {
@@ -38,27 +75,29 @@ pub fn caret_bar(color: Color) -> LayoutOpts {
 }
 
 /// Insert text at the caret, dropping control characters (single line).
-pub fn insert(text: &mut String, caret: &mut usize, input: &str) {
+/// The caret advances by what the store actually took: a bounded store
+/// drops input past its capacity.
+pub fn insert<T: EditBuffer>(text: &mut T, caret: &mut usize, input: &str) {
     let clean: String = input.chars().filter(|c| !c.is_control()).collect();
     if clean.is_empty() {
         return;
     }
-    text.insert_str(*caret, &clean);
-    *caret += clean.len();
+    let inserted = text.insert_str(*caret, &clean);
+    *caret += inserted;
 }
 
-pub fn delete_backward(text: &mut String, caret: &mut usize) {
-    let start = prev_boundary(text, *caret);
+pub fn delete_backward<T: EditBuffer>(text: &mut T, caret: &mut usize) {
+    let start = prev_boundary(text.as_str(), *caret);
     if start < *caret {
-        text.replace_range(start..*caret, "");
+        text.remove_range(start..*caret);
         *caret = start;
     }
 }
 
-pub fn delete_forward(text: &mut String, caret: &mut usize) {
-    let end = next_boundary(text, *caret);
+pub fn delete_forward<T: EditBuffer>(text: &mut T, caret: &mut usize) {
+    let end = next_boundary(text.as_str(), *caret);
     if end > *caret {
-        text.replace_range(*caret..end, "");
+        text.remove_range(*caret..end);
     }
 }
 
@@ -79,24 +118,24 @@ pub fn next_boundary(text: &str, index: usize) -> usize {
 /// Apply the IME's `delete_surrounding_text` request: byte counts before
 /// and after the caret, widened outward to whole characters (a partial
 /// character cannot be deleted). Mirrors lens's textfield.
-pub fn apply_ime_delete(text: &mut String, caret: &mut usize, before: u32, after: u32) {
+pub fn apply_ime_delete<T: EditBuffer>(text: &mut T, caret: &mut usize, before: u32, after: u32) {
     if before > 0 && *caret > 0 {
         let mut start = caret.saturating_sub(before as usize);
-        while start > 0 && !text.is_char_boundary(start) {
+        while start > 0 && !text.as_str().is_char_boundary(start) {
             start -= 1;
         }
         if start < *caret {
-            text.replace_range(start..*caret, "");
+            text.remove_range(start..*caret);
             *caret = start;
         }
     }
     if after > 0 {
-        let mut end = (*caret + after as usize).min(text.len());
-        while end < text.len() && !text.is_char_boundary(end) {
+        let mut end = (*caret + after as usize).min(text.as_str().len());
+        while end < text.as_str().len() && !text.as_str().is_char_boundary(end) {
             end += 1;
         }
         if end > *caret {
-            text.replace_range(*caret..end, "");
+            text.remove_range(*caret..end);
         }
     }
 }
@@ -285,8 +324,9 @@ pub fn edit_surface(f: &mut Frame, dark: bool, surface: EditSurface<'_>) -> lens
 /// Apply a frame of input to an owned buffer, in protocol order: the IME's
 /// surrounding-text deletion, committed text (typed characters and IME
 /// results), editing keys (Backspace/Delete, caret arrows/Home/End), and
-/// Ctrl+V paste. The caller keeps Return/Tab and focus policy.
-pub fn edit_keys(text: &mut String, caret: &mut usize, f: &mut Frame, input: &Input) {
+/// Ctrl+V paste. The caller keeps Return/Tab and focus policy. On a
+/// bounded store, input past the capacity is dropped (see [`EditBuffer`]).
+pub fn edit_keys<T: EditBuffer>(text: &mut T, caret: &mut usize, f: &mut Frame, input: &Input) {
     let (before, after) = ime_delete(input);
     apply_ime_delete(text, caret, before, after);
     let committed = committed_text(input);
@@ -300,16 +340,16 @@ pub fn edit_keys(text: &mut String, caret: &mut usize, f: &mut Frame, input: &In
         delete_forward(text, caret);
     }
     if key_down(input, key::LEFT) {
-        *caret = prev_boundary(text, *caret);
+        *caret = prev_boundary(text.as_str(), *caret);
     }
     if key_down(input, key::RIGHT) {
-        *caret = next_boundary(text, *caret);
+        *caret = next_boundary(text.as_str(), *caret);
     }
     if key_down(input, key::HOME) {
         *caret = 0;
     }
     if key_down(input, key::END) {
-        *caret = text.len();
+        *caret = text.as_str().len();
     }
     if command_held(input) && key_pressed(input, 'v' as i32) {
         f.request_paste();

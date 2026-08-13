@@ -25,6 +25,7 @@ use zeroize::Zeroize;
 
 use super::SecretState;
 use aegis_portal_runtime::RequestTracker;
+use aegis_portal_runtime::sync;
 
 /// The served interface version.
 pub(crate) const SECRET_VERSION: u32 = 1;
@@ -94,12 +95,12 @@ impl SecretIface {
         app_id: &str,
         fd: Fd<'_>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, Value<'static>>)> {
-        if self.tracker.lock().unwrap().was_closed(path) {
+        if sync::lock(&self.tracker, "secret tracker").was_closed(path) {
             log::info!("portal: RetrieveSecret at {path} cancelled by Request.Close");
             return Ok((1, HashMap::new()));
         }
 
-        if self.state.lock().unwrap().is_unlocked() {
+        if sync::lock(&self.state, "secret state").is_unlocked() {
             return Ok(self.deliver(app_id, fd));
         }
 
@@ -130,7 +131,7 @@ impl SecretIface {
             .await
             .unwrap_or(super::PortalUnlockOutcome::Failed);
 
-        if self.tracker.lock().unwrap().was_closed(path) {
+        if sync::lock(&self.tracker, "secret tracker").was_closed(path) {
             log::info!("portal: RetrieveSecret at {path} cancelled while unlocking");
             return Ok((1, HashMap::new()));
         }
@@ -146,7 +147,7 @@ impl SecretIface {
     /// the caller's fd. The state guard is dropped before any fd I/O.
     fn deliver(&self, app_id: &str, fd: Fd<'_>) -> (u32, HashMap<String, Value<'static>>) {
         let mut secret = {
-            let state = self.state.lock().unwrap();
+            let state = sync::lock(&self.state, "secret state");
             let Some(vault) = &state.vault else {
                 return (2, HashMap::new());
             };

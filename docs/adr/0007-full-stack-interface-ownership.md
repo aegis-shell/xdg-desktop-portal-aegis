@@ -1,6 +1,6 @@
 # ADR-0007: Full-stack interface ownership
 
-- Status: Accepted
+- Status: Accepted (wallpaper design point superseded by [ADR-0011](0011-wallpaper-wire-reconciliation.md))
 - Date: 2026-08-13
 - Amends: [ADR-0004](0004-portal-ownership-and-runtime-ipc-boundary.md)
 

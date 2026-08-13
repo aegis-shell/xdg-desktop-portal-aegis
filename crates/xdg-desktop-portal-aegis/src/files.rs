@@ -55,32 +55,21 @@ pub(crate) fn write_capture(dir: &Path, token: &str, png: &[u8]) -> io::Result<P
 }
 
 /// Create-temp-then-rename under `dir`, mode 0600, so no consumer observes a
-/// partial payload.
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+/// partial payload. Shared by the screenshot cache and the wallpaper staging
+/// directory.
+pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     // Open without following the final component and validate before chmod.
     // Otherwise an attacker-controlled cache symlink could make the portal
     // change permissions on an unrelated directory.
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir)?;
-    let metadata = directory.metadata()?;
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    if !metadata.is_dir() || metadata.uid() != uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "screenshot directory must be a user-owned real directory",
-        ));
-    }
+    let directory = open_owned_dir(dir)?;
     // The directory contains names and pixels from private screenshots. Do
     // not rely on the process umask to keep it private.
     directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     if directory.metadata()?.permissions().mode() & 0o7777 != 0o700 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "screenshot directory mode must be 0700",
+            "portal data directory mode must be 0700",
         ));
     }
 
@@ -103,6 +92,36 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
         let _ = std::fs::remove_file(&temporary);
     }
     result.map(|()| final_path)
+}
+
+/// Open `dir` without following the final component and prove it is a
+/// user-owned real directory (not a symlink to one).
+fn open_owned_dir(dir: &Path) -> io::Result<std::fs::File> {
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "portal data directory must be a user-owned real directory",
+        ));
+    }
+    Ok(directory)
+}
+
+/// Remove `dir` and its contents, after proving it is a user-owned real
+/// directory with the same O_DIRECTORY|O_NOFOLLOW discipline as
+/// [`write_atomic`]. A missing directory is not an error.
+pub(crate) fn remove_owned_dir(dir: &Path) -> io::Result<()> {
+    match open_owned_dir(dir) {
+        Ok(_) => std::fs::remove_dir_all(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn random_suffix() -> String {
@@ -246,6 +265,36 @@ mod tests {
             0o755
         );
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remove_owned_dir_wipes_contents_and_refuses_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "xdg-desktop-portal-aegis-remove-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staging = root.join("wallpaper");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("current.png"), b"stale").unwrap();
+        std::fs::write(staging.join(".current.png.ab.tmp"), b"partial").unwrap();
+
+        remove_owned_dir(&staging).unwrap();
+        assert!(!staging.exists());
+        // A missing directory is not an error.
+        remove_owned_dir(&staging).unwrap();
+
+        // A symlink is refused and its target keeps its contents.
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.png"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &staging).unwrap();
+        assert!(remove_owned_dir(&staging).is_err());
+        assert_eq!(std::fs::read(target.join("keep.png")).unwrap(), b"keep");
         std::fs::remove_dir_all(root).unwrap();
     }
 

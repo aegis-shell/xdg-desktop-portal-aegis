@@ -12,7 +12,7 @@ use aegis_portal_prompter::{
     BytePath, Choice, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter,
     FilterRule, FilterRuleKind, PromptResult, PrompterRequest,
 };
-use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender};
+use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 use zbus::zvariant::{ObjectPath, Value};
 
 use crate::{files, prompter};
@@ -236,7 +236,7 @@ fn run_pick(
     request_path: &str,
     request: FileChooserRequest,
 ) -> (u32, HashMap<String, Value<'static>>) {
-    if tracker.lock().unwrap().was_closed(request_path) {
+    if sync::lock(tracker, "file chooser tracker").was_closed(request_path) {
         return cancelled();
     }
     if let Err(error) = request.validate() {
@@ -248,7 +248,7 @@ fn run_pick(
     match invoke_prompter(tracker, request_path, &request) {
         Ok(response @ FileChooserResponse::Selected { .. }) => {
             // Request.Close wins a race with a completed child response.
-            if tracker.lock().unwrap().was_closed(request_path) {
+            if sync::lock(tracker, "file chooser tracker").was_closed(request_path) {
                 return cancelled();
             }
             if let Err(error) = response.validate_for(&request) {
@@ -280,7 +280,7 @@ fn invoke_prompter(
     request_path: &str,
     request: &FileChooserRequest,
 ) -> Result<FileChooserResponse, String> {
-    let cancelled = || tracker.lock().unwrap().was_closed(request_path);
+    let cancelled = || sync::lock(tracker, "file chooser tracker").was_closed(request_path);
     match prompter::invoke(
         PrompterRequest::file_chooser(request.clone()),
         Some(&cancelled),

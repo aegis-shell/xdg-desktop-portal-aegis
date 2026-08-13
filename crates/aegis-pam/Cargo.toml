@@ -1,11 +1,11 @@
 [package]
 name = "aegis-pam"
-description = "PAM module caching the login authtok for the Aegis secret vault's auto-unlock (token consumed by xdg-desktop-portal-aegis)"
+description = "PAM module caching the login authtok for the Aegis secret vault's auto-unlock (token consumed by xdg-desktop-portal-aegis) and re-keying the vault on login password changes"
 readme = "README.md"
 publish = false
 version.workspace = true
 edition.workspace = true
-license = "GPL-3.0-only"
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
@@ -14,6 +14,6 @@ crate-type = ["cdylib"]
 name = "pam_aegis"
 
 [dependencies]
-pamsm = { version = "0.4.3", features = ["libpam"] }
+aegis-portal-secret.workspace = true
 libc = { workspace = true }
 zeroize = { workspace = true }
