@@ -198,9 +198,9 @@ pub(crate) fn parse_buffers_data_types(param: &Pod) -> Option<u32> {
 
 /// The offered video format: raw video in the SPA format matching the
 /// compositor's pixel layout at the output's geometry. The framerate is a
-/// range because the compositor is damage-driven: frames arrive when the
-/// screen changes, bounded by its vertical sync, and each consumer picks
-/// the rate its pipeline wants.
+/// range: frames arrive at the negotiated cadence, paced by the compositor
+/// and bounded by its vertical sync, and each consumer picks the rate its
+/// pipeline wants.
 pub(crate) fn format_pod(
     width: u32,
     height: u32,

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- ScreenCast streams stalled to one frame every few seconds on a static
+  desktop (frozen picture in OBS and other PipeWire consumers): the
+  compositor only ever produced stream frames as a by-product of
+  damage-driven presentation. Live streams now pace the compositor's main
+  loop at the negotiated cadence (aegis ≥ the fix in ADR-0052's updated
+  pacing contract), so frames flow at the requested rate whether or not
+  anything on screen changes. No portal-side transport change was needed;
+  the cast bridge already republishes every compositor frame.
+
 ## [0.0.10] - 2026-08-13
 
 ### Added

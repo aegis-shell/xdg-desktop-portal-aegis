@@ -82,8 +82,10 @@ use crate::ipc;
 use crate::screencast::CastJob;
 
 /// Frame-rate ceiling requested from the compositor. The compositor paces
-/// frames itself (damage-driven, bounded by the output's vertical sync);
-/// this is only a cap, and the server clamps it to its own supported range.
+/// frames itself: while a stream is live, its due frames drive presentation
+/// at the negotiated cadence (bounded by the output's vertical sync), so
+/// frames flow even on a static screen; this is only a cap, and the server
+/// clamps it to its own supported range.
 pub(crate) const STREAM_MAX_FPS: u32 = 60;
 /// A screencast publishes frames for PipeWire capture consumers.
 const STREAM_DIRECTION: Direction = Direction::Output;
