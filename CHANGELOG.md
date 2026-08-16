@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-08-16
+
 ### Added
 
 - Flatpak-OBS-grade ScreenCast source selection, window capture,
