@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-08-16
+
 ### Fixed
 
 - Every compositor-mediated portal function being refused. Both binaries
