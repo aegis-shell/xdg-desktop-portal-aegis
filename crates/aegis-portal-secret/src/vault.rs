@@ -126,6 +126,14 @@ impl Vault {
                 io::Error::last_os_error()
             );
         }
+        // Independent of the mlock outcome: keep the key's pages out of any
+        // core dump image, including a piped core handler, which the
+        // process-wide RLIMIT_CORE=0 alone cannot guarantee.
+        crate::mark_dontdump(
+            "the vault master key",
+            vault.master_key.as_ptr(),
+            vault.master_key.len(),
+        );
         vault
     }
 

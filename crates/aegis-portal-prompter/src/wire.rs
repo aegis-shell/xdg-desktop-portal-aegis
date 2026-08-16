@@ -13,7 +13,7 @@
 
 use std::io::{self, Write};
 
-// This crate does not depend on libc (see the prctl declaration in
+// This crate does not depend on libc (see the setrlimit declaration in
 // main.rs); declare the two entry points the wire guard needs. POSIX,
 // but the prompter is Linux-only, like the iris/lens stack it links.
 #[cfg(target_os = "linux")]

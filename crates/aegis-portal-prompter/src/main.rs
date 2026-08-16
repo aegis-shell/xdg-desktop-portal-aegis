@@ -31,18 +31,20 @@ const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 // stack this binary links.
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
-    fn prctl(
-        option: std::ffi::c_int,
-        arg2: std::ffi::c_ulong,
-        arg3: std::ffi::c_ulong,
-        arg4: std::ffi::c_ulong,
-        arg5: std::ffi::c_ulong,
-    ) -> std::ffi::c_int;
+    fn setrlimit(resource: std::ffi::c_int, rlim: *const Rlimit) -> std::ffi::c_int;
 }
 
-/// Linux `PR_SET_DUMPABLE`: clear the process's dumpable flag.
+/// Linux `RLIMIT_CORE`: the core dump size resource.
 #[cfg(target_os = "linux")]
-const PR_SET_DUMPABLE: std::ffi::c_int = 4;
+const RLIMIT_CORE: std::ffi::c_int = 4;
+
+/// Mirrors Linux `struct rlimit` (`rlim_t` is `unsigned long`).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Rlimit {
+    rlim_cur: std::ffi::c_ulong,
+    rlim_max: std::ffi::c_ulong,
+}
 
 fn main() -> ExitCode {
     // Claim the protocol wire before anything else can touch stdout: the
@@ -50,16 +52,26 @@ fn main() -> ExitCode {
     // one flushed at exit corrupts a shared wire (see wire.rs).
     let mut wire = Wire::acquire();
     // Prompt requests can carry vault passwords through this process's
-    // memory; keep them out of core dumps. Best effort: a prctl failure
-    // (e.g. under a restrictive seccomp filter) warns and never aborts
-    // startup. The logger is not initialized yet, so the warning goes to
-    // stderr directly.
-    // SAFETY: PR_SET_DUMPABLE takes no pointer arguments; the remaining
-    // arguments are ignored (zeroed here).
+    // memory; keep core dumps from being written for it. The secret buffer
+    // additionally opts its own pages out of any dump image with
+    // MADV_DONTDUMP (see ui/secret_buffer.rs). Do NOT switch this to
+    // PR_SET_DUMPABLE=0: a non-dumpable process's /proc/<pid>/exe is
+    // unreadable, which blinds the compositor's kernel-verified identity
+    // check for built-in IPC scope claims (ADR-0128). Best effort: a
+    // setrlimit failure (e.g. under a restrictive seccomp filter) warns and
+    // never aborts startup. The logger is not initialized yet, so the
+    // warning goes to stderr directly.
+    // SAFETY: setrlimit takes a valid pointer to an initialized rlimit.
     #[cfg(target_os = "linux")]
-    if unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        let error = std::io::Error::last_os_error();
-        eprintln!("aegis-portal-prompter: could not disable core dumps: {error}");
+    {
+        let no_core = Rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { setrlimit(RLIMIT_CORE, &no_core) } != 0 {
+            let error = std::io::Error::last_os_error();
+            eprintln!("aegis-portal-prompter: could not disable core dumps: {error}");
+        }
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     if std::env::args().nth(1).as_deref() == Some("--notification-daemon") {

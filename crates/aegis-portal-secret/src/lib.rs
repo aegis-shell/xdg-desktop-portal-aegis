@@ -42,10 +42,42 @@ const MAX_PENDING_UNLOCKS: usize = 64;
 /// Anything else in the token file parses as a legacy raw password token.
 pub const PAM_TOKEN_KEY_PREFIX: &str = "aegis-key-v1:";
 
+/// Mark the pages covering a secret region `MADV_DONTDUMP` so its bytes
+/// stay out of any core dump image — including a piped core handler, which
+/// the process-wide `RLIMIT_CORE` cap alone cannot guarantee. Best effort
+/// like the mlock policy: a failure is logged, never fatal. The flag dies
+/// with the mapping, so it needs no undo.
+fn mark_dontdump(what: &str, ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // madvise requires a page-aligned address, so round the range out to
+    // its covering pages; over-excluding a neighbor's bytes on a shared
+    // page is harmless. SAFETY: the rounded range covers the region the
+    // caller guarantees is valid readable memory owned by this process.
+    let page = page_size();
+    let start = ptr as usize & !(page - 1);
+    let end = (ptr as usize + len + page - 1) & !(page - 1);
+    if unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTDUMP) } != 0 {
+        log::warn!(
+            "portal: could not mark {what} MADV_DONTDUMP: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// The host page size, defaulting to 4 KiB if sysconf refuses.
+fn page_size() -> usize {
+    // SAFETY: sysconf is always safe to call.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 { size as usize } else { 4096 }
+}
+
 /// A best-effort mlock'd byte buffer for hot secret material. Construction
-/// pins the buffer's pages against swapping; drop zeroizes the contents
-/// before releasing them. A pinning failure (RLIMIT_MEMLOCK and friends) is
-/// logged and never fails the surrounding operation — the buffer stays
+/// pins the buffer's pages against swapping and marks them MADV_DONTDUMP so
+/// they stay out of any core dump image. Drop zeroizes the contents before
+/// releasing them. A pinning or advice failure (RLIMIT_MEMLOCK and friends)
+/// is logged and never fails the surrounding operation — the buffer stays
 /// fully usable. The Vec is never grown after construction, so the pinned
 /// address stays valid for the buffer's lifetime, the same reasoning as the
 /// boxed master key in `Vault`.
@@ -82,6 +114,9 @@ impl LockedBytes {
                 std::io::Error::last_os_error()
             );
         }
+        // Independent of the mlock outcome: exclude the pages from any
+        // core dump image.
+        mark_dontdump("a secret buffer", locked.bytes.as_ptr(), locked.bytes.len());
         locked
     }
 

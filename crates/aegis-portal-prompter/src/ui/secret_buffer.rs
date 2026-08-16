@@ -6,8 +6,9 @@
 //! live pages themselves are swappable. `SecretBuffer` instead holds the
 //! secret in one fixed heap allocation that never reallocates, is
 //! `mlock`'d against swapping on a best-effort basis (the same policy the
-//! vault's master key follows), and is zeroized on every clear path — on
-//! drop the zeroing happens before the pages are `munlock`'d.
+//! vault's master key follows), is marked `MADV_DONTDUMP` so its pages
+//! stay out of any core dump image, and is zeroized on every clear path —
+//! on drop the zeroing happens before the pages are `munlock`'d.
 //!
 //! The 256-byte cap is generous for the vault's UTF-8 password domain. It
 //! is enforced on byte length without ever splitting a multi-byte
@@ -24,13 +25,53 @@ use super::edit::EditBuffer;
 pub const CAPACITY: usize = 256;
 
 // This crate does not depend on libc (unlike the daemon crate); declare
-// the two syscall entry points needed to pin the buffer against swapping,
-// following main.rs's prctl precedent. Linux-only, like the iris/lens
-// stack this binary links.
+// the syscall entry points needed to pin the buffer against swapping and
+// keep it out of core dumps, following main.rs's setrlimit precedent.
+// Linux-only, like the iris/lens stack this binary links.
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn mlock(addr: *const std::ffi::c_void, len: usize) -> std::ffi::c_int;
     fn munlock(addr: *const std::ffi::c_void, len: usize) -> std::ffi::c_int;
+    fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: std::ffi::c_int)
+    -> std::ffi::c_int;
+    fn sysconf(name: std::ffi::c_int) -> std::ffi::c_long;
+}
+
+/// Linux `MADV_DONTDUMP`: exclude the range's pages from core dumps.
+#[cfg(target_os = "linux")]
+const MADV_DONTDUMP: std::ffi::c_int = 16;
+
+/// glibc `_SC_PAGESIZE`.
+#[cfg(target_os = "linux")]
+const _SC_PAGESIZE: std::ffi::c_int = 30;
+
+/// Mark the pages covering a secret region `MADV_DONTDUMP` so its bytes
+/// stay out of any core dump image, including a piped core handler, which
+/// the process-wide `RLIMIT_CORE` cap alone cannot guarantee. Best effort
+/// like the mlock policy: a failure is logged, never fatal. The flag dies
+/// with the mapping, so it needs no undo.
+#[cfg(target_os = "linux")]
+fn mark_dontdump(what: &str, ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: sysconf is always safe to call. Page sizes are powers of two.
+    let page = match unsafe { sysconf(_SC_PAGESIZE) } {
+        size if size > 0 => size as usize,
+        _ => 4096,
+    };
+    // madvise requires a page-aligned address, so round the range out to
+    // its covering pages; over-excluding a neighbor's bytes on a shared
+    // page is harmless. SAFETY: the rounded range covers the region the
+    // caller guarantees is valid readable memory owned by this process.
+    let start = ptr as usize & !(page - 1);
+    let end = (ptr as usize + len + page - 1) & !(page - 1);
+    if unsafe { madvise(start as *mut std::ffi::c_void, end - start, MADV_DONTDUMP) } != 0 {
+        log::warn!(
+            "prompter: could not mark {what} MADV_DONTDUMP: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 pub struct SecretBuffer {
@@ -71,6 +112,13 @@ impl SecretBuffer {
                     std::io::Error::last_os_error()
                 );
             }
+            // Independent of the mlock outcome: exclude the pages from any
+            // core dump image.
+            mark_dontdump(
+                "the secret buffer",
+                buffer.bytes.as_ptr(),
+                buffer.bytes.len(),
+            );
         }
         buffer
     }
@@ -188,6 +236,11 @@ impl PageLock {
             let locked =
                 unsafe { mlock(bytes.as_ptr().cast::<std::ffi::c_void>(), bytes.len()) } == 0;
             if locked {
+                // Keep the guarded pages out of any core dump image too.
+                // The flag deliberately survives the guard: the region's
+                // contents are secret for the mapping's whole lifetime, not
+                // just while the lock is held.
+                mark_dontdump("the secret response", bytes.as_ptr(), bytes.len());
                 return Some(PageLock {
                     addr: bytes.as_ptr().cast::<std::ffi::c_void>(),
                     len: bytes.len(),

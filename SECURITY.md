@@ -90,18 +90,24 @@ optics release.
 
 ### Process and Memory Boundaries
 
-- The vault master key is heap-pinned and `mlock`ed on a best-effort
-  basis: an `mlock` failure (for example `RLIMIT_MEMLOCK`) logs a warning
-  and never fails an unlock, and the key is zeroized and `munlock`ed on
-  drop. The daemon holds hot secret material — PAM token bytes, the
-  unlock-prompt password, and re-key working copies — in `LockedBytes`,
-  an owning buffer pinned the same way. The prompter accumulates a typed
+- The vault master key is heap-pinned, `mlock`ed, and marked
+  `MADV_DONTDUMP` on a best-effort basis: an `mlock`/`madvise` failure
+  (for example `RLIMIT_MEMLOCK`) logs a warning and never fails an
+  unlock, and the key is zeroized and `munlock`ed on drop. The daemon
+  holds hot secret material — PAM token bytes, the unlock-prompt
+  password, and re-key working copies — in `LockedBytes`, an owning
+  buffer protected the same way. The prompter accumulates a typed
   password in a fixed 256-byte heap buffer (`SecretBuffer`) that is
-  `mlock`ed best-effort and never reallocated, so growth cannot smear
-  partial passwords across freed pages; the secret response is `mlock`ed
-  during serialization, and the daemon `mlock`s the prompter's response
-  buffer after reading it. Both binaries clear their dumpable flag
-  (`PR_SET_DUMPABLE`) at startup, so core dumps exclude their memory.
+  `mlock`ed and `MADV_DONTDUMP`ed best-effort and never reallocated, so
+  growth cannot smear partial passwords across freed pages; the secret
+  response is `mlock`ed and dump-excluded during serialization, and the
+  daemon `mlock`s the prompter's response buffer after reading it. Both
+  binaries cap `RLIMIT_CORE` at zero at startup so no core dump file is
+  written for them, and the `MADV_DONTDUMP` page markings keep key
+  material out of any dump image, including a piped core handler. The
+  processes deliberately stay dumpable: a non-dumpable process's
+  `/proc/<pid>/exe` is unreadable, which would blind the compositor's
+  kernel-verified identity check for built-in IPC scope claims.
   Honest residuals: per-frame transient strings in the prompter's input
   path also live in platform and IME buffers by design, and the stdout
   line writer holds bytes briefly during serialization — zeroing those

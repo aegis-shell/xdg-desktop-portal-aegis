@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Every compositor-mediated portal function being refused. Both binaries
+  cleared their dumpable flag at startup, which makes `/proc/<pid>/exe`
+  unreadable even to same-uid processes; the compositor's peer-identity
+  check for built-in IPC scope claims (ADR-0128) then failed closed,
+  refusing the `aegis-portal` scope and breaking ScreenCast consent (OBS
+  recording), Screenshot, Wallpaper, and idle Inhibit. Core-dump
+  protection now caps `RLIMIT_CORE` at zero instead, and every
+  secret-holding buffer (`LockedBytes`, the vault master key,
+  `SecretBuffer`, the serialization `PageLock`) is additionally marked
+  `MADV_DONTDUMP` so key material stays out of any dump image, including
+  a piped core handler. The processes stay dumpable, as the compositor's
+  identity verification requires.
+
 ## [0.0.12] - 2026-08-16
 
 ### Added
