@@ -2,7 +2,8 @@
 //!
 //! The backend writes one versioned JSON request to stdin; this process shows
 //! the matching native dialog (file chooser, confirmation, secret password,
-//! or application chooser) and writes one versioned JSON response to stdout.
+//! application chooser, or screen-source chooser) and writes one versioned
+//! JSON response to stdout.
 //! The wire contract lives in `aegis_portal_prompter`; this binary only
 //! renders it.
 //!
@@ -18,6 +19,9 @@ use aegis_portal_prompter::{
 };
 
 mod ui;
+mod wire;
+
+use wire::Wire;
 
 const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -41,6 +45,10 @@ unsafe extern "C" {
 const PR_SET_DUMPABLE: std::ffi::c_int = 4;
 
 fn main() -> ExitCode {
+    // Claim the protocol wire before anything else can touch stdout: the
+    // optics C stack prints process-lifetime diagnostics, and a buffered
+    // one flushed at exit corrupts a shared wire (see wire.rs).
+    let mut wire = Wire::acquire();
     // Prompt requests can carry vault passwords through this process's
     // memory; keep them out of core dumps. Best effort: a prctl failure
     // (e.g. under a restrictive seccomp filter) warns and never aborts
@@ -55,7 +63,7 @@ fn main() -> ExitCode {
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     if std::env::args().nth(1).as_deref() == Some("--notification-daemon") {
-        return ui::notify::run_daemon();
+        return ui::notify::run_daemon(wire);
     }
     let response = match read_request().and_then(run_dialog) {
         Ok(response) => response,
@@ -64,7 +72,7 @@ fn main() -> ExitCode {
             PrompterResponse::failed(message)
         }
     };
-    match write_response(&response) {
+    match write_response(&mut wire, &response) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log::error!("prompter: could not write response: {error}");
@@ -87,7 +95,7 @@ fn read_request() -> Result<PromptRequest, String> {
     request.into_prompt()
 }
 
-fn write_response(response: &PrompterResponse) -> Result<(), String> {
+fn write_response(wire: &mut Wire, response: &PrompterResponse) -> Result<(), String> {
     // Pin a secret response's password bytes against swapping for their
     // short serialization lifetime. Best effort: the guard is None when the
     // value is empty, the platform has no mlock, or the rlimit refuses, and
@@ -99,12 +107,10 @@ fn write_response(response: &PrompterResponse) -> Result<(), String> {
         }
         _ => None,
     };
-    let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, response)
+    serde_json::to_writer(&mut *wire, response)
         .map_err(|error| format!("could not encode response: {error}"))?;
-    stdout
-        .write_all(b"\n")
-        .and_then(|()| stdout.flush())
+    wire.write_all(b"\n")
+        .and_then(|()| wire.flush())
         .map_err(|error| error.to_string())
 }
 
@@ -114,6 +120,7 @@ fn run_dialog(request: PromptRequest) -> Result<PrompterResponse, String> {
         PromptRequest::Confirm(request) => ui::confirm::run(request)?,
         PromptRequest::Secret(request) => ui::secret::run(request)?,
         PromptRequest::ChooseApp(request) => ui::choose_app::run(request)?,
+        PromptRequest::ChooseSource(request) => ui::choose_source::run(request)?,
         PromptRequest::LauncherEdit(request) => ui::launcher_edit::run(request)?,
     };
     Ok(PrompterResponse {

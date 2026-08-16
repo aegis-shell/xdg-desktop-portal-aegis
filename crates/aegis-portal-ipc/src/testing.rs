@@ -14,9 +14,9 @@ use crate::blob::SealedBlob;
 use crate::codec::{read_msg, write_msg};
 use crate::schema::{Request, Response, valid_wallpaper_path};
 use crate::{
-    ConfirmPickResult, ConnectionCapabilities, Event, LOCAL_PORTAL_SCOPE, LeaseGrant,
-    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
-    StreamTarget,
+    ConfirmPickResult, ConnectionCapabilities, Event, LOCAL_PORTAL_SCOPE, LeaseGrant, OutputInfo,
+    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamCursorMode,
+    StreamPixelFormat, StreamTarget,
 };
 
 pub struct CaptureOutputPayload {
@@ -82,6 +82,11 @@ pub trait Handler: Send + Sync + 'static {
         Err("capture is not implemented by this test server".into())
     }
 
+    /// Protocol-29 output enumeration.
+    fn enumerate_outputs(&self) -> Result<Vec<OutputInfo>, String> {
+        Err("output enumeration is not implemented by this test server".into())
+    }
+
     fn pick_target(&self, _connection: u64, _kind: PickKind) -> Result<PickResult, String> {
         Err("target picking is not implemented by this test server".into())
     }
@@ -102,6 +107,7 @@ pub trait Handler: Send + Sync + 'static {
         _max_fps: Option<u32>,
         _target: StreamTarget,
         _dmabuf: Option<bool>,
+        _cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
         Err("streaming is not implemented by this test server".into())
     }
@@ -348,6 +354,32 @@ impl Server {
         .and_then(|()| crate::blob::send_fd(&writer, fd))
         .is_ok()
     }
+
+    /// Push a protocol-29 `StreamGeometryChanged` event: after it, the
+    /// compositor produces no further frames for the stream until the
+    /// client restarts it.
+    #[must_use]
+    pub fn push_stream_geometry_changed(&self, stream_id: u64, width: u32, height: u32) -> bool {
+        let writer = self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&stream_id)
+            .map(|(_, writer)| Arc::clone(writer));
+        let Some(writer) = writer else {
+            return false;
+        };
+        let mut writer = writer.lock().unwrap();
+        write_msg(
+            &mut *writer,
+            &Event::StreamGeometryChanged {
+                stream_id,
+                width,
+                height,
+            },
+        )
+        .is_ok()
+    }
 }
 
 impl Drop for Server {
@@ -456,6 +488,10 @@ fn serve_connection(
                     send_error(&writer, "no active lease to renew".into())
                 }
             }
+            Request::EnumerateOutputs => match handler.enumerate_outputs() {
+                Ok(outputs) => send(&writer, &Response::Outputs { outputs }),
+                Err(message) => send_error(&writer, message),
+            },
             Request::CaptureOutput { region } => match handler.capture_output(region) {
                 Ok(capture) => match SealedBlob::new(&capture.png) {
                     Ok(blob) => {
@@ -490,8 +526,9 @@ fn serve_connection(
                 max_fps,
                 target,
                 dmabuf,
+                cursor,
             } => {
-                match handler.stream_output_start(connection, max_fps, target, dmabuf) {
+                match handler.stream_output_start(connection, max_fps, target, dmabuf, cursor) {
                     Ok(info) => {
                         let (slots, slot_stride, slot_bytes) = match info.slots.as_ref() {
                             Some(table) if !table.is_empty() => (

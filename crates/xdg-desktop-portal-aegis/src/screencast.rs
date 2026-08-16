@@ -2,26 +2,37 @@
 //!
 //! The portal frontend supplies Request and Session object paths to the
 //! backend. `CreateSession` exports the Session object, `SelectSources`
-//! requires a user-confirmed compositor picker, and `Start` spawns the cast
-//! thread (compositor frame stream → PipeWire producer). Blocking
-//! picker and PipeWire work stays on the screencast worker; D-Bus methods
+//! runs the source selection (chooser prompter, optional window pick, and
+//! a compositor consent confirmation), and `Start` spawns the cast thread
+//! (compositor frame stream → PipeWire producer). Blocking picker and
+//! PipeWire work stays on the screencast worker; D-Bus methods
 //! asynchronously await the backend `(response, results)` tuple.
 //!
-//! This backend advertises monitor sources only, one stream per session, and
-//! cursor mode Hidden. Client source-type masks that offer window alongside
-//! monitor (OBS's unified screen capture sends both bits) are accepted and
-//! served as monitor, per the `types`-as-acceptable-set contract. Selection
-//! always requires an explicit compositor
-//! confirmation identifying the requesting application. Aegis IPC's legacy window stream is deliberately not
-//! reachable here because it crops the composed output and can therefore
-//! contain pixels from an occluding window. Persistence requests are accepted
-//! but conservatively reduced to `persist_mode = 0`; restore data is treated
-//! as unavailable and therefore causes a normal fresh confirmation, as the
-//! version-4 contract permits. Version 5's `mapping_id` stream property is
-//! optional and omitted because no RemoteDesktop coordinate mapping exists.
-//! Version 6's stable PipeWire `object.serial` is resolved from the registry
-//! and returned as `pipewire-serial`; Start fails rather than claim v6 without
-//! that stable identifier.
+//! Capabilities key off the negotiated compositor protocol: against
+//! protocol 29 the backend advertises monitor and window sources plus
+//! Hidden and Embedded cursor modes; older compositors get monitor-only
+//! and Hidden-only. Client source-type masks that offer more than the
+//! backend can serve are accepted and served as their supported subset,
+//! per the `types`-as-acceptable-set contract. Selection always requires
+//! an explicit compositor confirmation identifying the requesting
+//! application. A window selection goes through the compositor's
+//! interactive toplevel pick; a per-output selection names the connector
+//! (protocol 29 fails a connector target closed against older peers, so
+//! the option only exists where it can be honored).
+//!
+//! Persistence follows the v4 contract: with `persist_mode` 1 or 2 and the
+//! user's "remember" tick, a monitor selection yields an opaque
+//! 128-bit restore token (mode 1 on disk under
+//! `$XDG_DATA_HOME/aegis-portal`, mode 2 in memory until the caller's bus
+//! name vanishes). A later `SelectSources` presenting a valid token
+//! restores the stored selection without any UI; invalid or unservable
+//! tokens silently degrade to the normal flow. Window selections are never
+//! persisted (window ids are not stable) and report `persist_mode` 0.
+//! Version 5's `mapping_id` stream property is optional and omitted
+//! because no RemoteDesktop coordinate mapping exists. Version 6's stable
+//! PipeWire `object.serial` is resolved from the registry and returned as
+//! `pipewire-serial`; Start fails rather than claim v6 without that stable
+//! identifier.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,6 +42,7 @@ use std::time::Duration;
 use zbus::zvariant::{Array, Dict, ObjectPath, Structure, StructureBuilder, Value};
 
 use crate::cast;
+use crate::persist::{RestoreStore, StoredSelection, StoredSource};
 use crate::session::{CastSource, SessionIface, SessionRegistry};
 use aegis_portal_runtime::{PortalResponse, RequestTracker, ResponseSender, sync};
 
@@ -40,8 +52,15 @@ const SESSION_IFACE: &str = "org.freedesktop.impl.portal.Session";
 pub(crate) const SCREENCAST_VERSION: u32 = 6;
 /// `AvailableSourceTypes` bit: monitor.
 const SOURCE_TYPE_MONITOR: u32 = 1;
-/// `AvailableCursorModes`: Hidden only. No cursor metadata is produced.
-const CURSOR_MODES: u32 = 1;
+/// `AvailableSourceTypes` bit: window (protocol 29).
+const SOURCE_TYPE_WINDOW: u32 = 2;
+/// `AvailableCursorModes` bit: Hidden.
+const CURSOR_MODE_HIDDEN: u32 = 1;
+/// `AvailableCursorModes` bit: Embedded (protocol 29).
+const CURSOR_MODE_EMBEDDED: u32 = 2;
+/// The compositor protocol that adds output enumeration, per-output
+/// stream targets, window streams, and cursor modes.
+const PER_SOURCE_PROTOCOL: u32 = 29;
 /// Waiting for the PipeWire negotiation longer than this is a failure.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// One job handed from the bus methods to the screencast worker.
@@ -53,6 +72,9 @@ pub(crate) enum CastJob {
         source_types: u32,
         cursor_mode: u32,
         persist_mode: u32,
+        restore_token: Option<String>,
+        /// The caller's D-Bus unique name; mode-2 tokens are keyed by it.
+        sender: Option<String>,
         reply: ResponseSender,
     },
     Start {
@@ -74,6 +96,7 @@ pub(crate) struct SelectOptions {
     pub(crate) source_types: u32,
     pub(crate) cursor_mode: u32,
     pub(crate) persist_mode: u32,
+    pub(crate) restore_token: Option<String>,
 }
 
 /// Parse `SelectSources` options. Unknown keys are ignored per spec.
@@ -90,27 +113,59 @@ pub(crate) fn parse_select_options(options: &HashMap<String, Value<'_>>) -> Sele
         .get("persist_mode")
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(0);
+    let restore_token = options
+        .get("restore_token")
+        .and_then(|value| String::try_from(value).ok())
+        .filter(|token| !token.is_empty());
     SelectOptions {
         source_types,
         cursor_mode,
         persist_mode,
+        restore_token,
     }
 }
 
 /// Why a `SelectSources` option set cannot be served, as a D-Bus message.
 /// `types` is the set the client accepts; the backend may serve any subset,
-/// so the mask only needs to intersect what we offer (monitor). OBS's unified
-/// screen-capture source always offers monitor|window and breaks on a strict
-/// equality check.
-fn validate_select(options: &SelectOptions) -> Result<(), String> {
-    if options.source_types & SOURCE_TYPE_MONITOR == 0 {
-        return Err("only monitor sources are supported".to_string());
-    }
-    if options.cursor_mode != CURSOR_MODES {
+/// so the mask only needs to intersect what the compositor's negotiated
+/// protocol can serve. OBS's unified screen-capture source always offers
+/// monitor|window and breaks on a strict equality check. The window bit and
+/// the Embedded cursor mode need protocol 29.
+fn validate_select(options: &SelectOptions, protocol: u32) -> Result<(), String> {
+    if options.source_types & !(SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW) != 0 {
         return Err(format!(
-            "cursor_mode {} is not supported (Hidden only)",
-            options.cursor_mode
+            "source types {:#b} name undefined bits",
+            options.source_types
         ));
+    }
+    // The mask must intersect what the compositor can serve. A window bit
+    // alongside monitor is accepted everywhere and served as monitor on
+    // pre-29 compositors; only a mask with no servable subset fails.
+    let available = if protocol >= PER_SOURCE_PROTOCOL {
+        SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW
+    } else {
+        SOURCE_TYPE_MONITOR
+    };
+    if options.source_types & available == 0 {
+        return Err(if protocol >= PER_SOURCE_PROTOCOL {
+            "only monitor and window sources are supported".to_string()
+        } else {
+            "only monitor sources are supported".to_string()
+        });
+    }
+    match options.cursor_mode {
+        CURSOR_MODE_HIDDEN => {}
+        CURSOR_MODE_EMBEDDED if protocol >= PER_SOURCE_PROTOCOL => {}
+        other => {
+            return Err(format!(
+                "cursor_mode {other} is not supported (Hidden{})",
+                if protocol >= PER_SOURCE_PROTOCOL {
+                    " or Embedded"
+                } else {
+                    " only"
+                }
+            ));
+        }
     }
     if options.persist_mode > 2 {
         return Err(format!(
@@ -128,6 +183,7 @@ pub(crate) struct ScreenCastIface {
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
     pub(crate) sessions: Arc<Mutex<SessionRegistry>>,
     pub(crate) jobs: mpsc::SyncSender<CastJob>,
+    pub(crate) socket: PathBuf,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -189,6 +245,7 @@ impl ScreenCastIface {
         session_handle: ObjectPath<'_>,
         app_id: &str,
         options: HashMap<String, Value<'_>>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<PortalResponse> {
         let session_path = session_handle.as_str().to_string();
         if !sync::lock(&self.sessions, "screencast sessions").contains(&session_path) {
@@ -197,7 +254,8 @@ impl ScreenCastIface {
             )));
         }
         let options = parse_select_options(&options);
-        validate_select(&options).map_err(zbus::fdo::Error::InvalidArgs)?;
+        validate_select(&options, self.compositor_version())
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
 
         let path = handle.as_str().to_string();
         log::debug!("portal: SelectSources for '{app_id}' on {session_path} at {path}");
@@ -211,6 +269,8 @@ impl ScreenCastIface {
             source_types: options.source_types,
             cursor_mode: options.cursor_mode,
             persist_mode: options.persist_mode,
+            restore_token: options.restore_token,
+            sender: header.sender().map(|sender| sender.as_str().to_string()),
             reply,
         });
         match queued {
@@ -276,12 +336,20 @@ impl ScreenCastIface {
 
     #[zbus(property, name = "AvailableSourceTypes")]
     fn available_source_types(&self) -> u32 {
-        SOURCE_TYPE_MONITOR
+        if self.compositor_version() >= PER_SOURCE_PROTOCOL {
+            SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW
+        } else {
+            SOURCE_TYPE_MONITOR
+        }
     }
 
     #[zbus(property, name = "AvailableCursorModes")]
     fn available_cursor_modes(&self) -> u32 {
-        CURSOR_MODES
+        if self.compositor_version() >= PER_SOURCE_PROTOCOL {
+            CURSOR_MODE_HIDDEN | CURSOR_MODE_EMBEDDED
+        } else {
+            CURSOR_MODE_HIDDEN
+        }
     }
 
     #[zbus(property, name = "version")]
@@ -291,6 +359,16 @@ impl ScreenCastIface {
 }
 
 impl ScreenCastIface {
+    /// The live negotiated compositor protocol; a compositor that cannot be
+    /// reached reports the conservative minimum, which advertises monitor
+    /// sources and the Hidden cursor mode only.
+    fn compositor_version(&self) -> u32 {
+        let mut capture = crate::ipc::PortalCapture::new(self.socket.clone());
+        capture
+            .protocol_version()
+            .unwrap_or(aegis_portal_ipc::MIN_PROTOCOL_VERSION)
+    }
+
     /// `Ok(false)` is bounded backpressure, reported as portal response 2;
     /// disconnection remains a D-Bus service failure.
     fn enqueue(&self, job: CastJob) -> zbus::fdo::Result<bool> {
@@ -316,6 +394,7 @@ pub(crate) fn cast_worker(
     conn: zbus::blocking::Connection,
     tracker: Arc<Mutex<RequestTracker>>,
     sessions: Arc<Mutex<SessionRegistry>>,
+    restore_store: Arc<Mutex<RestoreStore>>,
     socket: PathBuf,
 ) {
     const MAX_ACTIVE_CAST_REQUESTS: usize = 32;
@@ -335,6 +414,8 @@ pub(crate) fn cast_worker(
                 source_types,
                 cursor_mode,
                 persist_mode,
+                restore_token,
+                sender,
                 reply,
             } => {
                 if active.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -346,6 +427,7 @@ pub(crate) fn cast_worker(
                 }
                 let task_tracker = Arc::clone(&tracker);
                 let task_sessions = Arc::clone(&sessions);
+                let task_store = Arc::clone(&restore_store);
                 let task_socket = socket.clone();
                 let active_guard = ActiveGuard(Arc::clone(&active));
                 let spawn_failure_reply = reply.clone();
@@ -357,13 +439,18 @@ pub(crate) fn cast_worker(
                         let code = select_sources(
                             &task_tracker,
                             &task_sessions,
+                            &task_store,
                             &mut picker,
                             &request_path,
                             &session_path,
                             &app_id,
-                            source_types,
-                            cursor_mode,
-                            persist_mode,
+                            SelectOptions {
+                                source_types,
+                                cursor_mode,
+                                persist_mode,
+                                restore_token,
+                            },
+                            sender.as_deref(),
                         );
                         log::debug!("portal: SelectSources for '{app_id}' → response {code}");
                         let _ = reply.send_blocking((code, HashMap::new()));
@@ -425,21 +512,203 @@ pub(crate) fn cast_worker(
 fn select_sources(
     tracker: &Arc<Mutex<RequestTracker>>,
     sessions: &Arc<Mutex<SessionRegistry>>,
+    store: &Arc<Mutex<RestoreStore>>,
     picker: &mut crate::ipc::PortalCapture,
     request_path: &str,
     session_path: &str,
     app_id: &str,
-    source_types: u32,
-    _cursor_mode: u32,
-    persist_mode: u32,
+    options: SelectOptions,
+    sender: Option<&str>,
 ) -> u32 {
     if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return 1;
     }
-    let source = match pick_source(picker, source_types, app_id) {
-        Ok(source) => source,
-        Err(code) => return code,
+    let protocol = picker
+        .protocol_version()
+        .unwrap_or(aegis_portal_ipc::MIN_PROTOCOL_VERSION);
+
+    // A valid restore token skips every dialog: the stored selection is
+    // restored as-is and the token stays valid. Anything else — an unknown,
+    // mismatched, or unservable token — silently degrades to the normal
+    // interactive flow, as the contract permits.
+    if options.persist_mode > 0
+        && let Some(token) = options.restore_token.as_deref()
+    {
+        let outputs = enumerate_outputs(picker, protocol);
+        let servable = |source: &StoredSource| servable_source(source, protocol, &outputs);
+        let restored =
+            sync::lock(store, "screencast restore store").validate(token, app_id, &servable);
+        sync::lock(store, "screencast restore store").prune(&servable);
+        if let Some((mode, selection)) = restored {
+            let source = match &selection.source {
+                StoredSource::Desktop => CastSource::Monitor { output: None },
+                StoredSource::Output { connector } => CastSource::Monitor {
+                    output: Some(connector.clone()),
+                },
+            };
+            log::info!("portal: SelectSources for '{app_id}' restored a persisted selection");
+            return mark_selected(
+                tracker,
+                sessions,
+                request_path,
+                session_path,
+                app_id,
+                source,
+                selection.cursor_mode,
+                mode,
+                Some((mode, token.to_string())),
+            );
+        }
+    }
+
+    // The chooser's option list: the whole desktop always; one entry per
+    // connector when the compositor has several; the interactive window
+    // pick when the client accepts window sources. A single resulting
+    // option skips the chooser entirely — the common single-monitor case
+    // keeps the historical one-dialog flow.
+    let mut choices = vec![aegis_portal_prompter::SourceChoice {
+        id: "desktop".to_string(),
+        label: "Entire desktop".to_string(),
+        description: None,
+    }];
+    let mut window_offered = false;
+    if protocol >= PER_SOURCE_PROTOCOL {
+        let outputs = enumerate_outputs(picker, protocol);
+        if outputs.len() > 1 {
+            for output in &outputs {
+                choices.push(aegis_portal_prompter::SourceChoice {
+                    id: format!("output:{}", output.connector),
+                    label: output.connector.clone(),
+                    description: Some(format!(
+                        "{}×{}{}",
+                        output.rect.size.w,
+                        output.rect.size.h,
+                        if output.primary { ", primary" } else { "" }
+                    )),
+                });
+            }
+        }
+        if options.source_types & SOURCE_TYPE_WINDOW != 0 {
+            window_offered = true;
+            choices.push(aegis_portal_prompter::SourceChoice {
+                id: "window".to_string(),
+                label: "Window…".to_string(),
+                description: None,
+            });
+        }
+    }
+
+    let (selected, remember) = if choices.len() == 1 {
+        ("desktop".to_string(), false)
+    } else {
+        match choose_source(
+            tracker,
+            request_path,
+            app_id,
+            choices,
+            options.persist_mode > 0,
+        ) {
+            Ok(answer) => answer,
+            Err(code) => return code,
+        }
     };
+    if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
+        return 1;
+    }
+
+    let source = match selected.as_str() {
+        "desktop" => CastSource::Monitor { output: None },
+        "window" if window_offered => match pick_window(picker) {
+            Ok(window) => CastSource::Window { window },
+            Err(code) => return code,
+        },
+        id if id.starts_with("output:") && protocol >= PER_SOURCE_PROTOCOL => CastSource::Monitor {
+            output: Some(id.trim_start_matches("output:").to_string()),
+        },
+        other => {
+            log::warn!("portal: source chooser answered an unoffered option {other:?}");
+            return 2;
+        }
+    };
+
+    // Explicit compositor consent naming the concrete target.
+    let body = match &source {
+        CastSource::Monitor { output: None } => {
+            format!("Allow {app_id} to record the entire desktop?")
+        }
+        CastSource::Monitor {
+            output: Some(connector),
+        } => format!("Allow {app_id} to record output {connector}?"),
+        CastSource::Window { .. } => format!("Allow {app_id} to record the selected window?"),
+    };
+    match picker.pick_confirm(
+        "Share Your Screen".to_string(),
+        body,
+        Some("Share".to_string()),
+    ) {
+        Ok(aegis_portal_ipc::ConfirmPickResult::Confirmed) => {}
+        Ok(aegis_portal_ipc::ConfirmPickResult::Cancelled) => return 1,
+        Err(error) => {
+            log::warn!("portal: screen sharing confirmation failed: {error}");
+            return 2;
+        }
+    }
+    if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
+        return 1;
+    }
+
+    // Persistence: only monitor selections are restorable (a window id is
+    // not stable), so a remembered window selection never yields a token
+    // and Start reports the reduction to persist_mode 0.
+    let grant = if remember && options.persist_mode > 0 {
+        match &source {
+            CastSource::Monitor { output } => {
+                let stored = StoredSelection {
+                    app_id: app_id.to_string(),
+                    source: match output {
+                        None => StoredSource::Desktop,
+                        Some(connector) => StoredSource::Output {
+                            connector: connector.clone(),
+                        },
+                    },
+                    cursor_mode: options.cursor_mode,
+                };
+                sync::lock(store, "screencast restore store")
+                    .issue(options.persist_mode, sender.unwrap_or(""), stored)
+                    .map(|token| (options.persist_mode, token))
+            }
+            CastSource::Window { .. } => None,
+        }
+    } else {
+        None
+    };
+
+    mark_selected(
+        tracker,
+        sessions,
+        request_path,
+        session_path,
+        app_id,
+        source,
+        options.cursor_mode,
+        options.persist_mode,
+        grant,
+    )
+}
+
+/// Record the armed selection on the session. Response codes as above.
+#[allow(clippy::too_many_arguments)]
+fn mark_selected(
+    tracker: &Arc<Mutex<RequestTracker>>,
+    sessions: &Arc<Mutex<SessionRegistry>>,
+    request_path: &str,
+    session_path: &str,
+    app_id: &str,
+    source: CastSource,
+    cursor_mode: u32,
+    persist_mode: u32,
+    persist_grant: Option<(u32, String)>,
+) -> u32 {
     if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return 1;
     }
@@ -447,7 +716,9 @@ fn select_sources(
         session_path,
         app_id,
         source,
+        cursor_mode,
         persist_mode,
+        persist_grant,
     ) {
         Ok(()) => 0,
         Err(error) => {
@@ -457,24 +728,103 @@ fn select_sources(
     }
 }
 
-/// Decide the session's monitor source through an explicit user action.
-fn pick_source(
+/// List the compositor's outputs when the protocol speaks enumeration;
+/// any failure (including an older compositor's refusal) is an empty list,
+/// which simply yields no per-output chooser entries.
+fn enumerate_outputs(
     picker: &mut crate::ipc::PortalCapture,
-    source_types: u32,
+    protocol: u32,
+) -> Vec<aegis_portal_ipc::OutputInfo> {
+    if protocol < PER_SOURCE_PROTOCOL {
+        return Vec::new();
+    }
+    picker.enumerate_outputs().unwrap_or_else(|error| {
+        log::info!("portal: output enumeration unavailable: {error}");
+        Vec::new()
+    })
+}
+
+/// Whether a stored selection can still be captured: the whole desktop
+/// always; a connector only against protocol 29 with the connector present.
+fn servable_source(
+    source: &StoredSource,
+    protocol: u32,
+    outputs: &[aegis_portal_ipc::OutputInfo],
+) -> bool {
+    match source {
+        StoredSource::Desktop => true,
+        StoredSource::Output { connector } => {
+            protocol >= PER_SOURCE_PROTOCOL
+                && outputs.iter().any(|output| &output.connector == connector)
+        }
+    }
+}
+
+/// Run the source chooser prompter. Response codes: `Ok` carries the
+/// selected option id and the remember tick; `Err(1)` cancels, `Err(2)`
+/// is a prompter failure.
+fn choose_source(
+    tracker: &Arc<Mutex<RequestTracker>>,
+    request_path: &str,
     app_id: &str,
-) -> Result<CastSource, u32> {
-    if source_types & SOURCE_TYPE_MONITOR == 0 {
+    options: Vec<aegis_portal_prompter::SourceChoice>,
+    remember_offered: bool,
+) -> Result<(String, bool), u32> {
+    let request = aegis_portal_prompter::ChooseSourceRequest {
+        app_id: app_id.to_string(),
+        title: "Share Your Screen".to_string(),
+        options,
+        remember_offered,
+        parent_window: None,
+    };
+    if let Err(error) = request.validate() {
+        log::warn!("portal: invalid source chooser request: {error}");
         return Err(2);
     }
-    match picker.pick_confirm(
-        "Share Your Screen".to_string(),
-        format!("Allow {app_id} to view the current monitor?"),
-        Some("Share".to_string()),
-    ) {
-        Ok(aegis_portal_ipc::ConfirmPickResult::Confirmed) => Ok(CastSource::Monitor),
-        Ok(aegis_portal_ipc::ConfirmPickResult::Cancelled) => Err(1),
+    let cancelled = || sync::lock(tracker, "screencast tracker").was_closed(request_path);
+    let answered = crate::prompter::invoke(
+        aegis_portal_prompter::PrompterRequest::choose_source(request.clone()),
+        Some(&cancelled),
+    );
+    match answered {
+        Ok(aegis_portal_prompter::PromptResult::ChooseSource(response)) => {
+            if cancelled() {
+                return Err(1);
+            }
+            if let Err(error) = response.validate_for(&request) {
+                log::warn!("portal: invalid source chooser response: {error}");
+                return Err(2);
+            }
+            match response {
+                aegis_portal_prompter::ChooseSourceResponse::Selected { source, remember } => {
+                    Ok((source, remember))
+                }
+                aegis_portal_prompter::ChooseSourceResponse::Cancelled => Err(1),
+            }
+        }
+        Err(crate::prompter::InvokeError::Cancelled) => Err(1),
+        Ok(_) => {
+            log::warn!("portal: source chooser returned the wrong response kind");
+            Err(2)
+        }
+        Err(crate::prompter::InvokeError::Failed(error)) => {
+            log::warn!("portal: source chooser failed: {error}");
+            Err(2)
+        }
+    }
+}
+
+/// Pick one toplevel through compositor chrome.
+fn pick_window(picker: &mut crate::ipc::PortalCapture) -> Result<aegis_portal_ipc::WindowId, u32> {
+    match picker.pick(aegis_portal_ipc::PickKind::Window) {
+        Ok(aegis_portal_ipc::PickResult::Window { id }) => Ok(id),
+        Ok(aegis_portal_ipc::PickResult::Cancelled) => Err(1),
+        Ok(other) => {
+            log::warn!("portal: window pick answered an unexpected result: {other:?}");
+            Err(2)
+        }
         Err(error) => {
-            log::warn!("portal: monitor sharing confirmation failed: {error}");
+            log::warn!("portal: window pick failed: {error}");
             Err(2)
         }
     }
@@ -495,7 +845,7 @@ fn start_cast(
     if sync::lock(tracker, "screencast tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
-    let (source, requested_persist_mode) = {
+    let selection = {
         let mut sessions = sync::lock(sessions, "screencast sessions");
         match sessions.reserve_start(session_path, app_id) {
             Ok(selection) => selection,
@@ -505,9 +855,19 @@ fn start_cast(
             }
         }
     };
+    let cursor = match selection.cursor_mode {
+        CURSOR_MODE_EMBEDDED => aegis_portal_ipc::StreamCursorMode::Embedded,
+        _ => aegis_portal_ipc::StreamCursorMode::Hidden,
+    };
     // The cast thread reports compositor-side stream ends back to this
     // worker through a clone of the worker's own job channel.
-    let handle = match cast::spawn(socket.to_path_buf(), session_path.to_string(), jobs.clone()) {
+    let handle = match cast::spawn(
+        socket.to_path_buf(),
+        session_path.to_string(),
+        jobs.clone(),
+        selection.source.clone(),
+        cursor,
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             sync::lock(sessions, "screencast sessions").clear_start(session_path);
@@ -539,22 +899,36 @@ fn start_cast(
                 started.serial,
                 started.width,
                 started.height,
-                source
+                selection.source
             );
+            let source_type = match &selection.source {
+                CastSource::Monitor { .. } => SOURCE_TYPE_MONITOR,
+                CastSource::Window { .. } => SOURCE_TYPE_WINDOW,
+            };
             let mut results = HashMap::from([(
                 "streams".to_string(),
                 streams_value(
                     started.node_id,
                     started.serial,
-                    SOURCE_TYPE_MONITOR,
-                    (0, 0),
+                    source_type,
+                    started.position,
                     (started.width as i32, started.height as i32),
                 ),
             )]);
-            if requested_persist_mode != 0 {
-                // Omitting this would make the frontend assume the requested
-                // nonzero mode was granted. Report the safe reduction.
-                results.insert("persist_mode".to_string(), Value::from(0_u32));
+            match &selection.persist_grant {
+                // A granted or restored token is reported with its mode.
+                Some((mode, token)) => {
+                    results.insert("persist_mode".to_string(), Value::from(*mode));
+                    results.insert("restore_token".to_string(), Value::from(token.clone()));
+                }
+                // Omitting this would make the frontend assume the
+                // requested nonzero mode was granted. Report the safe
+                // reduction (no remember tick, or an unpersistable
+                // selection such as a window).
+                None if selection.requested_persist_mode != 0 => {
+                    results.insert("persist_mode".to_string(), Value::from(0_u32));
+                }
+                None => {}
             }
             (0, results)
         }
@@ -649,37 +1023,62 @@ mod tests {
         assert_eq!(parsed.source_types, SOURCE_TYPE_MONITOR);
         assert_eq!(parsed.cursor_mode, 1);
         assert_eq!(parsed.persist_mode, 0);
-        assert!(validate_select(&parsed).is_ok());
+        assert_eq!(parsed.restore_token, None);
+        assert!(validate_select(&parsed, 24).is_ok());
+        assert!(validate_select(&parsed, 29).is_ok());
     }
 
     #[test]
     fn select_options_accept_monitor_and_window_mix() {
         // Clients such as OBS's unified screen capture offer every type they
-        // can take; serving the monitor subset is the contract.
+        // can take; serving the supported subset is the contract.
         let parsed = parse_select_options(&options(&[("types", Value::from(0b11u32))]));
-        assert!(validate_select(&parsed).is_ok());
+        assert!(validate_select(&parsed, 24).is_ok());
+        assert!(validate_select(&parsed, 29).is_ok());
     }
 
     #[test]
-    fn select_options_accept_only_hidden_cursor_mode() {
-        for unsupported in [0u32, 2, 4, 5] {
+    fn embedded_cursor_mode_needs_protocol_29() {
+        for unsupported in [0u32, 3, 4, 5] {
             let parsed =
                 parse_select_options(&options(&[("cursor_mode", Value::from(unsupported))]));
-            assert!(validate_select(&parsed).is_err());
+            assert!(validate_select(&parsed, 29).is_err());
         }
+        let parsed = parse_select_options(&options(&[("cursor_mode", Value::from(2u32))]));
+        assert!(validate_select(&parsed, 28).is_err());
+        assert!(validate_select(&parsed, 29).is_ok());
     }
 
     #[test]
-    fn select_options_refuse_window_only_sources() {
+    fn window_only_sources_need_protocol_29() {
         let window_only = parse_select_options(&options(&[("types", Value::from(0b10u32))]));
         assert_eq!(window_only.source_types, 2);
-        assert!(validate_select(&window_only).is_err());
+        assert!(validate_select(&window_only, 28).is_err());
+        assert!(validate_select(&window_only, 29).is_ok());
     }
 
     #[test]
     fn select_options_refuse_unknown_source_bits() {
         let unknown = parse_select_options(&options(&[("types", Value::from(0b100u32))]));
-        assert!(validate_select(&unknown).is_err());
+        assert!(validate_select(&unknown, 29).is_err());
+        let empty = parse_select_options(&options(&[("types", Value::from(0u32))]));
+        assert!(validate_select(&empty, 29).is_err());
+    }
+
+    #[test]
+    fn restore_token_is_parsed_and_empty_tokens_ignored() {
+        let parsed = parse_select_options(&options(&[(
+            "restore_token",
+            Value::from("0123456789abcdef0123456789abcdef"),
+        )]));
+        assert_eq!(
+            parsed.restore_token.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let parsed = parse_select_options(&options(&[("restore_token", Value::from(""))]));
+        assert_eq!(parsed.restore_token, None);
+        let parsed = parse_select_options(&options(&[("restore_token", Value::from(7u32))]));
+        assert_eq!(parsed.restore_token, None);
     }
 
     #[test]
@@ -692,16 +1091,16 @@ mod tests {
         for mode in 0_u32..=2 {
             let parsed = parse_select_options(&options(&[("persist_mode", Value::from(mode))]));
             assert_eq!(parsed.persist_mode, mode);
-            assert!(validate_select(&parsed).is_ok());
+            assert!(validate_select(&parsed, 29).is_ok());
         }
         let parsed = parse_select_options(&options(&[("persist_mode", Value::from(3_u32))]));
-        assert!(validate_select(&parsed).is_err());
+        assert!(validate_select(&parsed, 29).is_err());
     }
 
     #[test]
     fn select_options_ignore_wrong_types() {
         let parsed = parse_select_options(&options(&[("types", Value::from("monitor"))]));
-        assert!(validate_select(&parsed).is_ok());
+        assert!(validate_select(&parsed, 29).is_ok());
     }
 
     #[test]

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use aegis_portal_ipc::testing::{Handler, Server, StreamFrameFdPayload, StreamInfo};
 use aegis_portal_ipc::{
-    Client, ConnectionCapabilities, StreamMessage, StreamPixelFormat, StreamTarget,
+    Client, ConnectionCapabilities, StreamCursorMode, StreamMessage, StreamPixelFormat,
+    StreamTarget,
 };
 
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -25,6 +26,7 @@ impl Handler for DmabufStream {
         _max_fps: Option<u32>,
         _target: StreamTarget,
         _dmabuf: Option<bool>,
+        _cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
         Ok(StreamInfo {
             stream_id: 7,
@@ -75,7 +77,7 @@ fn dmabuf_stream_frames_cross_the_wire_as_descriptors() {
     .expect("handshake");
 
     let started = client
-        .start_output_stream_target(None, StreamTarget::Output)
+        .start_output_stream_target(None, StreamTarget::Output { output: None })
         .expect("stream start");
     assert_eq!(started.stream_id, 7);
     assert_eq!(
@@ -132,6 +134,7 @@ impl Handler for SlotStream {
         _max_fps: Option<u32>,
         _target: StreamTarget,
         dmabuf: Option<bool>,
+        _cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
         if dmabuf != Some(true) {
             return Err("expected the dmabuf opt-in".into());
@@ -185,7 +188,7 @@ fn slot_streams_transfer_the_table_frames_and_releases() {
     );
 
     let started = client
-        .start_output_stream(None, StreamTarget::Output, true)
+        .start_output_stream(None, StreamTarget::Output { output: None }, true, None)
         .expect("stream start");
     let slots = started.slots.expect("a slot table");
     assert_eq!(slots.len(), 3);
@@ -264,6 +267,7 @@ impl Handler for RacyStream {
         _max_fps: Option<u32>,
         _target: StreamTarget,
         _dmabuf: Option<bool>,
+        _cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
         Ok(StreamInfo {
             stream_id: 7,
@@ -304,7 +308,7 @@ fn a_frame_racing_ahead_of_started_is_buffered() {
     .expect("handshake");
 
     let started = client
-        .start_output_stream_target(None, StreamTarget::Output)
+        .start_output_stream_target(None, StreamTarget::Output { output: None })
         .expect("stream start despite the early frame");
     assert_eq!(started.stream_id, 7);
 
@@ -334,6 +338,7 @@ impl Handler for RacySlotStream {
         _max_fps: Option<u32>,
         _target: StreamTarget,
         dmabuf: Option<bool>,
+        _cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
         if dmabuf != Some(true) {
             return Err("expected the dmabuf opt-in".into());
@@ -394,7 +399,7 @@ fn a_frame_racing_ahead_of_a_slot_stream_start_is_buffered() {
     .expect("handshake");
 
     let started = client
-        .start_output_stream(None, StreamTarget::Output, true)
+        .start_output_stream(None, StreamTarget::Output { output: None }, true, None)
         .expect("stream start despite the early frame");
     let slots = started.slots.expect("a slot table");
     assert_eq!(slots.len(), 3);
@@ -404,4 +409,176 @@ fn a_frame_racing_ahead_of_a_slot_stream_start_is_buffered() {
         panic!("expected the early frame, got {message:?}");
     };
     assert_eq!(frame.sequence, 1);
+}
+
+/// Protocol-29 output enumeration and output-addressed streaming.
+struct Outputs {
+    starts: std::sync::Mutex<Vec<(StreamTarget, Option<StreamCursorMode>)>>,
+}
+
+impl Handler for Outputs {
+    fn enumerate_outputs(&self) -> Result<Vec<aegis_portal_ipc::OutputInfo>, String> {
+        Ok(vec![
+            aegis_portal_ipc::OutputInfo {
+                connector: "HDMI-A-1".into(),
+                primary: true,
+                rect: aegis_portal_ipc::Rect::new(0, 0, 1920, 1080),
+            },
+            aegis_portal_ipc::OutputInfo {
+                connector: "DP-1".into(),
+                primary: false,
+                rect: aegis_portal_ipc::Rect::new(1920, 0, 2560, 1440),
+            },
+        ])
+    }
+
+    fn stream_output_start(
+        &self,
+        _connection: u64,
+        _max_fps: Option<u32>,
+        target: StreamTarget,
+        _dmabuf: Option<bool>,
+        cursor: Option<StreamCursorMode>,
+    ) -> Result<StreamInfo, String> {
+        self.starts.lock().unwrap().push((target, cursor));
+        Ok(StreamInfo {
+            stream_id: 7,
+            width: 2,
+            height: 2,
+            format: StreamPixelFormat::Bgra8,
+            slots: None,
+        })
+    }
+}
+
+#[test]
+fn enumerate_outputs_round_trips_the_output_set() {
+    let handler = Arc::new(Outputs {
+        starts: std::sync::Mutex::new(Vec::new()),
+    });
+    let server = Server::start(&socket_path("outputs"), handler).expect("bind test server");
+    let mut client = Client::connect_with_timeout(
+        server.path(),
+        ConnectionCapabilities::QUERY,
+        Duration::from_secs(5),
+    )
+    .expect("handshake");
+
+    let outputs = client.enumerate_outputs().expect("enumerate outputs");
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].connector, "HDMI-A-1");
+    assert!(outputs[0].primary);
+    assert_eq!(
+        outputs[0].rect,
+        aegis_portal_ipc::Rect::new(0, 0, 1920, 1080)
+    );
+    assert_eq!(outputs[1].connector, "DP-1");
+    assert!(!outputs[1].primary);
+}
+
+#[test]
+fn v29_stream_start_carries_the_connector_and_cursor_mode() {
+    let handler = Arc::new(Outputs {
+        starts: std::sync::Mutex::new(Vec::new()),
+    });
+    let server =
+        Server::start(&socket_path("v29-start"), Arc::clone(&handler)).expect("bind test server");
+    let mut client = Client::connect_with_timeout(
+        server.path(),
+        ConnectionCapabilities::QUERY,
+        Duration::from_secs(5),
+    )
+    .expect("handshake");
+    assert_eq!(
+        client.protocol_version(),
+        aegis_portal_ipc::PROTOCOL_VERSION
+    );
+
+    let started = client
+        .start_output_stream(
+            Some(60),
+            StreamTarget::Output {
+                output: Some("HDMI-A-1".into()),
+            },
+            false,
+            Some(StreamCursorMode::Embedded),
+        )
+        .expect("stream start");
+    assert_eq!(started.stream_id, 7);
+    assert_eq!(
+        handler.starts.lock().unwrap().as_slice(),
+        &[(
+            StreamTarget::Output {
+                output: Some("HDMI-A-1".into())
+            },
+            Some(StreamCursorMode::Embedded)
+        )]
+    );
+
+    // The geometry-changed event surfaces on the stream lane; after it the
+    // compositor sends no further frames until the stream is restarted.
+    assert!(server.push_stream_geometry_changed(7, 2560, 1440));
+    let message = client.next_stream_message().expect("geometry message");
+    let StreamMessage::GeometryChanged {
+        stream_id,
+        width,
+        height,
+    } = message
+    else {
+        panic!("expected a geometry change, got {message:?}");
+    };
+    assert_eq!((stream_id, width, height), (7, 2560, 1440));
+}
+
+/// Against a pre-29 peer the cursor mode is silently dropped (the peer only
+/// streams the hidden-cursor default anyway), but a connector-named target
+/// fails closed: an older compositor could only stream the whole desktop,
+/// which captures more than the caller asked for.
+#[test]
+fn v29_start_parameters_degrade_against_a_legacy_server() {
+    let handler = Arc::new(Outputs {
+        starts: std::sync::Mutex::new(Vec::new()),
+    });
+    let server = Server::start_legacy(
+        &socket_path("v29-legacy"),
+        Arc::clone(&handler),
+        aegis_portal_ipc::MIN_PROTOCOL_VERSION,
+    )
+    .expect("bind legacy test server");
+    let mut client = Client::connect_with_timeout(
+        server.path(),
+        ConnectionCapabilities::QUERY,
+        Duration::from_secs(5),
+    )
+    .expect("handshake with downgrade");
+    assert_eq!(
+        client.protocol_version(),
+        aegis_portal_ipc::MIN_PROTOCOL_VERSION
+    );
+
+    client
+        .start_output_stream(
+            Some(60),
+            StreamTarget::Output { output: None },
+            false,
+            Some(StreamCursorMode::Embedded),
+        )
+        .expect("stream start");
+    assert_eq!(
+        handler.starts.lock().unwrap().as_slice(),
+        &[(StreamTarget::Output { output: None }, None)]
+    );
+
+    let addressed = client.start_output_stream(
+        None,
+        StreamTarget::Output {
+            output: Some("HDMI-A-1".into()),
+        },
+        false,
+        None,
+    );
+    assert!(
+        addressed.is_err(),
+        "a connector target must fail closed against a pre-29 peer"
+    );
 }

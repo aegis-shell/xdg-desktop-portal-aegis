@@ -12,10 +12,18 @@ pub(crate) const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 /// A received compositor frame.
 pub(crate) enum FramePayload {
     /// A frame carrying its own descriptor (sealed memfd or dmabuf blob),
-    /// plus the plane stride from the frame header.
-    Descriptor { file: File, stride: u32 },
-    /// A protocol-25 frame referencing a slot transferred at start.
-    Slot(u32),
+    /// plus the plane stride and the damage rects from the frame header.
+    Descriptor {
+        file: File,
+        stride: u32,
+        damage: Vec<aegis_portal_ipc::Rect>,
+    },
+    /// A protocol-25 frame referencing a slot transferred at start, plus
+    /// the damage rects from the frame header.
+    Slot {
+        slot: u32,
+        damage: Vec<aegis_portal_ipc::Rect>,
+    },
 }
 
 /// Check one received frame against the stream's announced format and
@@ -49,7 +57,10 @@ pub(crate) fn validate_frame(
         if !matches!(frame.payload, StreamPayload::Slot) {
             return Err("slot frame carried a descriptor".to_string());
         }
-        return Ok(FramePayload::Slot(slot));
+        return Ok(FramePayload::Slot {
+            slot,
+            damage: frame.damage,
+        });
     }
     match (announced, frame.format, frame.payload) {
         (
@@ -67,6 +78,7 @@ pub(crate) fn validate_frame(
             Ok(FramePayload::Descriptor {
                 file,
                 stride: frame.stride,
+                damage: frame.damage,
             })
         }
         (
@@ -93,6 +105,7 @@ pub(crate) fn validate_frame(
             Ok(FramePayload::Descriptor {
                 file,
                 stride: frame.stride,
+                damage: frame.damage,
             })
         }
         (announced, wire, _) => Err(format!(

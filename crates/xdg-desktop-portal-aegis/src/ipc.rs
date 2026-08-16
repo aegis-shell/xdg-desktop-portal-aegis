@@ -111,6 +111,28 @@ impl PortalCapture {
         }
     }
 
+    /// The protocol version negotiated with the compositor. Connects lazily
+    /// like every other operation; callers treat a failure as the oldest
+    /// supported version (conservative capability reporting).
+    pub(crate) fn protocol_version(&mut self) -> io::Result<u32> {
+        Ok(self.client()?.protocol_version())
+    }
+
+    /// List the compositor's outputs (protocol 29), with the same
+    /// reconnect + retry discipline as [`PortalCapture::capture_png`]. An
+    /// older compositor's refusal of the op surfaces as an error, so
+    /// callers must consult [`PortalCapture::protocol_version`] first.
+    pub(crate) fn enumerate_outputs(&mut self) -> io::Result<Vec<aegis_portal_ipc::OutputInfo>> {
+        match self.client()?.enumerate_outputs() {
+            Ok(outputs) => Ok(outputs),
+            Err(first) => {
+                log::info!("portal: output enumeration failed ({first}); reconnecting IPC");
+                self.client = None;
+                self.client()?.enumerate_outputs()
+            }
+        }
+    }
+
     /// Capture a region of the focused output as PNG bytes (compositor
     /// logical pixels), with the same reconnect + retry discipline as
     /// [`PortalCapture::capture_png`].

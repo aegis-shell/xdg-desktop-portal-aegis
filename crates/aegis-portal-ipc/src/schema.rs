@@ -1,4 +1,4 @@
-//! Portal-owned projection of Aegis IPC protocol version 25.
+//! Portal-owned projection of Aegis IPC protocol version 29.
 //!
 //! Only compositor-owned portal resources belong here. The wire types are
 //! implemented independently from the compositor's Rust model so an internal
@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 /// Newest protocol version this projection speaks. The handshake asks for
 /// this version and accepts a downgrade to [`MIN_PROTOCOL_VERSION`] when the
 /// compositor is older (version-gated features, such as dmabuf slot
-/// streaming at 25, key off the negotiated version). Protocol 26
-/// (`CaptureWindow`) and 27 (`LaunchApp`, `Focus.reveal`) are deliberately
-/// not projected: no Portal interface needs them.
-pub const PROTOCOL_VERSION: u32 = 25;
+/// streaming at 25 and the protocol-29 additions — output enumeration,
+/// per-output stream targets, the stream cursor mode, and the
+/// `StreamGeometryChanged` event — key off the negotiated version).
+/// Protocol 26 (`CaptureWindow`), 27 (`LaunchApp`, `Focus.reveal`), and 28
+/// are deliberately not projected: no Portal interface needs them.
+pub const PROTOCOL_VERSION: u32 = 29;
 /// Oldest protocol version this projection can negotiate down to.
 pub const MIN_PROTOCOL_VERSION: u32 = 24;
 pub const LOCAL_PORTAL_SCOPE: &str = "aegis-portal";
@@ -164,6 +166,14 @@ pub struct SettingsSnapshot {
     pub preferences: DesktopPreferences,
 }
 
+/// One compositor output as `EnumerateOutputs` reports it (protocol 29).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputInfo {
+    pub connector: String,
+    pub primary: bool,
+    pub rect: Rect,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamPixelFormat {
@@ -172,20 +182,45 @@ pub enum StreamPixelFormat {
     Dmabuf { drm_format: u32, modifier: u64 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamTarget {
-    #[default]
-    Output,
+    /// An output stream. `output` names the connector to stream (protocol
+    /// 29); `None` streams the whole desktop and is the only shape protocol
+    /// 28 and older speak, so it serializes as bare `{"type":"Output"}`.
+    Output {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
     Window {
         window: WindowId,
     },
 }
 
-impl StreamTarget {
-    pub(crate) fn is_output(&self) -> bool {
-        matches!(self, Self::Output)
+impl Default for StreamTarget {
+    fn default() -> Self {
+        Self::Output { output: None }
     }
+}
+
+impl StreamTarget {
+    /// True for the default whole-desktop output target: the wire default,
+    /// omitted from `StreamOutputStart`. A connector-named output target is
+    /// not the default and always crosses the wire.
+    pub(crate) fn is_output(&self) -> bool {
+        matches!(self, Self::Output { output: None })
+    }
+}
+
+/// Cursor composition mode of a stream (protocol 29). `hidden` — the wire
+/// and compositor default — never paints the cursor; `embedded` composites
+/// it into the frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamCursorMode {
+    #[default]
+    Hidden,
+    Embedded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,15 +233,29 @@ pub enum PickKind {
     Region,
     Pixel,
     Window,
+    Output,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PickResult {
-    Region { rect: Rect },
-    Pixel { point: Point, rgb: [u8; 3] },
-    Window { id: WindowId },
-    Output,
+    Region {
+        rect: Rect,
+    },
+    Pixel {
+        point: Point,
+        rgb: [u8; 3],
+    },
+    Window {
+        id: WindowId,
+    },
+    /// The picked output. `connector` names it (protocol 29); older
+    /// compositors report no connector, so a bare `{"type":"Output"}` still
+    /// deserializes with `connector: None`.
+    Output {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connector: Option<String>,
+    },
     Cancelled,
 }
 
@@ -266,6 +315,15 @@ pub enum Event {
         stream_id: u64,
         reason: String,
     },
+    /// The stream's output geometry changed (protocol 29). After this
+    /// event the compositor produces no further frames for the stream
+    /// until the client restarts it (`StreamOutputStop` +
+    /// `StreamOutputStart`).
+    StreamGeometryChanged {
+        stream_id: u64,
+        width: u32,
+        height: u32,
+    },
     #[serde(skip)]
     Other,
 }
@@ -286,6 +344,8 @@ pub(crate) enum Request {
     RenewLease {
         ttl_ms: u64,
     },
+    /// List the compositor's outputs (protocol 29).
+    EnumerateOutputs,
     CaptureOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<Rect>,
@@ -299,6 +359,10 @@ pub(crate) enum Request {
         /// that does not opt in never receives a dmabuf announcement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dmabuf: Option<bool>,
+        /// Cursor composition mode (protocol 29); absent asks for the
+        /// compositor default (`hidden`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<StreamCursorMode>,
     },
     /// Release a dmabuf stream slot (protocol 25) after the PipeWire
     /// consumer returned the buffer bound to it.
@@ -343,6 +407,10 @@ pub(crate) enum Response {
     },
     Settings {
         snapshot: SettingsSnapshot,
+    },
+    /// Reply to [`Request::EnumerateOutputs`] (protocol 29).
+    Outputs {
+        outputs: Vec<OutputInfo>,
     },
     CaptureOutput {
         width: u32,
@@ -452,8 +520,8 @@ mod tests {
     }
 
     #[test]
-    fn hello_matches_the_v25_wire_shape() {
-        // The literal 25 pins this fixture to the v25 shape; PROTOCOL_VERSION
+    fn hello_matches_the_v29_wire_shape() {
+        // The literal 29 pins this fixture to the v29 shape; PROTOCOL_VERSION
         // must equal it.
         let request = Request::Hello {
             version: PROTOCOL_VERSION,
@@ -465,7 +533,7 @@ mod tests {
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
                 "type": "Hello",
-                "version": 25,
+                "version": 29,
                 "caps": {
                     "query": true,
                     "control": false,
@@ -578,8 +646,9 @@ mod tests {
             (
                 Request::StreamOutputStart {
                     max_fps: Some(30),
-                    target: StreamTarget::Output,
+                    target: StreamTarget::Output { output: None },
                     dmabuf: None,
+                    cursor: None,
                 },
                 serde_json::json!({
                     "type": "StreamOutputStart",
@@ -589,8 +658,9 @@ mod tests {
             (
                 Request::StreamOutputStart {
                     max_fps: Some(60),
-                    target: StreamTarget::Output,
+                    target: StreamTarget::Output { output: None },
                     dmabuf: Some(true),
+                    cursor: None,
                 },
                 serde_json::json!({
                     "type": "StreamOutputStart",
@@ -620,6 +690,159 @@ mod tests {
         for (request, fixture) in fixtures {
             assert_eq!(serde_json::to_value(request).unwrap(), fixture);
         }
+    }
+
+    #[test]
+    fn v29_operations_match_their_wire_fixtures() {
+        // EnumerateOutputs, both directions.
+        assert_eq!(
+            serde_json::to_value(Request::EnumerateOutputs).unwrap(),
+            serde_json::json!({ "type": "EnumerateOutputs" })
+        );
+        let request: Request =
+            serde_json::from_value(serde_json::json!({ "type": "EnumerateOutputs" })).unwrap();
+        assert_eq!(request, Request::EnumerateOutputs);
+        let outputs = Response::Outputs {
+            outputs: vec![
+                OutputInfo {
+                    connector: "HDMI-A-1".into(),
+                    primary: true,
+                    rect: Rect::new(0, 0, 1920, 1080),
+                },
+                OutputInfo {
+                    connector: "DP-1".into(),
+                    primary: false,
+                    rect: Rect::new(1920, 0, 2560, 1440),
+                },
+            ],
+        };
+        let fixture = serde_json::json!({
+            "type": "Outputs",
+            "outputs": [
+                {
+                    "connector": "HDMI-A-1",
+                    "primary": true,
+                    "rect": { "origin": { "x": 0, "y": 0 }, "size": { "w": 1920, "h": 1080 } }
+                },
+                {
+                    "connector": "DP-1",
+                    "primary": false,
+                    "rect": { "origin": { "x": 1920, "y": 0 }, "size": { "w": 2560, "h": 1440 } }
+                }
+            ]
+        });
+        assert_eq!(serde_json::to_value(&outputs).unwrap(), fixture);
+        let parsed: Response = serde_json::from_value(fixture).unwrap();
+        assert_eq!(parsed, outputs);
+
+        // StreamTarget: the legacy bare `{"type":"Output"}` (v≤28) and the
+        // connector-carrying v29 shape, both directions.
+        let legacy = serde_json::json!({ "type": "Output" });
+        assert_eq!(
+            serde_json::to_value(StreamTarget::Output { output: None }).unwrap(),
+            legacy
+        );
+        let parsed: StreamTarget = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed, StreamTarget::Output { output: None });
+        let addressed = serde_json::json!({ "type": "Output", "output": "HDMI-A-1" });
+        assert_eq!(
+            serde_json::to_value(StreamTarget::Output {
+                output: Some("HDMI-A-1".into())
+            })
+            .unwrap(),
+            addressed
+        );
+        let parsed: StreamTarget = serde_json::from_value(addressed).unwrap();
+        assert_eq!(
+            parsed,
+            StreamTarget::Output {
+                output: Some("HDMI-A-1".into())
+            }
+        );
+
+        // StreamOutputStart with a cursor mode and a connector target.
+        let request = Request::StreamOutputStart {
+            max_fps: Some(60),
+            target: StreamTarget::Output {
+                output: Some("HDMI-A-1".into()),
+            },
+            dmabuf: Some(true),
+            cursor: Some(StreamCursorMode::Embedded),
+        };
+        let fixture = serde_json::json!({
+            "type": "StreamOutputStart",
+            "max_fps": 60,
+            "target": { "type": "Output", "output": "HDMI-A-1" },
+            "dmabuf": true,
+            "cursor": "embedded"
+        });
+        assert_eq!(serde_json::to_value(&request).unwrap(), fixture);
+        let parsed: Request = serde_json::from_value(fixture).unwrap();
+        assert_eq!(parsed, request);
+        // The cursor modes are kebab-case on the wire; `hidden` is the
+        // default and serializes inside the option only when asked for.
+        assert_eq!(
+            serde_json::to_value(StreamCursorMode::Hidden).unwrap(),
+            serde_json::json!("hidden")
+        );
+        assert_eq!(
+            serde_json::to_value(StreamCursorMode::Embedded).unwrap(),
+            serde_json::json!("embedded")
+        );
+
+        // StreamGeometryChanged: after it the compositor sends no further
+        // frames until the client restarts the stream.
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "StreamGeometryChanged",
+            "stream_id": 3,
+            "width": 2560,
+            "height": 1440
+        }))
+        .unwrap();
+        assert_eq!(
+            event,
+            Event::StreamGeometryChanged {
+                stream_id: 3,
+                width: 2560,
+                height: 1440
+            }
+        );
+
+        // PickTarget for an output, and the picked result with and without
+        // a connector. The legacy bare `{"type":"Output"}` result (v≤28)
+        // deserializes with `connector: None`.
+        assert_eq!(
+            serde_json::to_value(Request::PickTarget {
+                kind: PickKind::Output
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "PickTarget",
+                "kind": { "type": "Output" }
+            })
+        );
+        let legacy_result = serde_json::json!({ "type": "Output" });
+        let parsed: PickResult = serde_json::from_value(legacy_result).unwrap();
+        assert_eq!(parsed, PickResult::Output { connector: None });
+        assert_eq!(
+            serde_json::to_value(PickResult::Output { connector: None }).unwrap(),
+            serde_json::json!({ "type": "Output" })
+        );
+        let addressed_result = serde_json::json!({ "type": "Output", "connector": "DP-1" });
+        let parsed: PickResult = serde_json::from_value(addressed_result).unwrap();
+        assert_eq!(
+            parsed,
+            PickResult::Output {
+                connector: Some("DP-1".into())
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(PickResult::Output {
+                connector: Some("DP-1".into())
+            })
+            .unwrap(),
+            serde_json::json!({ "type": "Output", "connector": "DP-1" })
+        );
     }
 
     #[test]

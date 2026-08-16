@@ -31,9 +31,13 @@ downgrade to 24, so it keeps working with protocol-24 compositors using the
 SHM transports while protocol-25 compositors additionally provide the
 zero-copy dmabuf slot stream (see
 [ADR-0005](../adr/0005-screencast-dmabuf-slot-protocol.md)). The current
-workspace offers protocol 25 and negotiates down to 24; upstream protocols
-26 (`CaptureWindow`) and 27 (`LaunchApp`, `Focus.reveal`) are deliberately
-not projected. Wallpaper uses the compositor's path-based `SetWallpaper`
+workspace offers protocol 29 and negotiates down to 24; upstream protocols
+26 (`CaptureWindow`), 27 (`LaunchApp`, `Focus.reveal`), and 28 are
+deliberately not projected. The protocol-29 additions (output enumeration,
+connector-addressed stream targets, stream cursor mode,
+`StreamGeometryChanged`, output picking) activate only where negotiated
+(see [ADR-0015](../adr/0015-protocol-29-projection.md)). Wallpaper uses the
+compositor's path-based `SetWallpaper`
 op, which the compositor has spoken since protocol 17 — before this
 projection's floor — so it works against every listed Aegis release (see
 [ADR-0011](../adr/0011-wallpaper-wire-reconciliation.md)). A future Aegis

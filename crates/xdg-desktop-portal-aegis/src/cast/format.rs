@@ -16,6 +16,12 @@ pub(crate) const FRAMERATE_MAX: Fraction = Fraction { num: 360, denom: 1 };
 /// bit 1, MemFd is bit 2, and DmaBuf is bit 3.
 pub(crate) const DMABUF_DATA_TYPE_BIT: u32 = 1 << 3;
 pub(crate) const ALL_DATA_TYPES: u32 = (1 << 1) | (1 << 2) | DMABUF_DATA_TYPE_BIT;
+/// Pool depth offered to copy-path consumers. Encoder consumers hold
+/// buffers while their reorder lookahead runs, so the two-buffer minimum
+/// would drop every frame a consumer holds even briefly; four absorbs the
+/// hold. Zero-copy slot streams default to the slot count instead — every
+/// pool buffer binds a slot, so extras would only serve the copy fallback.
+pub(crate) const SHM_POOL_BUFFERS: usize = 4;
 /// DRM_FORMAT_MOD_LINEAR: the only dmabuf layout the copy path may
 /// memory-map. Tiled layouts read back tile-swizzled on the CPU, so they
 /// must come from the compositor's SHM readback instead.
@@ -303,9 +309,10 @@ pub(crate) fn format_pods(
 /// Buffer constraints offered once the format is negotiated: buffers of
 /// exactly one frame at the layout delivery actually uses (the slot's
 /// stride and size for zero-copy dmabuf, tightly packed for the copy
-/// path), defaulting to the slot count on slot streams.
-pub(crate) fn buffers_pod(slots: usize, stride: i32, size: i32) -> Vec<u8> {
-    let default = u32::try_from(slots).unwrap_or(0).clamp(2, 8);
+/// path). `default_buffers` is the offered pool depth — the slot count on
+/// zero-copy slot streams, `SHM_POOL_BUFFERS` on the copy path.
+pub(crate) fn buffers_pod(default_buffers: usize, stride: i32, size: i32) -> Vec<u8> {
+    let default = u32::try_from(default_buffers).unwrap_or(0).clamp(2, 8);
     let object = pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),

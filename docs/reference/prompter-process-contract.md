@@ -10,6 +10,19 @@ contracts by hand. Decision history lives in
 [ADR-0004](../adr/0004-portal-ownership-and-runtime-ipc-boundary.md) and
 [ADR-0008](../adr/0008-optics-prompter-rewrite.md).
 
+## Standard Streams
+
+Standard output is the protocol wire in both contracts; standard error is
+the diagnostics channel. At startup, before any library code runs, the
+prompter claims the wire (`Wire::acquire` in
+`crates/aegis-portal-prompter/src/wire.rs`): fd 1 is duplicated into a
+private descriptor that both protocol writers use, and fd 1 itself is
+re-aliased onto fd 2 for the rest of the process lifetime. A library — or
+a stray `println!` — that writes to stdout lands on the journal as a
+diagnostic, not on the wire. The backend reads the pipe to EOF and parses
+the whole buffer strictly; trailing bytes fail the request. See
+[ADR-0014](../adr/0014-prompter-privatizes-standard-output.md).
+
 ## One-Shot Prompts
 
 The backend spawns one prompter process per interactive request, writes
@@ -20,7 +33,7 @@ its standard output. A request larger than 8 MiB
 Both directions are versioned envelopes: `PrompterRequest` carries
 `version` plus a tagged `prompt`; `PrompterResponse` carries `version`
 plus a tagged `result`. The version must equal
-`PROCESS_CONTRACT_VERSION` (currently 4) exactly — a mismatched
+`PROCESS_CONTRACT_VERSION` (currently 5) exactly — a mismatched
 backend/prompter pair refuses to interpret each other's fields — and the
 envelopes deny unknown fields.
 
@@ -30,6 +43,7 @@ envelopes deny unknown fields.
 | `confirm` | `ConfirmRequest` / `ConfirmResponse` (`confirmed`, `cancelled`) | Account, Access, Background, Wallpaper preview |
 | `secret` | `SecretRequest` / `SecretResponse` (`secret`, `cancelled`) | Secret vault unlock |
 | `choose_app` | `ChooseAppRequest` / `ChooseAppResponse` (`selected`, `cancelled`) | AppChooser, OpenURI with `ask` |
+| `choose_source` | `ChooseSourceRequest` / `ChooseSourceResponse` (`selected`, `cancelled`) | ScreenCast source selection |
 | `launcher_edit` | `LauncherEditRequest` / `LauncherEditResponse` (`saved`, `cancelled`) | DynamicLauncher |
 
 ### Validation Rules
@@ -38,12 +52,14 @@ envelopes deny unknown fields.
   non-empty, NUL-free, and capped at 16 KiB; choice lists have unique ids
   and consistent selections; paths are absolute and NUL-free; `SaveFiles`
   basenames are single path components; an app chooser offers 1–64
-  candidates; a launcher name is capped at 1 KiB.
+  candidates; a source chooser offers 1–16 options with unique
+  NUL-free ids; a launcher name is capped at 1 KiB.
 - Responses are validated against the exact request (`validate_for`)
   before they become portal results: selected paths are absolute and match
   the mode's cardinality, a returned filter was offered, choice answers
-  match the offered controls in order, a chosen app was offered, and a
-  non-editable launcher name comes back unchanged.
+  match the offered controls in order, a chosen app was offered, a chosen
+  source was offered and `remember` is set only when the checkbox was
+  shown, and a non-editable launcher name comes back unchanged.
 - Filesystem paths are byte arrays (`BytePath`), so non-UTF-8 names
   round-trip without loss.
 - Secret values are redacted from `Debug` output and zeroized on drop.

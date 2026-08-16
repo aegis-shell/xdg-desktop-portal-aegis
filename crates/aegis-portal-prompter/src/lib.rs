@@ -15,7 +15,9 @@ use std::path::{Component, Path, PathBuf};
 
 /// Version of the private stdin/stdout contract. The backend and prompter
 /// reject mismatches instead of interpreting fields using different schemas.
-pub const PROCESS_CONTRACT_VERSION: u32 = 4;
+/// Version 5 adds the `choose_source` prompt kind (the ScreenCast source
+/// chooser); version 4 added the app chooser and launcher editor.
+pub const PROCESS_CONTRACT_VERSION: u32 = 5;
 
 /// Versioned wire envelope sent to a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -64,6 +66,14 @@ impl PrompterRequest {
     }
 
     #[must_use]
+    pub fn choose_source(choose_source: ChooseSourceRequest) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::ChooseSource(choose_source),
+        }
+    }
+
+    #[must_use]
     pub fn launcher_edit(launcher_edit: LauncherEditRequest) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
@@ -97,6 +107,7 @@ pub enum PromptRequest {
     Confirm(ConfirmRequest),
     Secret(SecretRequest),
     ChooseApp(ChooseAppRequest),
+    ChooseSource(ChooseSourceRequest),
     LauncherEdit(LauncherEditRequest),
 }
 
@@ -107,6 +118,7 @@ impl PromptRequest {
             Self::Confirm(confirm) => confirm.validate(),
             Self::Secret(secret) => secret.validate(),
             Self::ChooseApp(choose_app) => choose_app.validate(),
+            Self::ChooseSource(choose_source) => choose_source.validate(),
             Self::LauncherEdit(launcher_edit) => launcher_edit.validate(),
         }
     }
@@ -154,6 +166,14 @@ impl PrompterResponse {
     }
 
     #[must_use]
+    pub fn choose_source(choose_source: ChooseSourceResponse) -> Self {
+        Self {
+            version: PROCESS_CONTRACT_VERSION,
+            result: PromptResult::ChooseSource(choose_source),
+        }
+    }
+
+    #[must_use]
     pub fn launcher_edit(launcher_edit: LauncherEditResponse) -> Self {
         Self {
             version: PROCESS_CONTRACT_VERSION,
@@ -195,6 +215,7 @@ pub enum PromptResult {
     Confirm(ConfirmResponse),
     Secret(SecretResponse),
     ChooseApp(ChooseAppResponse),
+    ChooseSource(ChooseSourceResponse),
     LauncherEdit(LauncherEditResponse),
     Failed { message: String },
 }
@@ -460,6 +481,103 @@ impl ChooseAppResponse {
             ));
         }
         validate_choice_answers(choices, &request.choices)
+    }
+}
+
+/// One capture source offered by the ScreenCast source chooser: the whole
+/// desktop, one connector-named output, or the interactive window pick.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceChoice {
+    /// Opaque backend-owned identifier (`desktop`, `output:<connector>`,
+    /// `window`); also the value the response reports as the choice.
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// One complete ScreenCast source-chooser request sent from the D-Bus
+/// backend to the prompter. The dialog renders a single-selection list of
+/// the offered sources; `remember_offered` controls whether the
+/// persistence checkbox is shown (the backend offers it only when the
+/// client requested a nonzero `persist_mode`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChooseSourceRequest {
+    pub app_id: String,
+    pub title: String,
+    pub options: Vec<SourceChoice>,
+    pub remember_offered: bool,
+    pub parent_window: Option<String>,
+}
+
+/// Source-chooser list cap: a desktop, a handful of outputs, and the
+/// window pick — sixteen is far beyond any real layout and far below the
+/// process contract's byte limit.
+const MAX_CHOOSE_SOURCE_OPTIONS: usize = 16;
+
+impl ChooseSourceRequest {
+    /// Reject malformed values before any dialog is shown.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_prompt_text("source chooser title", &self.title, false)?;
+        if let Some(parent) = self.parent_window.as_deref() {
+            validate_prompt_text("source chooser parent window", parent, true)?;
+        }
+        if self.options.is_empty() || self.options.len() > MAX_CHOOSE_SOURCE_OPTIONS {
+            return Err(format!(
+                "source chooser needs 1..={MAX_CHOOSE_SOURCE_OPTIONS} options"
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for option in &self.options {
+            if option.id.is_empty()
+                || option.id.len() > MAX_PROMPT_TEXT_BYTES
+                || option.id.contains('\0')
+            {
+                return Err("source ids must be non-empty, bounded, and NUL-free".into());
+            }
+            if !ids.insert(option.id.as_str()) {
+                return Err(format!("duplicate source id {:?}", option.id));
+            }
+            validate_prompt_text("source label", &option.label, false)?;
+            if let Some(description) = option.description.as_deref() {
+                validate_prompt_text("source description", description, true)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The one response a source-chooser prompter process emits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ChooseSourceResponse {
+    Selected {
+        /// The id of the chosen source option.
+        source: String,
+        /// Whether the user ticked the persistence checkbox.
+        remember: bool,
+    },
+    Cancelled,
+}
+
+impl ChooseSourceResponse {
+    /// Validate the child result against the exact request before exposing
+    /// it as a portal response: the chosen source must have been offered,
+    /// and `remember` may only be set when the checkbox was offered.
+    pub fn validate_for(&self, request: &ChooseSourceRequest) -> Result<(), String> {
+        let Self::Selected { source, remember } = self else {
+            return Ok(());
+        };
+        if !request.options.iter().any(|offered| &offered.id == source) {
+            return Err(format!(
+                "prompter returned a source that was not offered: {source:?}"
+            ));
+        }
+        if *remember && !request.remember_offered {
+            return Err("prompter remembered a source without the checkbox".into());
+        }
+        Ok(())
     }
 }
 
@@ -1110,6 +1228,135 @@ mod tests {
         assert!(wrong_choice.validate_for(&request).is_err());
 
         assert!(ChooseAppResponse::Cancelled.validate_for(&request).is_ok());
+    }
+
+    fn choose_source_request() -> ChooseSourceRequest {
+        ChooseSourceRequest {
+            app_id: "dev.aegis.Test".into(),
+            title: "Share Your Screen".into(),
+            options: vec![
+                SourceChoice {
+                    id: "desktop".into(),
+                    label: "Entire desktop".into(),
+                    description: None,
+                },
+                SourceChoice {
+                    id: "output:HDMI-A-1".into(),
+                    label: "HDMI-A-1".into(),
+                    description: Some("1920×1080".into()),
+                },
+                SourceChoice {
+                    id: "window".into(),
+                    label: "Window…".into(),
+                    description: None,
+                },
+            ],
+            remember_offered: true,
+            parent_window: Some("wayland:parent".into()),
+        }
+    }
+
+    #[test]
+    fn choose_source_contract_round_trips() {
+        let request = PrompterRequest::choose_source(choose_source_request());
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["version"], PROCESS_CONTRACT_VERSION);
+        assert_eq!(value["prompt"]["kind"], "choose_source");
+        assert!(matches!(
+            serde_json::from_value::<PrompterRequest>(value)
+                .unwrap()
+                .into_prompt()
+                .unwrap(),
+            PromptRequest::ChooseSource(_)
+        ));
+
+        let response = PrompterResponse::choose_source(ChooseSourceResponse::Selected {
+            source: "output:HDMI-A-1".into(),
+            remember: true,
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["result"]["kind"], "choose_source");
+        assert_eq!(encoded["result"]["response"]["status"], "selected");
+        let PromptResult::ChooseSource(decoded) =
+            serde_json::from_value::<PrompterResponse>(encoded)
+                .unwrap()
+                .into_result()
+                .unwrap()
+        else {
+            panic!("expected a choose_source result");
+        };
+        assert!(decoded.validate_for(&choose_source_request()).is_ok());
+    }
+
+    #[test]
+    fn choose_source_request_validation_is_bounded() {
+        let request = choose_source_request();
+
+        let mut no_options = request.clone();
+        no_options.options.clear();
+        assert!(no_options.validate().is_err());
+
+        let mut too_many = request.clone();
+        while too_many.options.len() <= 16 {
+            let index = too_many.options.len();
+            too_many.options.push(SourceChoice {
+                id: format!("output:DP-{index}"),
+                label: format!("DP-{index}"),
+                description: None,
+            });
+        }
+        assert!(too_many.validate().is_err());
+
+        let mut duplicate = request.clone();
+        duplicate.options.push(duplicate.options[0].clone());
+        assert!(duplicate.validate().is_err());
+
+        let mut unnamed = request.clone();
+        unnamed.options[0].label.clear();
+        assert!(unnamed.validate().is_err());
+
+        let mut empty_id = request.clone();
+        empty_id.options[0].id.clear();
+        assert!(empty_id.validate().is_err());
+
+        let mut nul_id = request;
+        nul_id.options[0].id.push('\0');
+        assert!(nul_id.validate().is_err());
+    }
+
+    #[test]
+    fn choose_source_response_is_checked_against_the_request() {
+        let request = choose_source_request();
+        let unknown_source = ChooseSourceResponse::Selected {
+            source: "output:SNEAKY-1".into(),
+            remember: false,
+        };
+        assert!(unknown_source.validate_for(&request).is_err());
+
+        // Remembering is only valid while the checkbox was offered.
+        let remembered = ChooseSourceResponse::Selected {
+            source: "desktop".into(),
+            remember: true,
+        };
+        assert!(remembered.validate_for(&request).is_ok());
+        let without_checkbox = ChooseSourceRequest {
+            remember_offered: false,
+            ..choose_source_request()
+        };
+        assert!(remembered.validate_for(&without_checkbox).is_err());
+
+        assert!(
+            ChooseSourceResponse::Cancelled
+                .validate_for(&request)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn choose_source_rejects_unknown_fields() {
+        let mut value = serde_json::to_value(choose_source_request()).unwrap();
+        value["surprise"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ChooseSourceRequest>(value).is_err());
     }
 
     fn launcher_edit_request() -> LauncherEditRequest {

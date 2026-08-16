@@ -6,7 +6,7 @@
 |-------------------|----------------|----------------|
 | `org.freedesktop.impl.portal.Settings` | Version 1 | Compositor-owned appearance and input settings |
 | `org.freedesktop.impl.portal.Screenshot` | Version 3 | Area target, color picking, and consent-checked legacy output capture |
-| `org.freedesktop.impl.portal.ScreenCast` | Version 6 | One monitor stream, hidden cursor, stable `pipewire-serial`, 60 fps ceiling, zero-copy dmabuf delivery over the protocol-25 [slot protocol](../adr/0005-screencast-dmabuf-slot-protocol.md) with a shared-memory fallback |
+| `org.freedesktop.impl.portal.ScreenCast` | Version 6 | Monitor and (protocol 29) window sources through a source chooser plus compositor consent; per-output selection on multi-output compositors; Hidden and (protocol 29) Embedded cursor modes; `persist_mode` 1–2 restore tokens for monitor selections ([ADR-0016](../adr/0016-screencast-runtime-protocol-29.md)); stable `pipewire-serial`, 60 fps ceiling, zero-copy dmabuf delivery over the protocol-25 [slot protocol](../adr/0005-screencast-dmabuf-slot-protocol.md) with a shared-memory fallback; output geometry changes renegotiate the live stream; per-frame damage rides `SPA_META_VideoDamage` when the consumer requests it |
 | `org.freedesktop.impl.portal.Secret` | Version 1 | Stable per-application secret from the encrypted vault; Portal-owned masked unlock prompt |
 | `org.freedesktop.impl.portal.Lockdown` | Current seven-property ABI | All properties are read-write and process-resident |
 | `org.freedesktop.impl.portal.FileChooser` | Current backend ABI | Open, save, directory, and multiple-file flows through a one-shot optics (iris/lens) process |
@@ -40,7 +40,7 @@ them cleanly.
 
 | Component | Purpose |
 |-----------|---------|
-| Aegis IPC protocol 25 | Compositor settings, screenshot capture and selection, capture consent, ScreenCast frames, and wallpaper application |
+| Aegis IPC protocol 29 (negotiates down to 24) | Compositor settings, screenshot capture and selection, capture consent, ScreenCast frames, and wallpaper application |
 | `xdg-desktop-portal` | Public portal frontend |
 | Optics (flux, lens, iris) shared libraries | All prompter UI processes, from the tagged `ming2k/optics` release |
 | PipeWire and WirePlumber | ScreenCast transport and routing |
@@ -69,6 +69,15 @@ whose wire schemas are verified by the current Portal line.
 The default vault directory is
 `$XDG_DATA_HOME/aegis/secrets`, or `$HOME/.local/share/aegis/secrets` when
 `XDG_DATA_HOME` is unset.
+
+ScreenCast `persist_mode` 1 restore tokens live in
+`$XDG_DATA_HOME/aegis-portal/screencast-restore.json` (directory `0700`,
+file `0600`, atomic replace). Each entry binds an opaque 128-bit token to
+one application's stored monitor selection (whole desktop or one
+connector) and cursor mode. Delete the file to revoke every persisted
+selection. `persist_mode` 2 tokens are process-resident and never touch
+the disk; they vanish when the owning application's bus connection
+closes.
 
 | Path | Mode | Purpose |
 |------|------|---------|

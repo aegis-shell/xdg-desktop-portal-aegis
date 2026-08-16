@@ -57,6 +57,7 @@ mod ipc;
 mod lockdown;
 mod notification;
 mod open_uri;
+mod persist;
 mod print;
 mod prompter;
 mod screencast;
@@ -150,6 +151,41 @@ fn spawn_worker(
     Ok(())
 }
 
+/// Watch `NameOwnerChanged` and drop mode-2 screencast restore tokens when
+/// their owner's unique name vanishes from the bus.
+fn spawn_restore_watcher(
+    conn: zbus::blocking::Connection,
+    store: Arc<Mutex<persist::RestoreStore>>,
+) -> Result<(), PortalError> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.DBus")?
+        .interface("org.freedesktop.DBus")?
+        .member("NameOwnerChanged")?
+        .build();
+    let iterator = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(64))?;
+    spawn_worker("aegis-portal-restore-gc", move || {
+        for message in iterator {
+            let Ok(message) = message else {
+                log::info!("portal: NameOwnerChanged watch ended; restore GC stops");
+                break;
+            };
+            let Some(signal) = zbus::fdo::NameOwnerChanged::from_message(message) else {
+                continue;
+            };
+            let Ok(args) = signal.args() else {
+                continue;
+            };
+            // Only unique-name departures matter: the name is the token
+            // owner key, and a well-known name's owner change keeps it.
+            if args.new_owner().is_none() && args.name().as_str().starts_with(':') {
+                aegis_portal_runtime::sync::lock(&store, "screencast restore store")
+                    .drop_owner(args.name().as_str());
+            }
+        }
+    })
+}
+
 /// Run the backend: serve all interfaces on the session bus and spawn the
 /// capture and screencast workers. The process is D-Bus-activated,
 /// stays resident while the bus is connected, and exits for reactivation
@@ -167,6 +203,7 @@ pub fn run() -> Result<(), PortalError> {
 
     let tracker = Arc::new(Mutex::new(RequestTracker::default()));
     let sessions = Arc::new(Mutex::new(SessionRegistry::default()));
+    let restore_store = Arc::new(Mutex::new(persist::RestoreStore::load(persist::data_dir())));
     const MAX_QUEUED_REQUESTS: usize = 128;
     let (jobs, rx) = mpsc::sync_channel::<CaptureJob>(MAX_QUEUED_REQUESTS);
     let (cast_jobs, cast_rx) = mpsc::sync_channel::<CastJob>(MAX_QUEUED_REQUESTS);
@@ -212,6 +249,7 @@ pub fn run() -> Result<(), PortalError> {
             tracker: Arc::clone(&tracker),
             sessions: Arc::clone(&sessions),
             jobs: cast_jobs.clone(),
+            socket: socket.clone(),
         },
     )?;
     // Stateless sandbox-policy query surface; no worker, no IPC.
@@ -322,6 +360,7 @@ pub fn run() -> Result<(), PortalError> {
     let cast_worker_conn = conn.clone();
     let cast_worker_tracker = Arc::clone(&tracker);
     let cast_worker_socket = socket.clone();
+    let cast_worker_store = Arc::clone(&restore_store);
     spawn_worker("aegis-portal-screencast", move || {
         screencast::cast_worker(
             cast_rx,
@@ -329,9 +368,14 @@ pub fn run() -> Result<(), PortalError> {
             cast_worker_conn,
             cast_worker_tracker,
             sessions,
+            cast_worker_store,
             cast_worker_socket,
         )
     })?;
+
+    // Mode-2 restore tokens live exactly as long as the caller's bus
+    // connection: drop them when the owning unique name vanishes.
+    spawn_restore_watcher(conn.clone(), restore_store)?;
 
     // FileChooser dispatches one supervised UI task/process per request and
     // never shares the compositor capture worker.

@@ -1,4 +1,4 @@
-//! Synchronous client for the Portal-owned Aegis IPC v24 projection.
+//! Synchronous client for the Portal-owned Aegis IPC v29 projection.
 
 use std::collections::VecDeque;
 use std::io;
@@ -11,9 +11,9 @@ use crate::blob;
 use crate::codec::{read_msg, write_msg};
 use crate::schema::{LeaseRequest, Request, Response, valid_wallpaper_path};
 use crate::{
-    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamPixelFormat,
-    StreamTarget,
+    ConfirmPickResult, ConnectionCapabilities, Event, LeaseGrant, MIN_PROTOCOL_VERSION, OutputInfo,
+    PROTOCOL_VERSION, PickKind, PickResult, Rect, SettingsSnapshot, StreamCursorMode,
+    StreamPixelFormat, StreamTarget,
 };
 
 #[derive(Debug)]
@@ -69,8 +69,19 @@ pub struct StreamFrame {
 #[derive(Debug)]
 pub enum StreamMessage {
     Frame(StreamFrame),
-    Ended { stream_id: u64, reason: String },
+    Ended {
+        stream_id: u64,
+        reason: String,
+    },
     LeaseRenewed,
+    /// The stream's output geometry changed (protocol 29). The compositor
+    /// sends no further frames for the stream until the client restarts it
+    /// (`StreamOutputStop` + `StreamOutputStart`).
+    GeometryChanged {
+        stream_id: u64,
+        width: u32,
+        height: u32,
+    },
 }
 
 pub struct Client {
@@ -232,6 +243,17 @@ impl Client {
         }
     }
 
+    /// List the compositor's outputs (protocol 29). Older compositors do
+    /// not speak the op; their refusal surfaces as the reply's `Error`.
+    pub fn enumerate_outputs(&mut self) -> io::Result<Vec<OutputInfo>> {
+        write_msg(&mut self.stream, &Request::EnumerateOutputs)?;
+        match read_msg::<_, Response>(&mut self.stream)? {
+            Response::Outputs { outputs } => Ok(outputs),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(unexpected("Outputs", &other)),
+        }
+    }
+
     pub fn capture_output(&mut self) -> io::Result<(u32, u32, Vec<u8>)> {
         self.capture_output_region(None)
     }
@@ -317,26 +339,39 @@ impl Client {
         max_fps: Option<u32>,
         target: StreamTarget,
     ) -> io::Result<StreamStarted> {
-        self.start_output_stream(max_fps, target, false)
+        self.start_output_stream(max_fps, target, false, None)
     }
 
     /// Start an output stream, optionally opting into the protocol-25
     /// dmabuf slot transport. The opt-in is honored only when the
     /// negotiated protocol is 25 or newer; an older server answers with the
-    /// SHM stream as if the flag were absent.
+    /// SHM stream as if the flag were absent. The protocol-29 parameters
+    /// degrade the same way: `cursor` is sent only to a protocol-29 peer,
+    /// and a connector-named `target` requires one outright (an older
+    /// compositor could only stream the whole desktop, so the request
+    /// fails closed instead of capturing more than asked).
     pub fn start_output_stream(
         &mut self,
         max_fps: Option<u32>,
         target: StreamTarget,
         dmabuf: bool,
+        cursor: Option<StreamCursorMode>,
     ) -> io::Result<StreamStarted> {
         let dmabuf = dmabuf && self.version >= 25;
+        let cursor = cursor.filter(|_| self.version >= 29);
+        if self.version < 29 && matches!(target, StreamTarget::Output { output: Some(_) }) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "per-output stream targets need protocol 29",
+            ));
+        }
         write_msg(
             &mut self.stream,
             &Request::StreamOutputStart {
                 max_fps,
                 target,
                 dmabuf: dmabuf.then_some(true),
+                cursor,
             },
         )?;
         // The compositor publishes the stream lane before it writes the
@@ -509,6 +544,22 @@ impl Client {
                     unreachable!();
                 };
                 Ok(Some(StreamMessage::Ended { stream_id, reason }))
+            }
+            Some("StreamGeometryChanged") => {
+                let event: Event = serde_json::from_value(value).map_err(json_error)?;
+                let Event::StreamGeometryChanged {
+                    stream_id,
+                    width,
+                    height,
+                } = event
+                else {
+                    unreachable!();
+                };
+                Ok(Some(StreamMessage::GeometryChanged {
+                    stream_id,
+                    width,
+                    height,
+                }))
             }
             Some("LeaseRenewed") => {
                 let response: Response = serde_json::from_value(value).map_err(json_error)?;

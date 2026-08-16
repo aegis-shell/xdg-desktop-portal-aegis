@@ -15,3 +15,6 @@
 | [0011](0011-wallpaper-wire-reconciliation.md) | Wallpaper wire reconciliation and the protocol-25 baseline | Accepted |
 | [0012](0012-derived-key-pam-tokens.md) | Derived-key PAM unlock tokens | Accepted |
 | [0013](0013-two-phase-vault-rekey.md) | Crash-safe two-phase vault re-key | Accepted |
+| [0014](0014-prompter-privatizes-standard-output.md) | The prompter privatizes its standard output | Accepted |
+| [0015](0015-protocol-29-projection.md) | The protocol-29 projection | Accepted |
+| [0016](0016-screencast-runtime-protocol-29.md) | The ScreenCast runtime surface for protocol 29 | Accepted |

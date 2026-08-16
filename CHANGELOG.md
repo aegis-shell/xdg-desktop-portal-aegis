@@ -4,6 +4,104 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Flatpak-OBS-grade ScreenCast source selection, window capture,
+  persistence, and geometry renegotiation on the protocol-29 surface
+  (see [ADR-0016](docs/adr/0016-screencast-runtime-protocol-29.md)):
+  - A new `choose_source` prompter kind (process contract 5) renders the
+    capture source chooser: the whole desktop, one entry per connector on
+    multi-output compositors, and a "Window…" entry when the client
+    accepts window sources. A single-option list skips the dialog, so the
+    common single-monitor flow keeps its one compositor consent prompt.
+    Every fresh selection is still gated by a compositor `PickConfirm`
+    naming the concrete target.
+  - `AvailableSourceTypes`/`AvailableCursorModes` now follow the
+    negotiated compositor protocol: 1/1 before protocol 29, 3/3 at 29+.
+    Window sources and the Embedded cursor mode are accepted only where
+    the compositor speaks them.
+  - Window capture goes through the compositor's interactive toplevel
+    pick and streams `StreamTarget::Window`; the Start result reports
+    `source_type` window.
+  - `persist_mode` 1 and 2 are honored for monitor selections with the
+    chooser's remember tick: mode 1 persists opaque 128-bit restore
+    tokens in `$XDG_DATA_HOME/aegis-portal/screencast-restore.json`
+    (0700/0600, atomic), mode 2 keeps them in memory until the caller's
+    bus name vanishes. A valid token restores the stored selection with
+    no UI; window selections never yield tokens and report
+    `persist_mode 0`.
+  - A compositor `StreamGeometryChanged` event (output mode change,
+    hotplug on a whole-desktop stream, window resize) now restarts the
+    compositor stream with the same target, cursor mode, and dmabuf
+    opt-in and re-offers the PipeWire format at the new geometry, so the
+    consumer re-fixates instead of freezing. A mismatched restart fails
+    the stream cleanly.
+  - The compositor's per-frame damage rects are attached to published
+    PipeWire buffers as `SPA_META_VideoDamage` metadata when the consumer
+    requests it (the OBS direction); over-capacity damage collapses to a
+    full-frame region.
+  - The client's cursor mode now crosses to the compositor stream start
+    on protocol 29.
+
+- The `aegis-portal-ipc` projection is re-baselined to protocol 29
+  (negotiating down to 24), projecting the compositor's new
+  output-addressing surface (see
+  [ADR-0015](docs/adr/0015-protocol-29-projection.md)):
+  - `EnumerateOutputs`, reporting each output's connector, primary flag,
+    and logical rectangle.
+  - A connector-addressed `StreamTarget::Output` for per-output streams;
+    the bare whole-desktop shape is unchanged, so older compositors keep
+    working. Against a pre-29 peer the client fails a connector-named
+    target closed instead of silently streaming the whole desktop.
+  - A `cursor` mode on `StreamOutputStart` (`hidden`/`embedded`), sent
+    only to protocol-29 peers.
+  - The `StreamGeometryChanged` stream event, surfaced on the client's
+    stream lane; after it the compositor sends no further frames until
+    the stream is restarted. The cast loop's restart handling is part of
+    the runtime surface above.
+  - Output picking (`PickKind::Output`, with an optional connector in
+    `PickResult::Output`).
+
+### Fixed
+
+- A pending compositor slot frame leaked its dmabuf slot when the next
+  frame arrived before any PipeWire process cycle published it: the
+  latest-frame overwrite silently dropped the old payload, and with no
+  publish, no consumer return, and no teardown, nothing ever released the
+  slot — permanently shrinking the compositor's slot ring and degrading
+  the zero-copy stream to frame drops. Storing a frame now goes through
+  one helper that releases a superseded, never-published slot before
+  overwriting it, so the invariant cannot be bypassed; a regression test
+  drives two slot frames without an intervening process cycle and
+  observes the release at the compositor.
+
+- ScreenCast recordings froze on one frame for seconds at a time whenever
+  the PipeWire consumer held every pool buffer at once (an encoder's
+  reorder lookahead, or any slow reader). Buffer reclaim — and with it the
+  compositor's dmabuf slot releases — only ran inside the DRIVER stream's
+  `process` callback, cycles only ran when a compositor frame arrived, and
+  the compositor stops sending frames while all its capture slots are
+  consumer-owned: a circular wait that wedged the stream until some
+  external event renegotiated it. A keepalive timer now triggers cycles at
+  the stream's frame cadence while Streaming, so reclaim and slot releases
+  always run, and a frame the starved pool could not take stays pending
+  and is retried on a later cycle instead of being dropped. The
+  shared-memory pool offer also grew from two buffers to four to absorb
+  encoder lookahead holds.
+
+- Download prompts (FileChooser `SaveFile`) never delivered a result, so
+  no download ever started: every prompter response failed the backend's
+  strict parse with "trailing characters at line 2 column 1". libiris
+  printed its first-frame diagnostic to standard output, and C stdio's
+  full buffering on pipes flushed those bytes at process exit, after the
+  JSON response — corrupting the backend↔prompter wire for every prompt
+  kind, not just file choosers. Optics now sends all iris diagnostics to
+  standard error (Wayland, Cocoa, and Win32 backends alike), and the
+  prompter additionally claims standard output privately at startup —
+  fd 1 is duplicated for the protocol response and re-aliased to standard
+  error — so no library write can corrupt the wire again
+  ([ADR-0014](docs/adr/0014-prompter-privatizes-standard-output.md)).
+
 ## [0.0.11] - 2026-08-15
 
 ### Fixed

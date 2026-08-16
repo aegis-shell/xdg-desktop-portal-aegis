@@ -54,7 +54,7 @@ fn reclaim_returned_buffers(stream: &pw::stream::Stream, data: &StreamData) {
 pub(crate) fn process_frame(stream: &pw::stream::Stream, data: &mut StreamData) {
     reclaim_returned_buffers(stream, data);
 
-    if !data.pending.replace(false) {
+    if !data.pending.get() {
         return;
     }
     // The latest frame stays stored after publishing: a consumer that
@@ -62,18 +62,46 @@ pub(crate) fn process_frame(stream: &pw::stream::Stream, data: &mut StreamData) 
     // since queued buffers are flushed back on pause.
     let frame = data.latest.borrow();
     let Some(frame) = &*frame else {
+        data.pending.set(false);
         return;
     };
     match frame {
-        FramePayload::Descriptor { file, stride } => copy_into_pool(stream, data, file, *stride),
-        FramePayload::Slot(slot) => publish_slot(stream, data, *slot),
+        FramePayload::Descriptor {
+            file,
+            stride,
+            damage,
+        } => {
+            // A pool-starved frame stays pending: its memfd pixels are
+            // immutable, so the next cycle — frame- or keepalive-triggered —
+            // safely retries it once the consumer returns a pool buffer.
+            let (width, height) = {
+                let transport = data.transport.borrow();
+                (transport.width, transport.height)
+            };
+            if copy_into_pool(stream, data, file, *stride, width, height, damage) {
+                data.pending.set(false);
+            }
+        }
+        FramePayload::Slot { slot, damage } => {
+            // Slot frames never retry: every failure mode is permanent for
+            // that frame, and the copy fallback releases the slot
+            // immediately, so the pixels a retry would read may already be
+            // overwritten.
+            publish_slot(stream, data, *slot, damage);
+            data.pending.set(false);
+        }
     }
 }
 
 /// Publish a protocol-25 slot frame: queue the pool buffer bound to the
 /// slot when the consumer takes dmabufs, or copy the slot's pixels into a
 /// free pool buffer (and release the slot immediately) otherwise.
-fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
+fn publish_slot(
+    stream: &pw::stream::Stream,
+    data: &StreamData,
+    slot: u32,
+    damage: &[aegis_portal_ipc::Rect],
+) {
     let mut transport = data.transport.borrow_mut();
     let Some(binding) = transport.slot_bindings.get_mut(slot as usize) else {
         data.dropped_frames.set(data.dropped_frames.get() + 1);
@@ -89,10 +117,14 @@ fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
     match (forward, binding.pool) {
         (true, Some(pool_raw)) => {
             binding.in_flight = true;
+            let (width, height) = (transport.width, transport.height);
             drop(transport);
             // SAFETY: `pool_raw` is a live pool buffer of this stream bound
             // to this slot, dequeued earlier and not referenced elsewhere.
-            unsafe { stream.queue_raw_buffer(pool_raw) };
+            unsafe {
+                super::meta::attach_damage(pool_raw, damage, width, height);
+                stream.queue_raw_buffer(pool_raw)
+            };
         }
         _ => {
             if !transport.cpu_mappable() {
@@ -107,7 +139,8 @@ fn publish_slot(stream: &pw::stream::Stream, data: &StreamData, slot: u32) {
             }
             let file = &transport.slot_files[slot as usize].file;
             let stride = transport.slot_files[slot as usize].stride;
-            copy_into_pool(stream, data, file, stride);
+            let (width, height) = (transport.width, transport.height);
+            copy_into_pool(stream, data, file, stride, width, height, damage);
             drop(transport);
             data.release_slot(slot);
         }

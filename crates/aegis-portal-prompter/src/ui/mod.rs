@@ -3,6 +3,7 @@
 //! raw FFI call is funneled through.
 
 pub mod choose_app;
+pub mod choose_source;
 pub mod confirm;
 pub mod edit;
 pub mod file_chooser;

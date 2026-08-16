@@ -13,12 +13,28 @@ use std::os::unix::net::UnixStream;
 const MAX_SESSIONS: usize = 128;
 const MAX_LIVE_CASTS: usize = 16;
 
-/// The source a session is armed with. Window capture is intentionally not
-/// exposed until the compositor can render a toplevel independently of
-/// overlapping windows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The source a session is armed with. Whole-desktop and per-connector
+/// monitor captures are persistable; window captures are not (a window id
+/// is not stable across sessions, so no restore token is ever issued for
+/// one and Start reports `persist_mode` 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CastSource {
-    Monitor,
+    /// An output stream; `None` captures the whole desktop.
+    Monitor { output: Option<String> },
+    /// A single toplevel window (protocol 29 only).
+    Window { window: aegis_portal_ipc::WindowId },
+}
+
+/// The selection `Start` must apply, reserved out of the registry.
+pub(crate) struct StartSelection {
+    pub(crate) source: CastSource,
+    pub(crate) cursor_mode: u32,
+    /// Persistence the client asked for; Start reports the granted mode,
+    /// which is 0 whenever `persist_grant` is `None`.
+    pub(crate) requested_persist_mode: u32,
+    /// The restore-token grant decided at `SelectSources`: `(mode, token)`
+    /// for both freshly issued and restored tokens.
+    pub(crate) persist_grant: Option<(u32, String)>,
 }
 
 /// State of one portal screencast session.
@@ -28,9 +44,12 @@ pub(crate) struct CastSession {
     pub(crate) sources_selected: bool,
     /// The armed source; meaningful once `sources_selected` holds.
     pub(crate) source: CastSource,
-    /// Persistence requested by the frontend. The current backend safely
-    /// reduces nonzero modes to 0 and reports that reduction from Start.
+    /// The negotiated cursor mode (1 = Hidden, 2 = Embedded).
+    pub(crate) cursor_mode: u32,
+    /// Persistence requested by the frontend.
     pub(crate) requested_persist_mode: u32,
+    /// The restore-token grant from `SelectSources`, if any.
+    pub(crate) persist_grant: Option<(u32, String)>,
     /// Reserved before spawning PipeWire negotiation so concurrent Start
     /// calls cannot create two producers for one session.
     pub(crate) starting: bool,
@@ -61,8 +80,10 @@ impl SessionRegistry {
             CastSession {
                 app_id: app_id.to_string(),
                 sources_selected: false,
-                source: CastSource::Monitor,
+                source: CastSource::Monitor { output: None },
+                cursor_mode: 1,
                 requested_persist_mode: 0,
+                persist_grant: None,
                 starting: false,
                 stop: None,
                 cast_thread: None,
@@ -80,7 +101,9 @@ impl SessionRegistry {
         path: &str,
         app_id: &str,
         source: CastSource,
+        cursor_mode: u32,
         requested_persist_mode: u32,
+        persist_grant: Option<(u32, String)>,
     ) -> Result<(), String> {
         let session = self
             .sessions
@@ -94,17 +117,19 @@ impl SessionRegistry {
         }
         session.sources_selected = true;
         session.source = source;
+        session.cursor_mode = cursor_mode;
         session.requested_persist_mode = requested_persist_mode;
+        session.persist_grant = persist_grant;
         Ok(())
     }
 
-    /// Validate the application owner and return the source and persistence
-    /// request `Start` must apply.
+    /// Validate the application owner and return the selection `Start`
+    /// must apply.
     pub(crate) fn reserve_start(
         &mut self,
         path: &str,
         app_id: &str,
-    ) -> Result<(CastSource, u32), String> {
+    ) -> Result<StartSelection, String> {
         let session = self
             .sessions
             .get(path)
@@ -131,7 +156,12 @@ impl SessionRegistry {
             .get_mut(path)
             .ok_or_else(|| format!("unknown session {path}"))?;
         session.starting = true;
-        Ok((session.source, session.requested_persist_mode))
+        Ok(StartSelection {
+            source: session.source.clone(),
+            cursor_mode: session.cursor_mode,
+            requested_persist_mode: session.requested_persist_mode,
+            persist_grant: session.persist_grant.clone(),
+        })
     }
 
     pub(crate) fn clear_start(&mut self, path: &str) {
@@ -209,6 +239,10 @@ mod tests {
         registry
     }
 
+    fn desktop() -> CastSource {
+        CastSource::Monitor { output: None }
+    }
+
     #[test]
     fn duplicate_session_paths_are_refused() {
         let mut registry = registry_with("/s/1");
@@ -235,7 +269,7 @@ mod tests {
             let path = format!("/s/{index}");
             registry.insert(&path, "org.example.App").unwrap();
             registry
-                .mark_sources_selected(&path, "org.example.App", CastSource::Monitor, 0)
+                .mark_sources_selected(&path, "org.example.App", desktop(), 1, 0, None)
                 .unwrap();
         }
         for index in 0..MAX_LIVE_CASTS {
@@ -255,12 +289,11 @@ mod tests {
         let mut registry = SessionRegistry::default();
         registry.insert("/s/host", "").unwrap();
         registry
-            .mark_sources_selected("/s/host", "", CastSource::Monitor, 0)
+            .mark_sources_selected("/s/host", "", desktop(), 1, 0, None)
             .unwrap();
-        assert_eq!(
-            registry.reserve_start("/s/host", ""),
-            Ok((CastSource::Monitor, 0))
-        );
+        let selection = registry.reserve_start("/s/host", "").unwrap();
+        assert_eq!(selection.source, desktop());
+        assert_eq!(selection.cursor_mode, 1);
     }
 
     #[test]
@@ -268,17 +301,16 @@ mod tests {
         let mut registry = registry_with("/s/1");
         assert!(registry.reserve_start("/s/1", "org.example.App").is_err());
         registry
-            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
+            .mark_sources_selected("/s/1", "org.example.App", desktop(), 1, 0, None)
             .unwrap();
-        assert_eq!(
-            registry.reserve_start("/s/1", "org.example.App"),
-            Ok((CastSource::Monitor, 0))
-        );
+        let selection = registry.reserve_start("/s/1", "org.example.App").unwrap();
+        assert_eq!(selection.source, desktop());
+        assert_eq!(selection.persist_grant, None);
         registry.clear_start("/s/1");
         assert!(registry.reserve_start("/s/1", "org.example.Other").is_err());
         assert!(
             registry
-                .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
+                .mark_sources_selected("/s/1", "org.example.App", desktop(), 1, 0, None)
                 .is_err()
         );
 
@@ -293,7 +325,7 @@ mod tests {
     fn remove_stops_and_joins_the_cast() {
         let mut registry = registry_with("/s/1");
         registry
-            .mark_sources_selected("/s/1", "org.example.App", CastSource::Monitor, 0)
+            .mark_sources_selected("/s/1", "org.example.App", desktop(), 1, 0, None)
             .unwrap();
         let (stop, read) = UnixStream::pair().unwrap();
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

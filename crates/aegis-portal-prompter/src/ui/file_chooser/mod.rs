@@ -652,15 +652,21 @@ fn icon_tool_button(
     if !enabled {
         f.push_style(style::muted_style(dark));
     }
+    // Lens containers align only on the cross axis and pack the main axis
+    // from the start, so `centered` supplies the main-axis centring: the
+    // glyph sits at the optical centre of the square button on both axes.
     let (response, ()) = f.pressable_row(
         id,
         "",
         &LayoutOpts {
-            pad: metrics::SPACE_XS,
             radius: metrics::RADIUS,
             ..Default::default()
         },
-        |f, _| icon(f),
+        |f, _| {
+            f.centered(metrics::CONTROL_HEIGHT, metrics::CONTROL_HEIGHT, |f| {
+                icon(f)
+            })
+        },
     );
     if !enabled {
         f.pop_style();
@@ -919,7 +925,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         if response.clicked {
                             create_folder(state);
                         }
-                        f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
+                        f.size_next(metrics::ACCEPT_WIDTH, metrics::CONTROL_HEIGHT);
                         if f.button("Create") {
                             create_folder(state);
                         }

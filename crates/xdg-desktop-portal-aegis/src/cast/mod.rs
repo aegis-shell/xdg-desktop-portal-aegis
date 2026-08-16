@@ -35,19 +35,45 @@
 //! on both transports, so the consumer never observes the switch.
 //!
 //! The stream is a PipeWire DRIVER fed by `pw_stream_trigger_process` when
-//! a compositor frame arrives, so graph cycles run only when there is a new
-//! frame. The latest frame is republished on the Streaming transition: an
-//! early trigger fails with EIO before the link is up, and a pause flushes
-//! queued buffers back to the producer.
+//! a compositor frame arrives, so graph cycles normally run only when there
+//! is a new frame. The latest frame is republished on the Streaming
+//! transition: an early trigger fails with EIO before the link is up, and a
+//! pause flushes queued buffers back to the producer.
+//!
+//! Frame arrival cannot be the only cycle source: `process` is what
+//! reclaims consumer-returned pool buffers, and reclaiming is what releases
+//! compositor dmabuf slots — while the compositor stops sending frames once
+//! every slot is consumer-owned. A consumer that holds the whole pool (an
+//! encoder's reorder lookahead, a slow reader) would wedge the stream in
+//! that circular wait: no frames, so no reclaim, so no slots, so no frames.
+//! A keepalive timer therefore triggers a cycle at a fixed cadence while
+//! the stream is Streaming, so reclaim and slot releases always run and a
+//! frame that failed to publish against a starved pool is retried.
 //!
 //! Teardown is single-path: closing the write end of the stop socket (or a
 //! compositor-side `StreamEnded`, or any read error) quits the loop, after
 //! which dropping the IPC client disconnects it — and the compositor's
 //! disconnect cleanup stops the stream with no extra round-trip.
+//!
+//! A protocol-29 `StreamGeometryChanged` event (an output mode change, a
+//! hotplug on a whole-desktop stream, or a window resize) freezes the
+//! compositor stream until restarted. The cast loop restarts it with the
+//! same target, cursor mode, and dmabuf opt-in, requires the restarted
+//! stream's geometry to match the event, swaps the transport, and then
+//! re-offers the PipeWire format at the new geometry so the consumer
+//! re-fixates (the Buffers offer follows in the `Format` param callback,
+//! which derives it from the swapped transport). A mismatched or failed
+//! restart fails the stream cleanly.
+//!
+//! Buffers may carry `SPA_META_VideoDamage` metadata: the producer offers
+//! it alongside the Buffers param and attaches each frame's compositor
+//! damage rects to the buffer it publishes, so consumers can re-read only
+//! what changed (see `cast::meta`).
 
 mod copy;
 mod format;
 mod frame;
+mod meta;
 mod publish;
 mod state;
 
@@ -71,15 +97,19 @@ use pw::stream::{StreamFlags, StreamState};
 
 use copy::PoolMem;
 use format::{
-    AnnouncedFormat, announced_format, buffers_pod, format_pods, parse_buffers_data_types,
-    parse_format_param,
+    SHM_POOL_BUFFERS, buffers_pod, format_pods, parse_buffers_data_types, parse_format_param,
 };
 use frame::{frame_len, validate_frame};
+use meta::damage_meta_pod;
 use publish::process_frame;
-use state::{DeliveryMode, LatestFrame, Negotiation, SlotBinding, StreamData, Transport};
+use state::{
+    DeliveryMode, LatestFrame, Negotiation, StreamData, Transport, replace_latest,
+    restart_stream_geometry,
+};
 
 use crate::ipc;
 use crate::screencast::CastJob;
+use crate::session::CastSource;
 
 /// Frame-rate ceiling requested from the compositor. The compositor paces
 /// frames itself: while a stream is live, its due frames drive presentation
@@ -92,6 +122,15 @@ const STREAM_DIRECTION: Direction = Direction::Output;
 /// Lease TTL requested at handshake and renewal; renewed at half TTL.
 const LEASE_TTL_MS: u64 = 900_000;
 const IPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// Keepalive cadence of DRIVER cycles while the stream is Streaming.
+/// Compositor frames trigger cycles directly; this timer exists for the
+/// cycles no frame can ever trigger — buffer reclaim releases compositor
+/// dmabuf slots, and the compositor stops sending frames while every slot
+/// is consumer-owned, so without it a consumer holding the whole pool
+/// wedges the stream in a circular wait (frozen picture until some external
+/// event renegotiates the stream). The interval matches the stream's
+/// maximum frame cadence, so recovery adds at most one frame of latency.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_MAX_FPS as u64);
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
@@ -100,6 +139,11 @@ pub(crate) struct CastStarted {
     pub(crate) serial: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// The source's origin in compositor (physical, desktop) coordinates:
+    /// the selected connector's rect origin for per-output captures, or
+    /// `(0, 0)` for whole-desktop and window captures (the wire carries no
+    /// window position).
+    pub(crate) position: (i32, i32),
 }
 
 /// Live cast handle owned by the session registry: drop `stop` to end the
@@ -111,17 +155,31 @@ pub(crate) struct CastHandle {
 }
 
 /// Spawn the cast thread. Returns immediately; the PipeWire negotiation
-/// result arrives on `handle.started` exactly once.
+/// result arrives on `handle.started` exactly once. `source` and `cursor`
+/// are the session's armed selection; every compositor stream the cast
+/// starts (including transport and geometry restarts) reuses them.
 pub(crate) fn spawn(
     socket: PathBuf,
     session_path: String,
     jobs: mpsc::SyncSender<CastJob>,
+    source: CastSource,
+    cursor: aegis_portal_ipc::StreamCursorMode,
 ) -> io::Result<CastHandle> {
     let (stop_read, stop_write) = UnixStream::pair()?;
     let (started_tx, started_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("aegis-portal-cast".to_string())
-        .spawn(move || cast_thread(socket, session_path, jobs, stop_read, started_tx))?;
+        .spawn(move || {
+            cast_thread(
+                socket,
+                session_path,
+                jobs,
+                source,
+                cursor,
+                stop_read,
+                started_tx,
+            )
+        })?;
     Ok(CastHandle {
         stop: stop_write,
         started: started_rx,
@@ -147,6 +205,7 @@ pub(crate) struct StartState {
     started: Option<mpsc::Sender<Result<CastStarted, String>>>,
     paused: Option<(u32, u32, u32)>,
     serials: std::collections::HashMap<u32, u64>,
+    position: (i32, i32),
     completed: bool,
 }
 
@@ -165,6 +224,7 @@ impl StartState {
                 serial,
                 width,
                 height,
+                position: self.position,
             }));
         }
     }
@@ -174,10 +234,20 @@ fn cast_thread(
     socket: PathBuf,
     session_path: String,
     jobs: mpsc::SyncSender<CastJob>,
+    source: CastSource,
+    cursor: aegis_portal_ipc::StreamCursorMode,
     stop_read: UnixStream,
     started: mpsc::Sender<Result<CastStarted, String>>,
 ) {
-    if let Err(error) = run_cast(&socket, &session_path, &jobs, stop_read, &started) {
+    if let Err(error) = run_cast(
+        &socket,
+        &session_path,
+        &jobs,
+        &source,
+        cursor,
+        stop_read,
+        &started,
+    ) {
         log::warn!("portal: cast for {session_path} failed: {error}");
         let _ = started.send(Err(error));
     }
@@ -191,46 +261,55 @@ fn run_cast(
     socket: &std::path::Path,
     session_path: &str,
     jobs: &mpsc::SyncSender<CastJob>,
+    source: &CastSource,
+    cursor: aegis_portal_ipc::StreamCursorMode,
     stop_read: UnixStream,
     started: &mpsc::Sender<Result<CastStarted, String>>,
 ) -> Result<(), String> {
     // Inward half first: without frames there is nothing to publish.
     let mut client = ipc::connect_compositor(socket, IPC_TIMEOUT)
         .map_err(|e| format!("compositor IPC connect: {e}"))?;
+    let target = match source {
+        CastSource::Monitor { output } => aegis_portal_ipc::StreamTarget::Output {
+            output: output.clone(),
+        },
+        CastSource::Window { window } => aegis_portal_ipc::StreamTarget::Window { window: *window },
+    };
     let stream_info = client
-        .start_output_stream(
-            Some(STREAM_MAX_FPS),
-            aegis_portal_ipc::StreamTarget::Output,
-            true,
-        )
+        .start_output_stream(Some(STREAM_MAX_FPS), target.clone(), true, Some(cursor))
         .map_err(|e| format!("start output stream: {e}"))?;
     let (width, height) = (stream_info.width, stream_info.height);
-    frame_len(width, height)?;
-    let announced = announced_format(stream_info.format)?;
-    let slot_files = stream_info.slots.unwrap_or_default();
-    let slot_count = slot_files.len();
-    let offered_modifier = match announced {
-        AnnouncedFormat::Dmabuf { modifier, .. } if slot_count > 0 => Some(modifier),
-        _ => None,
-    };
-    let transport = Rc::new(RefCell::new(Transport {
-        stream_id: stream_info.stream_id,
-        announced,
-        slot_files,
-        slot_bindings: (0..slot_count)
-            .map(|_| SlotBinding {
-                pool: None,
-                in_flight: false,
+    // The Start result names the selected connector's origin in desktop
+    // coordinates. Informational only: a failed lookup must not fail the
+    // cast, and whole-desktop/window captures report (0, 0).
+    let position = match source {
+        CastSource::Monitor {
+            output: Some(connector),
+        } => client
+            .enumerate_outputs()
+            .ok()
+            .and_then(|outputs| {
+                outputs
+                    .into_iter()
+                    .find(|info| info.connector == *connector)
+                    .map(|info| (info.rect.origin.x, info.rect.origin.y))
             })
-            .collect(),
-    }));
+            .unwrap_or((0, 0)),
+        _ => (0, 0),
+    };
+    frame_len(width, height)?;
+    let slot_count = stream_info.slots.as_ref().map_or(0, Vec::len);
+    let (initial_transport, announced) = Transport::new(stream_info, target, cursor, true)?;
+    let transport = Rc::new(RefCell::new(initial_transport));
     let teardown_transport = Rc::clone(&transport);
     let teardown_pool_mem: Rc<RefCell<HashMap<usize, PoolMem>>> =
         Rc::new(RefCell::new(HashMap::new()));
-    log::info!(
-        "portal: compositor stream {} for {session_path}: {width}x{height}, format {announced:?}, {slot_count} slots",
-        stream_info.stream_id,
-    );
+    {
+        let stream_id = transport.borrow().stream_id;
+        log::info!(
+            "portal: compositor stream {stream_id} for {session_path}: {width}x{height}, format {announced:?}, {slot_count} slots",
+        );
+    }
     let client = Rc::new(RefCell::new(client));
     let teardown_client = Rc::clone(&client);
 
@@ -259,6 +338,7 @@ fn run_cast(
         started: Some(started.clone()),
         paused: None,
         serials: std::collections::HashMap::new(),
+        position,
         completed: false,
     }));
     let exit_start_state = Rc::clone(&start_state);
@@ -280,14 +360,14 @@ fn run_cast(
         .register();
 
     let state_loop_weak = mainloop.downgrade();
+    // Set while the stream is Streaming; the keepalive timer only triggers
+    // cycles in that state (a trigger before the link is up fails with EIO).
+    let streaming = Rc::new(Cell::new(false));
+    let state_streaming = Rc::clone(&streaming);
     let _listener = stream
         .add_local_listener_with_user_data(StreamData {
             latest: Rc::clone(&latest),
             pending: Rc::clone(&pending),
-            width,
-            height,
-            spa_format: announced.spa_format(),
-            offered_modifier,
             transport: Rc::clone(&transport),
             negotiation: RefCell::new(Negotiation {
                 mode: DeliveryMode::Shm,
@@ -303,6 +383,7 @@ fn run_cast(
         })
         .state_changed(move |stream, data, _old, new| {
             log::debug!("portal: pipewire stream {new:?}");
+            state_streaming.set(new == StreamState::Streaming);
             if let StreamState::Error(message) = new {
                 if let Some(started) = data.start_state.borrow_mut().started.take() {
                     let _ = started.send(Err(format!("PipeWire stream error: {message}")));
@@ -326,7 +407,11 @@ fn run_cast(
                 {
                     state.serials.insert(node_id, serial);
                 }
-                state.paused = Some((node_id, data.width, data.height));
+                let (width, height) = {
+                    let transport = data.transport.borrow();
+                    (transport.width, transport.height)
+                };
+                state.paused = Some((node_id, width, height));
                 state.try_complete();
             }
             // A DRIVER stream only runs cycles when triggered, and a
@@ -352,8 +437,10 @@ fn run_cast(
                 }
                 // Advertise the layout delivery actually uses: the slot's
                 // stride and size for zero-copy dmabuf, tightly packed for
-                // the shared-memory copy path.
-                let buffers = {
+                // the shared-memory copy path. The damage metadata offer
+                // rides along (see `cast::meta`); a consumer that ignores
+                // it simply gets buffers without the meta block.
+                let (buffers, meta) = {
                     let transport = data.transport.borrow();
                     let mode = data.negotiation.borrow().mode;
                     let slot = if mode == DeliveryMode::Dmabuf {
@@ -361,20 +448,24 @@ fn run_cast(
                     } else {
                         None
                     };
-                    match slot {
+                    let buffers = match slot {
                         Some(slot) => buffers_pod(
                             transport.slot_files.len(),
                             slot.stride as i32,
                             slot.byte_len as i32,
                         ),
                         None => buffers_pod(
-                            transport.slot_files.len(),
-                            (data.width * 4) as i32,
-                            (data.width * data.height * 4) as i32,
+                            SHM_POOL_BUFFERS,
+                            (transport.width * 4) as i32,
+                            (transport.width * transport.height * 4) as i32,
                         ),
-                    }
+                    };
+                    (buffers, damage_meta_pod())
                 };
-                let mut params = [Pod::from_bytes(&buffers).expect("buffers pod")];
+                let mut params = [
+                    Pod::from_bytes(&buffers).expect("buffers pod"),
+                    Pod::from_bytes(&meta).expect("meta pod"),
+                ];
                 if let Err(error) = stream.update_params(&mut params) {
                     log::warn!("portal: pipewire update_params failed: {error}");
                 }
@@ -441,9 +532,13 @@ fn run_cast(
                 log::debug!("portal: bound compositor slot {index} to a pool buffer");
                 return;
             }
-            let frame_bytes = data.width as usize * data.height as usize * 4;
+            let frame_bytes = {
+                let transport = data.transport.borrow();
+                transport.width as usize * transport.height as usize * 4
+            };
             match PoolMem::new(frame_bytes) {
                 Ok(mem) => {
+                    let stride = data.transport.borrow().width * 4;
                     // SAFETY: as above; the memfd stays owned by
                     // `pool_mem` until remove_buffer/teardown, and `map`
                     // points at its pages.
@@ -458,7 +553,7 @@ fn run_cast(
                         (*datas).data = mem.map.cast();
                         (*chunk).offset = 0;
                         (*chunk).size = 0;
-                        (*chunk).stride = (data.width * 4) as i32;
+                        (*chunk).stride = stride as i32;
                         (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
                     }
                     data.pool_mem.borrow_mut().insert(buffer as usize, mem);
@@ -537,15 +632,14 @@ fn run_cast(
                         }
                         match validate_frame(
                             frame,
-                            width,
-                            height,
+                            state.width,
+                            state.height,
                             state.announced,
                             state.slot_count(),
                         ) {
                             Ok(payload) => {
                                 drop(state);
-                                *latest.borrow_mut() = Some(payload);
-                                pending.set(true);
+                                replace_latest(&latest, &pending, &transport, &io.0, payload);
                                 if let Some(stream) = stream_weak.upgrade()
                                     && let Err(error) = stream.trigger_process()
                                 {
@@ -558,6 +652,61 @@ fn run_cast(
                         }
                     }
                     Ok(StreamMessage::LeaseRenewed) => {}
+                    Ok(StreamMessage::GeometryChanged {
+                        stream_id,
+                        width,
+                        height,
+                    }) => {
+                        // The compositor sends no further frames until the
+                        // stream is restarted: restart it with the same
+                        // target, cursor mode, and dmabuf opt-in, then
+                        // re-offer the PipeWire format at the new geometry
+                        // so the consumer re-fixates. The Buffers offer
+                        // follows in `param_changed`, which derives it from
+                        // the swapped transport.
+                        if stream_id != transport.borrow().stream_id {
+                            log::debug!(
+                                "portal: ignoring geometry change for superseded stream {stream_id}"
+                            );
+                            return;
+                        }
+                        match restart_stream_geometry(
+                            &transport,
+                            &io.0,
+                            &latest,
+                            &pending,
+                            stream_id,
+                            width,
+                            height,
+                        ) {
+                            Ok((announced, slot_count)) => {
+                                log::info!(
+                                    "portal: stream {stream_id} geometry changed to {width}x{height}; renegotiating"
+                                );
+                                if let Some(stream) = stream_weak.upgrade() {
+                                    let format_bytes =
+                                        format_pods(width, height, announced, slot_count > 0);
+                                    let mut params: Vec<&Pod> = format_bytes
+                                        .iter()
+                                        .map(|bytes| Pod::from_bytes(bytes).expect("format pod"))
+                                        .collect();
+                                    if let Err(error) = stream.update_params(&mut params) {
+                                        log::warn!(
+                                            "portal: pipewire re-offer after the geometry change failed: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                // A mismatched or failed restart cannot be
+                                // served honestly; fail the stream cleanly.
+                                log::warn!(
+                                    "portal: geometry restart for {session_path} failed: {error}"
+                                );
+                                end_cast(&jobs, &session_path, &loop_weak);
+                            }
+                        }
+                    }
                     Ok(StreamMessage::Ended { reason, .. }) => {
                         log::info!("portal: compositor ended stream for {session_path}: {reason}");
                         end_cast(&jobs, &session_path, &loop_weak);
@@ -598,6 +747,24 @@ fn run_cast(
     });
     let half_ttl = Duration::from_millis(LEASE_TTL_MS / 2);
     lease_timer.update_timer(Some(half_ttl), Some(half_ttl));
+
+    // The keepalive is the cycle source of last resort: while Streaming, it
+    // runs `process` even when no compositor frame arrived, so
+    // consumer-returned buffers are reclaimed (releasing their compositor
+    // slots) and a frame held back by pool starvation is retried.
+    let keepalive_stream = stream.downgrade();
+    let keepalive_timer = mainloop.loop_().add_timer(move |_| {
+        if !streaming.get() {
+            return;
+        }
+        let Some(stream) = keepalive_stream.upgrade() else {
+            return;
+        };
+        if let Err(error) = stream.trigger_process() {
+            log::debug!("portal: keepalive trigger_process failed: {error}");
+        }
+    });
+    keepalive_timer.update_timer(Some(KEEPALIVE_INTERVAL), Some(KEEPALIVE_INTERVAL));
 
     let mut format_refs: Vec<&Pod> = format_bytes
         .iter()
@@ -682,6 +849,7 @@ mod tests {
         parse_format_param, spa_format_for_drm,
     };
     use super::frame::{FramePayload, validate_frame};
+    use super::meta::{MAX_DAMAGE_REGIONS, damage_meta_pod, parse_meta_pod};
 
     fn pod_words(bytes: &[u8]) -> &[u32] {
         let (head, words, tail) = unsafe { bytes.align_to::<u32>() };
@@ -912,5 +1080,16 @@ mod tests {
         let mut dest = vec![0_u8; 8];
         copy_rows(&src, 16, &mut dest, 4, 2);
         assert_eq!(dest, [0, 1, 2, 3, 16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn damage_meta_offer_is_video_damage_with_region_capacity() {
+        let bytes = damage_meta_pod();
+        let (meta_type, size) = parse_meta_pod(&bytes).expect("parseable meta pod");
+        assert_eq!(meta_type, spa_sys::SPA_META_VideoDamage);
+        assert_eq!(
+            size as usize,
+            MAX_DAMAGE_REGIONS * std::mem::size_of::<spa_sys::spa_meta_region>()
+        );
     }
 }

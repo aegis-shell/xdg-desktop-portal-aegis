@@ -64,21 +64,30 @@ impl Drop for PoolMem {
 }
 
 /// Map a frame descriptor and copy the pixels into a shared-pool buffer.
-/// Sealed memfds and mappable dmabufs take the same path.
+/// Sealed memfds and mappable dmabufs take the same path. `width`/`height`
+/// come from the caller's transport borrow (the publish path already holds
+/// it); `damage` rides to the queued buffer's VideoDamage metadata.
+///
+/// Returns `false` only when the pool had no free buffer, so the caller
+/// keeps the frame pending and a later cycle retries it. Every other
+/// outcome — published, or dropped for a permanent reason — returns `true`.
 pub(crate) fn copy_into_pool(
     stream: &pw::stream::Stream,
     data: &StreamData,
     file: &File,
     stride: u32,
-) {
-    let height = data.height as usize;
-    let row_bytes = data.width as usize * 4;
+    width: u32,
+    height: u32,
+    damage: &[aegis_portal_ipc::Rect],
+) -> bool {
+    let height = height as usize;
+    let row_bytes = width as usize * 4;
     let stride = stride as usize;
 
     let Ok(src_len) = file.metadata().map(|meta| meta.len() as usize) else {
         data.dropped_frames.set(data.dropped_frames.get() + 1);
         log::debug!("portal: could not stat the frame descriptor");
-        return;
+        return true;
     };
     let needed = stride * (height - 1) + row_bytes;
     if src_len < needed || needed > MAX_FRAME_BYTES {
@@ -86,7 +95,7 @@ pub(crate) fn copy_into_pool(
         log::warn!(
             "portal: frame payload of {src_len} bytes cannot hold {height} rows of stride {stride}"
         );
-        return;
+        return true;
     }
     // SAFETY: the descriptor outlives the mapping; the caller owns it.
     let map = unsafe {
@@ -113,47 +122,54 @@ pub(crate) fn copy_into_pool(
                 io::Error::last_os_error()
             );
         }
-        return;
+        return true;
     }
 
-    let pool_raw = data
+    let Some(pool_raw) = data
         .pool
         .borrow_mut()
         .pop()
-        .or_else(|| NonNull::new(unsafe { stream.dequeue_raw_buffer() }).map(NonNull::as_ptr));
-    let published = match pool_raw {
-        Some(pool_raw) => unsafe {
-            // SAFETY: `pool_raw` is a live pool buffer of this stream,
-            // dequeued on this thread; its first spa_data is a mapped memory
-            // block of `maxsize` bytes.
-            let spa_buffer = (*pool_raw).buffer;
-            let spa_data = (*spa_buffer).datas;
-            let dest_ptr = (*spa_data).data.cast::<u8>();
-            let dest_cap = (*spa_data).maxsize as usize;
-            if dest_ptr.is_null() || dest_cap < height * row_bytes {
-                data.pool.borrow_mut().push(pool_raw);
-                false
-            } else {
-                let dest = std::slice::from_raw_parts_mut(dest_ptr, dest_cap);
-                let src = std::slice::from_raw_parts(map.cast::<u8>(), src_len);
-                copy_rows(src, stride, dest, row_bytes, height);
-                let chunk = (*spa_data).chunk;
-                (*chunk).offset = 0;
-                (*chunk).size = (height * row_bytes) as u32;
-                (*chunk).stride = row_bytes as i32;
-                (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
-                stream.queue_raw_buffer(pool_raw);
-                true
-            }
-        },
-        None => false,
+        .or_else(|| NonNull::new(unsafe { stream.dequeue_raw_buffer() }).map(NonNull::as_ptr))
+    else {
+        // Pool starvation is transient: the consumer returns buffers on
+        // later cycles, and the caller keeps the frame pending for a retry.
+        // SAFETY: `map`/`src_len` name the live mapping created above.
+        unsafe { libc::munmap(map, src_len) };
+        log::debug!("portal: no free PipeWire buffer; holding frame for the next cycle");
+        return false;
+    };
+    let published = unsafe {
+        // SAFETY: `pool_raw` is a live pool buffer of this stream,
+        // dequeued on this thread; its first spa_data is a mapped memory
+        // block of `maxsize` bytes.
+        let spa_buffer = (*pool_raw).buffer;
+        let spa_data = (*spa_buffer).datas;
+        let dest_ptr = (*spa_data).data.cast::<u8>();
+        let dest_cap = (*spa_data).maxsize as usize;
+        if dest_ptr.is_null() || dest_cap < height * row_bytes {
+            data.pool.borrow_mut().push(pool_raw);
+            false
+        } else {
+            let dest = std::slice::from_raw_parts_mut(dest_ptr, dest_cap);
+            let src = std::slice::from_raw_parts(map.cast::<u8>(), src_len);
+            copy_rows(src, stride, dest, row_bytes, height);
+            let chunk = (*spa_data).chunk;
+            (*chunk).offset = 0;
+            (*chunk).size = (height * row_bytes) as u32;
+            (*chunk).stride = row_bytes as i32;
+            (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
+            super::meta::attach_damage(pool_raw, damage, width, height as u32);
+            stream.queue_raw_buffer(pool_raw);
+            true
+        }
     };
     if !published {
         data.dropped_frames.set(data.dropped_frames.get() + 1);
-        log::debug!("portal: no free PipeWire buffer; dropping frame");
+        log::debug!("portal: pool buffer could not hold the frame; dropping frame");
     }
     // SAFETY: `map`/`src_len` name the live mapping created above.
     unsafe { libc::munmap(map, src_len) };
+    true
 }
 
 /// Copy `height` rows of `row_bytes` from a source with the given row

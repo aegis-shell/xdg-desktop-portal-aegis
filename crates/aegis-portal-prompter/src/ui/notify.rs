@@ -33,6 +33,7 @@ use lens::{Align, Frame, Input, LayoutOpts};
 
 use super::style::{self, metrics};
 use super::{close_window, escape_pressed, run_window, truncate_to_width};
+use crate::wire::Wire;
 
 /// One live notification card.
 struct Card {
@@ -134,11 +135,11 @@ fn expire_cards(state: &mut State) -> bool {
     state.cards.iter().any(|card| card.deadline.is_some())
 }
 
-pub fn run_daemon() -> ExitCode {
+pub fn run_daemon(wire: Wire) -> ExitCode {
     let (commands, command_rx) = mpsc::channel::<NotifyCommand>();
     let (events, event_rx) = mpsc::channel::<NotifyEvent>();
     spawn_reader(commands);
-    let writer = spawn_writer(event_rx);
+    let writer = spawn_writer(event_rx, wire);
 
     let mut state = State {
         cards: Vec::new(),
@@ -224,13 +225,13 @@ fn spawn_reader(commands: mpsc::Sender<NotifyCommand>) {
         });
 }
 
-/// The stdout writer: one event per line, until the channel closes.
-fn spawn_writer(events: mpsc::Receiver<NotifyEvent>) -> std::thread::JoinHandle<()> {
+/// The protocol writer: one event per line on the private wire, until the
+/// channel closes.
+fn spawn_writer(events: mpsc::Receiver<NotifyEvent>, wire: Wire) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("aegis-notify-stdout".to_owned())
         .spawn(move || {
-            let stdout = std::io::stdout();
-            let mut out = std::io::BufWriter::new(stdout.lock());
+            let mut out = std::io::BufWriter::new(wire);
             while let Ok(event) = events.recv() {
                 let Ok(line) = EventFrame::new(event).encode() else {
                     continue;

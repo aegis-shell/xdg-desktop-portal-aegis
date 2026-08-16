@@ -11,7 +11,7 @@ through the narrow Aegis IPC contract described in
 |---------|------------------|-----------------|
 | Public portal ABI | D-Bus adapters, request lifecycle, result encoding | None |
 | Portal UI | FileChooser, Account confirmation, Secret password input | Window parenting through standard Wayland protocols |
-| Runtime wire client | Protocol-24 projection and sealed-memfd receiver | Protocol server and authorization |
+| Runtime wire client | Protocol-29 projection and sealed-memfd receiver | Protocol server and authorization |
 | Compositor resources | Validation, persistence, PipeWire publication | Settings, pixels, target selection, capture consent, frame streams |
 | Source dependencies | Portal workspace crates, registry packages, and the tagged optics (iris/lens) bindings | No Portal build dependency |
 

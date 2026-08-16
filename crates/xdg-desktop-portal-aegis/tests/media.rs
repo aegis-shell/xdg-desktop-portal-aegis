@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use aegis_portal_ipc::testing::{
     CaptureOutputPayload, Handler, Server, StreamFramePayload, StreamInfo,
 };
-use aegis_portal_ipc::{ConfirmPickResult, PickKind, PickResult, StreamPixelFormat, StreamTarget};
+use aegis_portal_ipc::{
+    ConfirmPickResult, PickKind, PickResult, StreamCursorMode, StreamPixelFormat, StreamTarget,
+};
 use zbus::blocking::Proxy;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
@@ -31,8 +33,13 @@ const PNG: &[u8] = &[
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
-/// One recorded `StreamOutputStart`: fps cap, target, dmabuf opt-in.
-type StreamStart = (Option<u32>, StreamTarget, Option<bool>);
+/// One recorded `StreamOutputStart`: fps cap, target, dmabuf opt-in, cursor.
+type StreamStart = (
+    Option<u32>,
+    StreamTarget,
+    Option<bool>,
+    Option<StreamCursorMode>,
+);
 
 #[derive(Default)]
 struct FakeCompositor {
@@ -42,9 +49,15 @@ struct FakeCompositor {
     stream_starts: Mutex<Vec<StreamStart>>,
     stream_stops: Mutex<Vec<u64>>,
     stream_disconnects: Mutex<Vec<u64>>,
+    /// The outputs `EnumerateOutputs` reports; a single HDMI-A-1 by
+    /// default (which keeps per-output entries off the source chooser).
+    outputs: Mutex<Vec<aegis_portal_ipc::OutputInfo>>,
     /// Per-stream announced formats, consumed in start order; streams start
     /// as Bgra8 when the queue is empty.
     stream_formats: Mutex<Vec<StreamPixelFormat>>,
+    /// Per-stream announced geometries, consumed in start order; streams
+    /// start as 2x2 when the queue is empty.
+    stream_sizes: Mutex<Vec<(u32, u32)>>,
     /// Stream ids handed out in start order, mirroring the compositor.
     next_stream_id: Mutex<u64>,
     /// Offer a protocol-25 slot table on dmabuf-opted-in streams.
@@ -54,6 +67,19 @@ struct FakeCompositor {
     slot_files: Mutex<Vec<std::fs::File>>,
     /// Slot releases received from the portal (protocol 25).
     releases: Mutex<Vec<(u64, u32)>>,
+    /// The connection that last started a stream (the cast connection).
+    stream_conn: Mutex<Option<u64>>,
+}
+
+impl FakeCompositor {
+    /// The default single output; tests with more push their own list.
+    fn one_output() -> aegis_portal_ipc::OutputInfo {
+        aegis_portal_ipc::OutputInfo {
+            connector: "HDMI-A-1".into(),
+            primary: true,
+            rect: aegis_portal_ipc::Rect::new(0, 0, 1920, 1080),
+        }
+    }
 }
 
 impl Handler for FakeCompositor {
@@ -69,6 +95,14 @@ impl Handler for FakeCompositor {
         })
     }
 
+    fn enumerate_outputs(&self) -> Result<Vec<aegis_portal_ipc::OutputInfo>, String> {
+        let outputs = self.outputs.lock().unwrap();
+        if outputs.is_empty() {
+            return Ok(vec![Self::one_output()]);
+        }
+        Ok(outputs.clone())
+    }
+
     fn pick_target(&self, _conn_id: u64, kind: PickKind) -> Result<PickResult, String> {
         self.picks.lock().unwrap().push(kind);
         Ok(match kind {
@@ -79,7 +113,12 @@ impl Handler for FakeCompositor {
                 point: aegis_portal_ipc::Point { x: 4, y: 8 },
                 rgb: [255, 128, 0],
             },
-            PickKind::Window => PickResult::Cancelled,
+            PickKind::Window => PickResult::Window {
+                id: aegis_portal_ipc::WindowId(7),
+            },
+            PickKind::Output => PickResult::Output {
+                connector: Some("HDMI-A-1".into()),
+            },
         })
     }
 
@@ -96,15 +135,17 @@ impl Handler for FakeCompositor {
 
     fn stream_output_start(
         &self,
-        _conn_id: u64,
+        conn_id: u64,
         max_fps: Option<u32>,
         target: StreamTarget,
         dmabuf: Option<bool>,
+        cursor: Option<StreamCursorMode>,
     ) -> Result<StreamInfo, String> {
+        *self.stream_conn.lock().unwrap() = Some(conn_id);
         self.stream_starts
             .lock()
             .unwrap()
-            .push((max_fps, target, dmabuf));
+            .push((max_fps, target, dmabuf, cursor));
         let stream_id = {
             let mut id = self.next_stream_id.lock().unwrap();
             *id += 1;
@@ -114,6 +155,14 @@ impl Handler for FakeCompositor {
             let mut queue = self.stream_formats.lock().unwrap();
             if queue.is_empty() {
                 StreamPixelFormat::Bgra8
+            } else {
+                queue.remove(0)
+            }
+        };
+        let (width, height) = {
+            let mut queue = self.stream_sizes.lock().unwrap();
+            if queue.is_empty() {
+                (2, 2)
             } else {
                 queue.remove(0)
             }
@@ -140,8 +189,8 @@ impl Handler for FakeCompositor {
         }
         Ok(StreamInfo {
             stream_id,
-            width: 2,
-            height: 2,
+            width,
+            height,
             format,
             slots,
         })
@@ -516,11 +565,29 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
     let fake = Arc::new(FakeCompositor::default());
     let server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
         .expect("bind fake compositor IPC");
+    // The monitor|window SelectSources below gets a chooser with two
+    // options (desktop, window); the scripted prompter picks the desktop.
+    let prompter_dir = temp_dir("cast-prompter");
+    let prompter = common::fake_prompter(&prompter_dir);
+    common::write_prompter_response(
+        &prompter_dir,
+        1,
+        &aegis_portal_prompter::PrompterResponse::choose_source(
+            aegis_portal_prompter::ChooseSourceResponse::Selected {
+                source: "desktop".into(),
+                remember: false,
+            },
+        ),
+    );
     let backend_log = runtime_dir.join("backend.log");
     let mut backend = daemon_command(&bus, &data_dir, &runtime_dir);
-    backend.env("RUST_LOG", "debug").stderr(Stdio::from(
-        std::fs::File::create(&backend_log).expect("backend log"),
-    ));
+    backend
+        .env("RUST_LOG", "debug")
+        .env("AEGIS_PORTAL_PROMPTER", &prompter)
+        .env("AEGIS_PROMPTER_FIXTURE", &prompter_dir)
+        .stderr(Stdio::from(
+            std::fs::File::create(&backend_log).expect("backend log"),
+        ));
     let _daemon = KillOnDrop(backend.spawn().expect("spawn portal daemon"));
     wait_for_name(&conn, PORTAL);
 
@@ -605,7 +672,12 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
     assert_ne!(serial, 0, "v6 requires a stable PipeWire serial");
     assert_eq!(
         fake.stream_starts.lock().unwrap().as_slice(),
-        &[(Some(60), StreamTarget::Output, Some(true))]
+        &[(
+            Some(60),
+            StreamTarget::Output { output: None },
+            Some(true),
+            Some(StreamCursorMode::Hidden)
+        )]
     );
 
     // Consume one raw frame from the exact node through an independent
@@ -666,7 +738,7 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
 
 #[path = "media/pipewire_consumer.rs"]
 mod pipewire_consumer;
-use pipewire_consumer::{Received, consume_one_frame};
+use pipewire_consumer::{Received, consume_one_frame, consume_one_frame_damage};
 
 /// DRM_FORMAT_XRGB8888: the fourcc the compositor announces for its
 /// single-plane BGRA8-class dmabuf exports.
@@ -821,7 +893,12 @@ fn dmabuf_cast_fixture(
     let (node_id, _) = start_cast_session(&conn, &session_path, tag);
     assert_eq!(
         fake.stream_starts.lock().unwrap().as_slice(),
-        &[(Some(60), StreamTarget::Output, Some(true))]
+        &[(
+            Some(60),
+            StreamTarget::Output { output: None },
+            Some(true),
+            Some(StreamCursorMode::Hidden)
+        )]
     );
     Some(DmabufCastFixture {
         fake,
@@ -1093,8 +1170,18 @@ fn screencast_switches_tiled_slot_streams_to_shm_readback() {
             assert_eq!(
                 restarts.as_slice(),
                 &[
-                    (Some(60), StreamTarget::Output, Some(true)),
-                    (Some(60), StreamTarget::Output, None),
+                    (
+                        Some(60),
+                        StreamTarget::Output { output: None },
+                        Some(true),
+                        Some(StreamCursorMode::Hidden)
+                    ),
+                    (
+                        Some(60),
+                        StreamTarget::Output { output: None },
+                        None,
+                        Some(StreamCursorMode::Hidden)
+                    ),
                 ]
             );
             break;
@@ -1129,4 +1216,648 @@ fn screencast_switches_tiled_slot_streams_to_shm_readback() {
         .expect("consumer thread")
         .expect("frame delivery");
     assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+}
+
+/// Two slot frames arriving without an intervening PipeWire process cycle:
+/// the first frame is superseded while still pending, and its slot has no
+/// other release path — a published slot's release is owned by its pool
+/// binding or went out on the copy path. The overwrite must release the
+/// superseded slot, or the compositor's slot ring permanently shrinks.
+#[test]
+fn screencast_releases_a_superseded_pending_slot_frame() {
+    let Some(fixture) = dmabuf_cast_fixture("pendingslot", true, linear_dmabuf_formats()) else {
+        return;
+    };
+    // No consumer links, so the stream never reaches Streaming and no
+    // process cycle runs between the two frames.
+    push_slot_frame(&fixture, 0);
+    push_slot_frame(&fixture, 1);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.fake.releases.lock().unwrap().contains(&(1, 0)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the superseded slot frame's release never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The superseding frame is still pending; it must not be released
+    // before it is published (its release belongs to the publish path).
+    assert!(!fixture.fake.releases.lock().unwrap().contains(&(1, 1)));
+}
+
+/// A running cast environment for the protocol-29 surface tests: private
+/// bus, isolated PipeWire stack, fake compositor, scripted one-shot
+/// prompter, and daemon. Guards drop in declaration order.
+struct CastEnv {
+    conn: zbus::blocking::Connection,
+    fake: Arc<FakeCompositor>,
+    server: Server,
+    runtime_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    prompter_dir: std::path::PathBuf,
+    _daemon: KillOnDrop,
+    _stack: (KillOnDrop, KillOnDrop),
+    _bus: common::PrivateBus,
+}
+
+impl Drop for CastEnv {
+    fn drop(&mut self) {
+        if std::env::var_os("AEGIS_PORTAL_E2E_KEEP").is_some() {
+            return;
+        }
+        std::fs::remove_dir_all(&self.runtime_dir).ok();
+        std::fs::remove_dir_all(&self.data_dir).ok();
+        std::fs::remove_dir_all(&self.prompter_dir).ok();
+    }
+}
+
+fn cast_env(
+    tag: &str,
+    outputs: Vec<aegis_portal_ipc::OutputInfo>,
+    responses: &[aegis_portal_prompter::PrompterResponse],
+) -> Option<CastEnv> {
+    let Some(bus) = private_bus() else {
+        if pipewire_e2e_required() {
+            panic!("dbus-daemon unavailable");
+        }
+        eprintln!("cast PipeWire E2E: no dbus-daemon, skipping");
+        return None;
+    };
+    let conn = bus.connect();
+    let data_dir = temp_dir(&format!("cast-{tag}-data"));
+    let runtime_dir = temp_dir(&format!("cast-{tag}-runtime"));
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure PipeWire runtime directory");
+    let Some(stack) = spawn_pipewire_stack(bus.address(), &runtime_dir) else {
+        std::fs::remove_dir_all(data_dir).ok();
+        std::fs::remove_dir_all(runtime_dir).ok();
+        return None;
+    };
+    let fake = Arc::new(FakeCompositor::default());
+    *fake.outputs.lock().unwrap() = outputs;
+    let server = Server::start(&runtime_dir.join("aegis.sock"), Arc::clone(&fake))
+        .expect("bind fake compositor IPC");
+    let prompter_dir = temp_dir(&format!("cast-{tag}-prompter"));
+    let prompter = common::fake_prompter(&prompter_dir);
+    for (index, response) in responses.iter().enumerate() {
+        common::write_prompter_response(&prompter_dir, (index + 1) as u32, response);
+    }
+    let backend_log = runtime_dir.join("backend.log");
+    let mut backend = daemon_command(&bus, &data_dir, &runtime_dir);
+    backend
+        .env("RUST_LOG", "debug")
+        .env("AEGIS_PORTAL_PROMPTER", &prompter)
+        .env("AEGIS_PROMPTER_FIXTURE", &prompter_dir)
+        .stderr(Stdio::from(
+            std::fs::File::create(&backend_log).expect("backend log"),
+        ));
+    let daemon = KillOnDrop(backend.spawn().expect("spawn portal daemon"));
+    wait_for_name(&conn, PORTAL);
+    Some(CastEnv {
+        conn,
+        fake,
+        server,
+        runtime_dir,
+        data_dir,
+        prompter_dir,
+        _daemon: daemon,
+        _stack: stack,
+        _bus: bus,
+    })
+}
+
+fn two_outputs() -> Vec<aegis_portal_ipc::OutputInfo> {
+    vec![
+        aegis_portal_ipc::OutputInfo {
+            connector: "HDMI-A-1".into(),
+            primary: true,
+            rect: aegis_portal_ipc::Rect::new(0, 0, 1920, 1080),
+        },
+        aegis_portal_ipc::OutputInfo {
+            connector: "DP-1".into(),
+            primary: false,
+            rect: aegis_portal_ipc::Rect::new(1920, 0, 2560, 1440),
+        },
+    ]
+}
+
+fn create_session(conn: &zbus::blocking::Connection, tag: &str) -> String {
+    let screencast = Proxy::new(
+        conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.impl.portal.ScreenCast",
+    )
+    .expect("ScreenCast proxy");
+    let session_path = format!("/org/freedesktop/portal/desktop/session/1/{tag}");
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "CreateSession",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_create"
+                )),
+                handle(&session_path),
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("CreateSession");
+    assert_eq!(code, 0);
+    session_path
+}
+
+fn select_sources(
+    conn: &zbus::blocking::Connection,
+    session_path: &str,
+    tag: &str,
+    options: HashMap<String, Value<'_>>,
+) -> u32 {
+    let screencast = Proxy::new(
+        conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.impl.portal.ScreenCast",
+    )
+    .expect("ScreenCast proxy");
+    let (code, _): (u32, HashMap<String, OwnedValue>) = screencast
+        .call(
+            "SelectSources",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_select"
+                )),
+                handle(session_path),
+                "",
+                options,
+            ),
+        )
+        .expect("SelectSources");
+    code
+}
+
+fn start_session(
+    conn: &zbus::blocking::Connection,
+    session_path: &str,
+    tag: &str,
+) -> (u32, HashMap<String, OwnedValue>) {
+    let screencast = Proxy::new(
+        conn,
+        PORTAL,
+        DESKTOP_PATH,
+        "org.freedesktop.impl.portal.ScreenCast",
+    )
+    .expect("ScreenCast proxy");
+    screencast
+        .call(
+            "Start",
+            &(
+                handle(&format!(
+                    "/org/freedesktop/portal/desktop/request/1/{tag}_start"
+                )),
+                handle(session_path),
+                "",
+                "",
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .expect("Start")
+}
+
+/// Read the `source_type` property of the single stream in a Start result.
+fn stream_source_type(results: &HashMap<String, OwnedValue>) -> u32 {
+    let streams = Value::from(results["streams"].clone());
+    let Value::Array(streams) = streams else {
+        panic!("streams result must be an array");
+    };
+    let Value::Structure(stream) = streams.get(0).expect("read stream").expect("one stream") else {
+        panic!("stream entry must be a structure");
+    };
+    let Value::Dict(properties) = &stream.fields()[1] else {
+        panic!("stream properties must be a dict");
+    };
+    properties
+        .iter()
+        .find_map(|(key, value)| {
+            let Value::Str(key) = key else { return None };
+            if key.as_str() != "source_type" {
+                return None;
+            }
+            let Value::Value(value) = value else {
+                return None;
+            };
+            u32::try_from(value.as_ref()).ok()
+        })
+        .expect("stream must include source_type")
+}
+
+/// Read the `position` property of the single stream in a Start result.
+fn stream_position(results: &HashMap<String, OwnedValue>) -> (i32, i32) {
+    let streams = Value::from(results["streams"].clone());
+    let Value::Array(streams) = streams else {
+        panic!("streams result must be an array");
+    };
+    let Value::Structure(stream) = streams.get(0).expect("read stream").expect("one stream") else {
+        panic!("stream entry must be a structure");
+    };
+    let Value::Dict(properties) = &stream.fields()[1] else {
+        panic!("stream properties must be a dict");
+    };
+    properties
+        .iter()
+        .find_map(|(key, value)| {
+            let Value::Str(key) = key else { return None };
+            if key.as_str() != "position" {
+                return None;
+            }
+            let Value::Value(value) = value else {
+                return None;
+            };
+            let Value::Structure(position) = value.as_ref() else {
+                return None;
+            };
+            let x = i32::try_from(&position.fields()[0]).ok()?;
+            let y = i32::try_from(&position.fields()[1]).ok()?;
+            Some((x, y))
+        })
+        .expect("stream must include position")
+}
+
+/// Wait until `condition` holds, with the standard E2E deadline.
+fn wait_until(condition: impl Fn() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{message}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A two-output compositor gets per-output chooser entries; selecting one
+/// names its connector in the compositor stream start, the confirmation
+/// names the concrete output, and the negotiated cursor mode crosses the
+/// wire (protocol 29).
+#[test]
+fn screencast_selects_a_single_output_and_embeds_cursor() {
+    let Some(env) = cast_env(
+        "persel",
+        two_outputs(),
+        &[aegis_portal_prompter::PrompterResponse::choose_source(
+            aegis_portal_prompter::ChooseSourceResponse::Selected {
+                source: "output:DP-1".into(),
+                remember: false,
+            },
+        )],
+    ) else {
+        return;
+    };
+    let session_path = create_session(&env.conn, "persel");
+    let code = select_sources(
+        &env.conn,
+        &session_path,
+        "persel",
+        HashMap::from([
+            ("types".to_string(), Value::from(1_u32)),
+            ("cursor_mode".to_string(), Value::from(2_u32)),
+        ]),
+    );
+    assert_eq!(code, 0);
+
+    // The chooser saw desktop + both connectors, and consent named DP-1.
+    let request = common::read_prompter_request(&env.prompter_dir, 1);
+    let aegis_portal_prompter::PromptRequest::ChooseSource(request) = request else {
+        panic!("expected a choose_source prompter request");
+    };
+    let ids: Vec<&str> = request
+        .options
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect();
+    assert_eq!(ids, ["desktop", "output:HDMI-A-1", "output:DP-1"]);
+    assert!(!request.remember_offered);
+    let confirms = env.fake.confirms.lock().unwrap().clone();
+    assert_eq!(confirms.len(), 1);
+    assert!(
+        confirms[0].1.contains("record output DP-1"),
+        "consent names the concrete output: {confirms:?}"
+    );
+
+    let (code, results) = start_session(&env.conn, &session_path, "persel");
+    assert_eq!(code, 0, "Start: {results:?}");
+    assert_eq!(stream_source_type(&results), 1);
+    assert_eq!(stream_position(&results), (1920, 0));
+    assert!(!results.contains_key("persist_mode"));
+    assert_eq!(
+        env.fake.stream_starts.lock().unwrap().as_slice(),
+        &[(
+            Some(60),
+            StreamTarget::Output {
+                output: Some("DP-1".into())
+            },
+            Some(true),
+            Some(StreamCursorMode::Embedded)
+        )]
+    );
+}
+
+/// A window selection goes through the compositor's interactive toplevel
+/// pick and starts a window stream; the stream result carries source_type
+/// window.
+#[test]
+fn screencast_window_selection_streams_the_window() {
+    let Some(env) = cast_env(
+        "winsel",
+        Vec::new(),
+        &[aegis_portal_prompter::PrompterResponse::choose_source(
+            aegis_portal_prompter::ChooseSourceResponse::Selected {
+                source: "window".into(),
+                remember: false,
+            },
+        )],
+    ) else {
+        return;
+    };
+    let session_path = create_session(&env.conn, "winsel");
+    let code = select_sources(
+        &env.conn,
+        &session_path,
+        "winsel",
+        HashMap::from([("types".to_string(), Value::from(0b11_u32))]),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(
+        env.fake.picks.lock().unwrap().as_slice(),
+        &[PickKind::Window]
+    );
+    let confirms = env.fake.confirms.lock().unwrap().clone();
+    assert_eq!(confirms.len(), 1);
+    assert!(
+        confirms[0].1.contains("record the selected window"),
+        "consent names the window: {confirms:?}"
+    );
+
+    let (code, results) = start_session(&env.conn, &session_path, "winsel");
+    assert_eq!(code, 0, "Start: {results:?}");
+    assert_eq!(stream_source_type(&results), 2);
+    assert_eq!(
+        env.fake.stream_starts.lock().unwrap().as_slice(),
+        &[(
+            Some(60),
+            StreamTarget::Window {
+                window: aegis_portal_ipc::WindowId(7)
+            },
+            Some(true),
+            Some(StreamCursorMode::Hidden)
+        )]
+    );
+}
+
+/// persist_mode 1 with the remember tick issues a restore token; a later
+/// session presenting it restores the selection with no chooser and no
+/// compositor consent, and Start re-issues the same token.
+#[test]
+fn screencast_persist_restore_round_trip() {
+    let Some(env) = cast_env(
+        "persist",
+        two_outputs(),
+        &[aegis_portal_prompter::PrompterResponse::choose_source(
+            aegis_portal_prompter::ChooseSourceResponse::Selected {
+                source: "desktop".into(),
+                remember: true,
+            },
+        )],
+    ) else {
+        return;
+    };
+    let session_path = create_session(&env.conn, "persist1");
+    let code = select_sources(
+        &env.conn,
+        &session_path,
+        "persist1",
+        HashMap::from([
+            ("types".to_string(), Value::from(1_u32)),
+            ("persist_mode".to_string(), Value::from(1_u32)),
+        ]),
+    );
+    assert_eq!(code, 0);
+    let (code, results) = start_session(&env.conn, &session_path, "persist1");
+    assert_eq!(code, 0, "Start: {results:?}");
+    let persist_mode = u32::try_from(results["persist_mode"].clone()).expect("persist_mode");
+    assert_eq!(persist_mode, 1);
+    let token = String::try_from(results["restore_token"].clone()).expect("restore_token");
+    assert_eq!(token.len(), 32);
+    assert!(
+        env.data_dir
+            .join("aegis-portal/screencast-restore.json")
+            .is_file(),
+        "the mode-1 token store landed under XDG_DATA_HOME"
+    );
+
+    // A later session presenting the token skips every dialog.
+    let restored_path = create_session(&env.conn, "persist2");
+    let code = select_sources(
+        &env.conn,
+        &restored_path,
+        "persist2",
+        HashMap::from([
+            ("types".to_string(), Value::from(1_u32)),
+            ("persist_mode".to_string(), Value::from(1_u32)),
+            ("restore_token".to_string(), Value::from(token.clone())),
+        ]),
+    );
+    assert_eq!(code, 0);
+    assert!(
+        !env.prompter_dir.join("request-2.json").exists(),
+        "a restored selection must not open the chooser"
+    );
+    assert_eq!(
+        env.fake.confirms.lock().unwrap().len(),
+        1,
+        "a restored selection must not ask for compositor consent again"
+    );
+    let (code, results) = start_session(&env.conn, &restored_path, "persist2");
+    assert_eq!(code, 0, "Start: {results:?}");
+    let persist_mode = u32::try_from(results["persist_mode"].clone()).expect("persist_mode");
+    assert_eq!(persist_mode, 1);
+    let restored_token = String::try_from(results["restore_token"].clone()).expect("restore_token");
+    assert_eq!(restored_token, token, "the token is re-issued unchanged");
+}
+
+/// A compositor geometry change restarts the stream with the same target,
+/// cursor mode, and dmabuf opt-in, and the PipeWire consumer renegotiates
+/// to the new geometry.
+#[test]
+fn screencast_geometry_change_restarts_and_renegotiates() {
+    let Some(env) = cast_env("geom", Vec::new(), &[]) else {
+        return;
+    };
+    *env.fake.stream_sizes.lock().unwrap() = vec![(2, 2), (4, 4)];
+    let session_path = create_session(&env.conn, "geom");
+    let code = select_sources(&env.conn, &session_path, "geom", HashMap::new());
+    assert_eq!(code, 0);
+    let (code, results) = start_session(&env.conn, &session_path, "geom");
+    assert_eq!(code, 0, "Start: {results:?}");
+    let (node_id, _) = stream_details(&results);
+
+    assert!(env.server.push_stream_geometry_changed(1, 4, 4));
+    wait_until(
+        || {
+            env.fake.stream_stops.lock().unwrap().contains(&1)
+                && env.fake.stream_starts.lock().unwrap().len() == 2
+        },
+        "the compositor stream never restarted for the geometry change",
+    );
+    assert_eq!(
+        env.fake.stream_starts.lock().unwrap().as_slice(),
+        &[
+            (
+                Some(60),
+                StreamTarget::Output { output: None },
+                Some(true),
+                Some(StreamCursorMode::Hidden)
+            ),
+            (
+                Some(60),
+                StreamTarget::Output { output: None },
+                Some(true),
+                Some(StreamCursorMode::Hidden)
+            ),
+        ],
+        "the restart reuses the live transport's target, cursor, and dmabuf opt-in"
+    );
+
+    // A consumer linking now negotiates the new 4x4 geometry and receives
+    // the restarted stream's frames.
+    let socket = env.runtime_dir.join("pipewire-0");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame(
+            &socket,
+            node_id,
+            4,
+            4,
+            false,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated at the new geometry");
+    let pixels = [0x42_u8; 64];
+    assert!(env.server.push_stream_frame(StreamFramePayload {
+        stream_id: 2,
+        sequence: 1,
+        width: 4,
+        height: 4,
+        stride: 16,
+        format: StreamPixelFormat::Bgra8,
+        damage: vec![aegis_portal_ipc::Rect::new(0, 0, 4, 4)],
+        dropped: 0,
+        pixels: pixels.to_vec().into(),
+    }));
+    let received = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery after the geometry change");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+}
+
+/// A restart that answers a geometry different from the announced change
+/// fails the stream cleanly: the cast stops, the IPC connection drops, and
+/// the session closes instead of publishing mismatched frames.
+#[test]
+fn screencast_geometry_mismatch_fails_the_stream() {
+    let Some(env) = cast_env("geomx", Vec::new(), &[]) else {
+        return;
+    };
+    // The restart answers the OLD geometry (the sizes queue only covers
+    // the first start), which never matches the announced 4x4 change.
+    let session_path = create_session(&env.conn, "geomx");
+    let code = select_sources(&env.conn, &session_path, "geomx", HashMap::new());
+    assert_eq!(code, 0);
+    let (code, results) = start_session(&env.conn, &session_path, "geomx");
+    assert_eq!(code, 0, "Start: {results:?}");
+
+    assert!(env.server.push_stream_geometry_changed(1, 4, 4));
+    // The mismatched restart still stops and restarts the stream, then the
+    // cast fails: its IPC connection (the one that started the stream)
+    // disconnects instead of publishing mismatched frames.
+    wait_until(
+        || {
+            env.fake.stream_stops.lock().unwrap().contains(&1)
+                && env.fake.stream_starts.lock().unwrap().len() == 2
+        },
+        "a mismatched geometry restart must stop and restart the stream",
+    );
+    let cast_conn = env
+        .fake
+        .stream_conn
+        .lock()
+        .unwrap()
+        .expect("the cast started a stream");
+    wait_until(
+        || {
+            env.fake
+                .stream_disconnects
+                .lock()
+                .unwrap()
+                .contains(&cast_conn)
+        },
+        "a mismatched geometry restart must fail the stream",
+    );
+}
+
+/// The compositor's per-frame damage rects reach the consumer as
+/// `SPA_META_VideoDamage` metadata on the published buffer.
+#[test]
+fn screencast_damage_reaches_the_consumer() {
+    let Some(env) = cast_env("damage", Vec::new(), &[]) else {
+        return;
+    };
+    let session_path = create_session(&env.conn, "damage");
+    let code = select_sources(&env.conn, &session_path, "damage", HashMap::new());
+    assert_eq!(code, 0);
+    let (code, results) = start_session(&env.conn, &session_path, "damage");
+    assert_eq!(code, 0, "Start: {results:?}");
+    let (node_id, _) = stream_details(&results);
+
+    let socket = env.runtime_dir.join("pipewire-0");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_one_frame_damage(&socket, node_id, 2, 2, ready_tx, Duration::from_secs(8))
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+    let pixels = [0x9a_u8; 16];
+    assert!(env.server.push_stream_frame(StreamFramePayload {
+        stream_id: 1,
+        sequence: 1,
+        width: 2,
+        height: 2,
+        stride: 8,
+        format: StreamPixelFormat::Bgra8,
+        damage: vec![aegis_portal_ipc::Rect::new(0, 0, 1, 1)],
+        dropped: 0,
+        pixels: pixels.to_vec().into(),
+    }));
+    let (received, damage) = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery");
+    assert_eq!(received, Received::SharedMem(pixels.to_vec()));
+    assert_eq!(
+        damage,
+        vec![pipewire_consumer::DamageRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1
+        }],
+        "the compositor's damage rect must reach the consumer as VideoDamage meta"
+    );
 }
