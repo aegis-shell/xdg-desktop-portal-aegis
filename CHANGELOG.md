@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.15] - 2026-08-17
+
+### Fixed
+
+- ScreenCast frame delivery pacing and stream stutter in consumers like OBS:
+  - Negotiate and attach `SPA_META_Header` with monotonic `CLOCK_MONOTONIC`
+    presentation timestamps (`pts`) and sequence numbers to every PipeWire
+    buffer, ensuring consumer sync and preventing frame jitter.
+  - Lower the PipeWire stream keepalive timer from 16.6ms to 4ms, ensuring
+    consumer-returned buffers are reclaimed with sub-frame latency and
+    preventing circular wait deadlocks under `StreamFlags::DRIVER` mode.
+
 ## [0.0.14] - 2026-08-17
 
 ### Added
