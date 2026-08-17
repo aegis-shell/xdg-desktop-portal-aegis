@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.17] - 2026-08-17
+
+### Added
+
+- Multi-modifier cross-negotiation test verifying that PipeWire correctly matches and fixates GPU hardware DRM modifiers with standard multi-option client modifier offers without falling back to SHM.
+- Multi-frame continuous streaming and cadence test asserting reliable packet delivery, monotonic PTS timestamp tracking, and sequential buffer recycling across consecutive frames.
+- Support for offering preferred modifier format pods alongside fallback plain SHM pods in the test harness, matching production PipeWire consumer behavior.
+
 ## [0.0.16] - 2026-08-17
 
 ### Fixed
