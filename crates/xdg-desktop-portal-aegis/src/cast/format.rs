@@ -247,7 +247,7 @@ pub(crate) fn format_pod(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Enum {
                     default: modifier as i64,
-                    alternatives: Vec::new(),
+                    alternatives: vec![modifier as i64],
                 },
             ))),
         });
