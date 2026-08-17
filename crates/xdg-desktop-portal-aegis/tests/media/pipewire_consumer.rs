@@ -17,7 +17,7 @@ use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Recta
 use pw::stream::{StreamFlags, StreamState};
 
 /// What one received frame looked like at the buffer level.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Received {
     /// A producer-owned `SPA_DATA_DmaBuf` buffer (zero-copy forwarding).
     DmaBuf(Vec<u8>),
@@ -47,6 +47,210 @@ fn finish(data: &ConsumerData, result: Result<Received, String>) {
             mainloop.quit();
         }
     }
+}
+
+/// One received frame with its payload and attached metadata blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedFrame {
+    pub received: Received,
+    pub pts_nanos: Option<i64>,
+    pub seq: Option<u64>,
+    pub damage: Vec<DamageRect>,
+}
+
+struct MultiConsumerData {
+    results: Rc<RefCell<Vec<ReceivedFrame>>>,
+    error: Rc<RefCell<Option<String>>>,
+    target_count: usize,
+    loop_weak: pw::main_loop::MainLoopWeak,
+}
+
+/// Connect to the PipeWire daemon listening on `socket`, subscribe to
+/// `node_id`, and receive `count` frames with their attached metadata blocks.
+pub fn consume_frames_metadata(
+    socket: &Path,
+    node_id: u32,
+    width: u32,
+    height: u32,
+    modifiers: &[u64],
+    count: usize,
+    ready: std::sync::mpsc::Sender<()>,
+    timeout: Duration,
+) -> Result<Vec<ReceivedFrame>, String> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(pw::init);
+    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
+    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
+    let socket = UnixStream::connect(socket).map_err(|e| format!("connect {socket:?}: {e}"))?;
+    let core = context
+        .connect_fd_rc(std::os::fd::OwnedFd::from(socket), None)
+        .map_err(|e| e.to_string())?;
+    let stream = pw::stream::StreamRc::new(
+        core,
+        "aegis-portal-test-multi-consumer",
+        pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Video",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let results: Rc<RefCell<Vec<ReceivedFrame>>> = Rc::new(RefCell::new(Vec::new()));
+    let error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let has_modifiers = !modifiers.is_empty();
+    let _listener = stream
+        .add_local_listener_with_user_data(MultiConsumerData {
+            results: Rc::clone(&results),
+            error: Rc::clone(&error),
+            target_count: count,
+            loop_weak: mainloop.downgrade(),
+        })
+        .state_changed(move |_stream, data, _old, new| {
+            if new == StreamState::Streaming {
+                let _ = ready.send(());
+            }
+            if let StreamState::Error(message) = new {
+                *data.error.borrow_mut() = Some(format!("stream error: {message}"));
+                if let Some(mainloop) = data.loop_weak.upgrade() {
+                    mainloop.quit();
+                }
+            }
+        })
+        .param_changed(move |stream, _data, id, param| {
+            if id != spa::param::ParamType::Format.as_raw() || param.is_none() {
+                return;
+            }
+            let mask: u32 = if has_modifiers {
+                (1 << 2) | (1 << 3) // MemFd | DmaBuf
+            } else {
+                (1 << 1) | (1 << 2) // MemPtr | MemFd
+            };
+            let buffers = buffers_pod(mask);
+            let damage_meta = damage_meta_pod();
+            let header_meta = header_meta_pod();
+            let mut params = [
+                Pod::from_bytes(&buffers).expect("buffers pod"),
+                Pod::from_bytes(&damage_meta).expect("damage meta pod"),
+                Pod::from_bytes(&header_meta).expect("header meta pod"),
+            ];
+            let _ = stream.update_params(&mut params);
+        })
+        .process(|stream, data| {
+            while let Some(mut buffer) = stream.dequeue_buffer() {
+                let pts_nanos = buffer
+                    .find_meta::<spa::buffer::meta::MetaHeader>()
+                    .map(|h| h.as_raw().pts);
+                let seq = buffer
+                    .find_meta::<spa::buffer::meta::MetaHeader>()
+                    .map(|h| h.as_raw().seq);
+                let damage = buffer
+                    .find_meta::<spa::buffer::meta::MetaVideoDamage>()
+                    .map(|meta| {
+                        meta.iter()
+                            .map(|region| {
+                                let raw = region.as_raw();
+                                DamageRect {
+                                    x: raw.region.position.x,
+                                    y: raw.region.position.y,
+                                    w: raw.region.size.width,
+                                    h: raw.region.size.height,
+                                }
+                            })
+                            .filter(|rect| rect.w != 0 && rect.h != 0)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let datas = buffer.datas_mut();
+                if datas.is_empty() {
+                    continue;
+                }
+                let data_ref = &mut datas[0];
+                let size = data_ref.chunk().size() as usize;
+                if size == 0 {
+                    continue;
+                }
+                let received = if data_ref.type_() == spa::buffer::DataType::DmaBuf {
+                    match read_dmabuf(data_ref, size) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            *data.error.borrow_mut() = Some(e);
+                            if let Some(mainloop) = data.loop_weak.upgrade() {
+                                mainloop.quit();
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    let Some(slice) = data_ref.data() else {
+                        *data.error.borrow_mut() = Some("shared buffer has no mapped data".into());
+                        if let Some(mainloop) = data.loop_weak.upgrade() {
+                            mainloop.quit();
+                        }
+                        return;
+                    };
+                    if slice.len() < size {
+                        *data.error.borrow_mut() = Some("shared buffer is smaller than its chunk".into());
+                        if let Some(mainloop) = data.loop_weak.upgrade() {
+                            mainloop.quit();
+                        }
+                        return;
+                    }
+                    Received::SharedMem(slice[..size].to_vec())
+                };
+                let mut list = data.results.borrow_mut();
+                list.push(ReceivedFrame {
+                    received,
+                    pts_nanos,
+                    seq,
+                    damage,
+                });
+                if list.len() >= data.target_count {
+                    if let Some(mainloop) = data.loop_weak.upgrade() {
+                        mainloop.quit();
+                    }
+                    return;
+                }
+            }
+        })
+        .register()
+        .map_err(|e| e.to_string())?;
+
+    let timeout_loop_weak = mainloop.downgrade();
+    let timeout_err = Rc::clone(&error);
+    let timeout_timer = mainloop.loop_().add_timer(move |_| {
+        *timeout_err.borrow_mut() = Some("timed out waiting for frames".into());
+        if let Some(mainloop) = timeout_loop_weak.upgrade() {
+            mainloop.quit();
+        }
+    });
+    timeout_timer.update_timer(Some(timeout), None);
+
+    let format_plain = format_pod(width, height, &[]);
+    let format_mod = if !modifiers.is_empty() {
+        Some(format_pod(width, height, modifiers))
+    } else {
+        None
+    };
+    let mut format_refs = Vec::new();
+    if let Some(ref m) = format_mod {
+        format_refs.push(Pod::from_bytes(m).expect("format mod pod"));
+    }
+    format_refs.push(Pod::from_bytes(&format_plain).expect("format plain pod"));
+    stream
+        .connect(
+            Direction::Input,
+            Some(node_id),
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            &mut format_refs,
+        )
+        .map_err(|e| e.to_string())?;
+
+    mainloop.run();
+    if let Some(err) = error.borrow_mut().take() {
+        return Err(err);
+    }
+    Ok(results.borrow_mut().clone())
 }
 
 /// Connect to the PipeWire daemon listening on `socket`, subscribe to
@@ -156,8 +360,17 @@ pub fn consume_one_frame(
     });
     timeout_timer.update_timer(Some(timeout), None);
 
-    let format_bytes = format_pod(width, height, offer_dmabuf);
-    let mut format_refs = [Pod::from_bytes(&format_bytes).expect("format pod")];
+    let format_plain = format_pod(width, height, &[]);
+    let format_mod = if offer_dmabuf {
+        Some(format_pod(width, height, &[0]))
+    } else {
+        None
+    };
+    let mut format_refs = Vec::new();
+    if let Some(ref m) = format_mod {
+        format_refs.push(Pod::from_bytes(m).expect("format mod pod"));
+    }
+    format_refs.push(Pod::from_bytes(&format_plain).expect("format plain pod"));
     stream
         .connect(
             Direction::Input,
@@ -300,7 +513,7 @@ pub fn consume_one_frame_damage(
     });
     timeout_timer.update_timer(Some(timeout), None);
 
-    let format_bytes = format_pod(width, height, false);
+    let format_bytes = format_pod(width, height, &[]);
     let mut format_refs = [Pod::from_bytes(&format_bytes).expect("format pod")];
     stream
         .connect(
@@ -367,8 +580,9 @@ fn read_dmabuf(data: &pw::spa::buffer::Data, size: usize) -> Result<Received, St
 }
 
 /// The consumer's format offer: raw BGRx at the stream's geometry, with a
+/// The consumer's format offer: raw BGRx at the stream's geometry, with a
 /// modifier enumeration when asking for zero-copy delivery.
-fn format_pod(width: u32, height: u32, offer_dmabuf: bool) -> Vec<u8> {
+fn format_pod(width: u32, height: u32, modifiers: &[u64]) -> Vec<u8> {
     let mut properties = vec![
         pod::Property {
             key: spa::param::format::FormatProperties::MediaType.as_raw(),
@@ -392,16 +606,15 @@ fn format_pod(width: u32, height: u32, offer_dmabuf: bool) -> Vec<u8> {
             )),
         },
     ];
-    if offer_dmabuf {
-        // Exactly one modifier: the producer's offer carries DRM_FORMAT_MOD_LINEAR.
+    if !modifiers.is_empty() {
         properties.push(pod::Property {
             key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
-            flags: pod::PropertyFlags::empty(),
+            flags: pod::PropertyFlags::MANDATORY | pod::PropertyFlags::DONT_FIXATE,
             value: pod::Value::Choice(pod::ChoiceValue::Long(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Enum {
-                    default: 0,
-                    alternatives: Vec::new(),
+                    default: modifiers[0] as i64,
+                    alternatives: modifiers.iter().map(|&m| m as i64).collect(),
                 },
             ))),
         });
@@ -464,6 +677,27 @@ fn damage_meta_pod() -> Vec<u8> {
                 value: pod::Value::Int(
                     (16 * std::mem::size_of::<spa::sys::spa_meta_region>()) as i32,
                 ),
+            },
+        ],
+    };
+    serialize(&pod::Value::Object(object))
+}
+
+/// The consumer's `SPA_PARAM_Meta` request for Header (PTS & sequence number).
+fn header_meta_pod() -> Vec<u8> {
+    let object = pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pod::Property {
+                key: 1, // SPA_PARAM_META_type
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Id(spa::utils::Id(spa::sys::SPA_META_Header)),
+            },
+            pod::Property {
+                key: 2, // SPA_PARAM_META_size
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(std::mem::size_of::<spa::sys::spa_meta_header>() as i32),
             },
         ],
     };

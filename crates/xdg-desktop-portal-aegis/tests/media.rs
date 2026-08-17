@@ -738,7 +738,9 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
 
 #[path = "media/pipewire_consumer.rs"]
 mod pipewire_consumer;
-use pipewire_consumer::{Received, consume_one_frame, consume_one_frame_damage};
+use pipewire_consumer::{
+    Received, consume_frames_metadata, consume_one_frame, consume_one_frame_damage,
+};
 
 /// DRM_FORMAT_XRGB8888: the fourcc the compositor announces for its
 /// single-plane BGRA8-class dmabuf exports.
@@ -934,8 +936,8 @@ fn push_dmabuf_frame(fixture: &DmabufCastFixture, pixels: &[u8]) {
     ));
 }
 
-/// Push one protocol-25 slot frame through the fixture's compositor.
-fn push_slot_frame(fixture: &DmabufCastFixture, slot: u32) {
+/// Push one protocol-25 slot frame through the fixture's compositor with explicit modifier.
+fn push_slot_frame_modifier(fixture: &DmabufCastFixture, slot: u32, modifier: u64) {
     assert!(fixture.server.push_stream_frame_slot(
         aegis_portal_ipc::testing::StreamFrameFdPayload {
             stream_id: 1,
@@ -945,7 +947,7 @@ fn push_slot_frame(fixture: &DmabufCastFixture, slot: u32) {
             stride: 8,
             format: StreamPixelFormat::Dmabuf {
                 drm_format: DRM_FORMAT_XRGB8888,
-                modifier: DRM_FORMAT_MOD_LINEAR,
+                modifier,
             },
             damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
             dropped: 0,
@@ -953,6 +955,11 @@ fn push_slot_frame(fixture: &DmabufCastFixture, slot: u32) {
         },
         slot,
     ));
+}
+
+/// Push one protocol-25 slot frame through the fixture's compositor.
+fn push_slot_frame(fixture: &DmabufCastFixture, slot: u32) {
+    push_slot_frame_modifier(fixture, slot, DRM_FORMAT_MOD_LINEAR);
 }
 
 /// Drive one frame through the cast: link a consumer, wait for it to reach
@@ -1860,4 +1867,128 @@ fn screencast_damage_reaches_the_consumer() {
         }],
         "the compositor's damage rect must reach the consumer as VideoDamage meta"
     );
+}
+
+/// A consumer offering a real-world multi-modifier Enum choice (matching
+/// OBS Studio's EGL modifier enumeration) must successfully match and fixate
+/// the compositor's tiled modifier and receive zero-copy DmaBuf frames.
+#[test]
+fn screencast_negotiates_multi_modifier_consumer_zero_copy() {
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(fixture) = dmabuf_cast_fixture(
+        "multimod",
+        true,
+        vec![StreamPixelFormat::Dmabuf {
+            drm_format: DRM_FORMAT_XRGB8888,
+            modifier: DRM_FORMAT_MOD_I915_X_TILED,
+        }],
+    ) else {
+        return;
+    };
+    let socket = fixture.runtime_dir.join("pipewire-0");
+    let node_id = fixture.node_id;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    // The consumer offers a list of modifiers including LINEAR, I915_X_TILED, and dummy.
+    let consumer_modifiers = [
+        DRM_FORMAT_MOD_LINEAR,
+        DRM_FORMAT_MOD_I915_X_TILED,
+        0x0100_0000_0000_0002,
+    ];
+    let consumer = std::thread::spawn(move || {
+        consume_frames_metadata(
+            &socket,
+            node_id,
+            2,
+            2,
+            &consumer_modifiers,
+            1,
+            ready_tx,
+            Duration::from_secs(8),
+        )
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+
+    let pixels = [0x55_u8; 16];
+    {
+        let mut files = fixture.fake.slot_files.lock().unwrap();
+        let file = &mut files[0];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&pixels).unwrap();
+    }
+    push_slot_frame_modifier(&fixture, 0, DRM_FORMAT_MOD_I915_X_TILED);
+
+    let frames = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("frame delivery");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].received, Received::DmaBuf(pixels.to_vec()));
+    assert!(
+        frames[0].pts_nanos.is_some(),
+        "delivered frame must carry SPA_META_Header PTS timestamp"
+    );
+    assert_eq!(
+        frames[0].seq,
+        Some(0),
+        "delivered frame must carry 0-indexed sequence number"
+    );
+}
+
+/// A consumer streaming multiple consecutive frames must receive continuous
+/// monotonically increasing PTS timestamps and sequential sequence numbers
+/// without buffer starvation or stalls.
+#[test]
+fn screencast_continuous_cadence_and_pts_headers() {
+    let Some(env) = cast_env("cadence", Vec::new(), &[]) else {
+        return;
+    };
+    let session_path = create_session(&env.conn, "cadence");
+    let code = select_sources(&env.conn, &session_path, "cadence", HashMap::new());
+    assert_eq!(code, 0);
+    let (code, results) = start_session(&env.conn, &session_path, "cadence");
+    assert_eq!(code, 0, "Start: {results:?}");
+    let (node_id, _) = stream_details(&results);
+
+    let socket = env.runtime_dir.join("pipewire-0");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume_frames_metadata(&socket, node_id, 2, 2, &[], 5, ready_tx, Duration::from_secs(8))
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the consumer linked and negotiated");
+
+    for i in 1..=5 {
+        let pixels = [i as u8; 16];
+        assert!(env.server.push_stream_frame(StreamFramePayload {
+            stream_id: 1,
+            sequence: i as u64,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: StreamPixelFormat::Bgra8,
+            damage: vec![aegis_portal_ipc::Rect::new(0, 0, 2, 2)],
+            dropped: 0,
+            pixels: pixels.to_vec().into(),
+        }));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let frames = consumer
+        .join()
+        .expect("consumer thread")
+        .expect("multi-frame delivery");
+    assert_eq!(frames.len(), 5, "must receive all 5 frames");
+
+    for (idx, frame) in frames.iter().enumerate() {
+        let expected_val = (idx + 1) as u8;
+        assert_eq!(
+            frame.received,
+            Received::SharedMem(vec![expected_val; 16]),
+            "frame content must match sequence"
+        );
+    }
 }
