@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.14] - 2026-08-17
+
+### Added
+
+- Added [Cast Frame Path](docs/reference/cast-frame-path.md) reference documentation describing the runtime pixel path behind a running cast (ownership split, session lifecycle, transport selection, and per-frame metadata).
+
 ## [0.0.13] - 2026-08-16
 
 ### Fixed
