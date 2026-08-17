@@ -4,7 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-## [0.0.15] - 2026-08-17
+## [0.0.16] - 2026-08-17
+
+### Fixed
+
+- Populated the alternatives list in the `VideoModifier` `ChoiceEnum` pod for
+  PipeWire stream format negotiation. PipeWire's `spa_pod_filter` requires
+  non-empty alternatives to match consumer-offered DRM modifiers, resolving
+  DmaBuf zero-copy negotiation failures that previously caused consumers like OBS
+  to fall back to CPU shared-memory readback.
 
 ### Fixed
 
