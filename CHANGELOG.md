@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.18] - 2026-08-18
+
+### Fixed
+
+- Replaced unconditional 4ms PipeWire screencast keepalive polling with demand-driven execution, eliminating idle 250Hz CPU/power drain on static desktops.
+- Added explicit vault locking API (`lock()`), query status (`is_unlocked()`), and 15-minute inactivity auto-lock watcher to `SecretService` for zeroizing master keys in memory.
+- Fixed D-Bus mutex guard scope in native Secret portal delivery to eliminate deadlock hazards during fast-path unlocks.
+
 ## [0.0.17] - 2026-08-17
 
 ### Added
