@@ -100,7 +100,16 @@ impl SecretIface {
             return Ok((1, HashMap::new()));
         }
 
-        if sync::lock(&self.state, "secret state").is_unlocked() {
+        let is_unlocked = {
+            let mut state = sync::lock(&self.state, "secret state");
+            if state.is_unlocked() {
+                state.last_accessed = std::time::Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if is_unlocked {
             return Ok(self.deliver(app_id, fd));
         }
 

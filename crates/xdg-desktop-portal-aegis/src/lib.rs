@@ -350,6 +350,7 @@ pub fn run() -> Result<(), PortalError> {
 
     secret_service.register_portal(&conn, Arc::clone(&tracker), DESKTOP_PATH)?;
     secret_service.start_pam_watcher();
+    secret_service.start_auto_lock_watcher(std::time::Duration::from_secs(15 * 60));
 
     let worker_tracker = Arc::clone(&tracker);
     let worker_socket = socket.clone();

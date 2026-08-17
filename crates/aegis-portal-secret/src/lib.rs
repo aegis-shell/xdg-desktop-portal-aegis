@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aegis_portal_runtime::sync;
 use argon2::Params;
@@ -223,6 +223,42 @@ impl SecretService {
         Ok(())
     }
 
+    /// Check if the vault is currently unlocked in memory.
+    pub fn is_unlocked(&self) -> bool {
+        sync::lock(&self.state, "secret state").is_unlocked()
+    }
+
+    /// Explicitly lock the vault and purge the master key from memory.
+    /// Dropping the `Vault` zeroizes its master key and munlocks its pages.
+    pub fn lock(&self) {
+        let mut state = sync::lock(&self.state, "secret state");
+        if state.vault.take().is_some() {
+            log::info!("portal: secret vault explicitly locked; master key zeroized in memory");
+        }
+    }
+
+    /// Start a background worker that locks the vault if no secret access has
+    /// occurred within `idle_timeout`.
+    pub fn start_auto_lock_watcher(&self, idle_timeout: Duration) {
+        let state = Arc::clone(&self.state);
+        let spawned = std::thread::Builder::new()
+            .name("aegis-secret-auto-lock".to_owned())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let mut state = sync::lock(&state, "secret state");
+                if state.is_unlocked() && state.last_accessed.elapsed() >= idle_timeout {
+                    if state.vault.take().is_some() {
+                        log::info!(
+                            "portal: secret vault auto-locked after {idle_timeout:?} of inactivity"
+                        );
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            log::error!("portal: could not start auto-lock watcher: {error}");
+        }
+    }
+
     /// Watch for a PAM token that arrives after backend startup (for example
     /// on screen unlock). The watcher exits permanently once the vault is
     /// unlocked and never exposes the token to D-Bus.
@@ -278,6 +314,7 @@ pub enum SecretError {
 
 struct SecretState {
     pub(crate) vault: Option<Vault>,
+    pub(crate) last_accessed: Instant,
     pub(crate) pending_unlocks: Vec<PendingUnlock>,
     pub(crate) unlock_worker_active: bool,
     pub(crate) vault_path: PathBuf,
@@ -674,6 +711,7 @@ fn create_password_vault_in(
 
     Ok(Arc::new(Mutex::new(SecretState {
         vault: Some(vault),
+        last_accessed: Instant::now(),
         pending_unlocks: Vec::new(),
         unlock_worker_active: false,
         vault_path,
@@ -700,6 +738,7 @@ pub fn rekey_password_vault_in(dir: &Path, current: &str, new: &str) -> Result<(
     validate_private_dir(dir)?;
     let mut state = SecretState {
         vault: None,
+        last_accessed: Instant::now(),
         pending_unlocks: Vec::new(),
         unlock_worker_active: false,
         vault_path: dir.join("vault.enc"),
@@ -1024,6 +1063,7 @@ fn init_in(dir: &Path) -> Result<Arc<Mutex<SecretState>>, SecretError> {
     let key_path = dir.join("vault.key");
     let mut state = SecretState {
         vault: None,
+        last_accessed: Instant::now(),
         pending_unlocks: Vec::new(),
         unlock_worker_active: false,
         vault_path: dir.join("vault.enc"),
@@ -1224,6 +1264,7 @@ mod tests {
         prepare_private_dir(dir).expect("prepare vault dir");
         Arc::new(Mutex::new(SecretState {
             vault: None,
+            last_accessed: Instant::now(),
             pending_unlocks: Vec::new(),
             unlock_worker_active: false,
             vault_path: dir.join("vault.enc"),
@@ -2268,5 +2309,33 @@ mod tests {
         let empty = LockedBytes::new(Vec::new());
         assert!(empty.as_bytes().is_empty());
         assert_eq!(empty.as_str(), Some(""));
+    }
+
+    #[test]
+    fn secret_service_explicit_lock_purges_master_key() {
+        struct DummyPrompter;
+        impl SecretPrompter for DummyPrompter {
+            fn prompt_secret(
+                &self,
+                _title: &str,
+                _reason: Option<&str>,
+                _cancelled: &dyn Fn() -> bool,
+            ) -> Result<PromptResponse, String> {
+                Ok(PromptResponse::Cancelled)
+            }
+        }
+
+        let dir = temp_dir("explicit-lock");
+        let service = SecretService {
+            state: init_in(&dir).expect("init"),
+            prompter: Arc::new(DummyPrompter),
+        };
+        assert!(service.is_unlocked());
+        service.lock();
+        assert!(!service.is_unlocked());
+        // Idempotent
+        service.lock();
+        assert!(!service.is_unlocked());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

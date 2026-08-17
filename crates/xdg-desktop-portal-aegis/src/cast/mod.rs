@@ -614,6 +614,8 @@ fn run_cast(
             let session_path = session_path.to_string();
             let compositor_dropped = Rc::clone(&compositor_dropped);
             let transport = Rc::clone(&transport);
+            let latest = Rc::clone(&latest);
+            let pending = Rc::clone(&pending);
             move |io| {
                 let message = io.0.borrow_mut().next_stream_message();
                 match message {
@@ -754,12 +756,24 @@ fn run_cast(
     lease_timer.update_timer(Some(half_ttl), Some(half_ttl));
 
     // The keepalive is the cycle source of last resort: while Streaming, it
-    // runs `process` even when no compositor frame arrived, so
-    // consumer-returned buffers are reclaimed (releasing their compositor
-    // slots) and a frame held back by pool starvation is retried.
+    // runs `process` only when work is pending (a frame held back by pool
+    // starvation or in-flight slot buffers needing reclaim upon consumer return).
+    // On a static screen with all buffers reclaimed, it remains idle without
+    // triggering redundant PipeWire graph cycles.
     let keepalive_stream = stream.downgrade();
+    let keepalive_pending = Rc::clone(&pending);
+    let keepalive_transport = Rc::clone(&transport);
     let keepalive_timer = mainloop.loop_().add_timer(move |_| {
         if !streaming.get() {
+            return;
+        }
+        let needs_cycle = {
+            let is_pending = keepalive_pending.get();
+            let transport = keepalive_transport.borrow();
+            let has_in_flight_slots = transport.slot_bindings.iter().any(|b| b.in_flight);
+            is_pending || has_in_flight_slots
+        };
+        if !needs_cycle {
             return;
         }
         let Some(stream) = keepalive_stream.upgrade() else {
