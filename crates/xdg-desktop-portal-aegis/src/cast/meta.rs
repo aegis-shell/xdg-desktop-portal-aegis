@@ -15,6 +15,35 @@ use pipewire::sys as pw_sys;
 /// over-reporting is always safe, under-reporting is not.
 pub(crate) const MAX_DAMAGE_REGIONS: usize = 16;
 
+/// The `SPA_PARAM_Meta` offer for `SPA_META_Header`: carries timestamps (PTS),
+/// sequence numbers, and buffer flags so consumers like OBS / FFmpeg can
+/// pace, synchronize, and track frames accurately.
+pub(crate) fn header_meta_pod() -> Vec<u8> {
+    let object = pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pod::Property {
+                key: 1, // SPA_PARAM_META_type
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Id(spa::utils::Id(spa_sys::SPA_META_Header)),
+            },
+            pod::Property {
+                key: 2, // SPA_PARAM_META_size
+                flags: pod::PropertyFlags::empty(),
+                value: pod::Value::Int(std::mem::size_of::<spa_sys::spa_meta_header>() as i32),
+            },
+        ],
+    };
+    pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pod::Value::Object(object),
+    )
+    .expect("pod serialization")
+    .0
+    .into_inner()
+}
+
 /// The `SPA_PARAM_Meta` offer: one VideoDamage metadata block per buffer
 /// with room for [`MAX_DAMAGE_REGIONS`] regions. The size is the region
 /// array's bytes, matching every producer that ships the metadata (the
@@ -45,6 +74,46 @@ pub(crate) fn damage_meta_pod() -> Vec<u8> {
     .expect("pod serialization")
     .0
     .into_inner()
+}
+
+/// Get monotonic clock timestamp in nanoseconds for buffer PTS.
+pub(crate) fn monotonic_pts_nanos() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as i64) * 1_000_000_000 + (ts.tv_nsec as i64)
+}
+
+/// Attach standard header metadata (PTS timestamp and monotonic sequence)
+/// to a buffer about to be queued into PipeWire.
+///
+/// # Safety
+/// `buffer` must be a live pool buffer of this stream.
+pub(crate) unsafe fn attach_header(
+    buffer: *mut pw_sys::pw_buffer,
+    seq: u64,
+    pts_nanos: i64,
+) {
+    let spa_buffer = unsafe { (*buffer).buffer };
+    if spa_buffer.is_null() {
+        return;
+    }
+    let meta = unsafe { spa_sys::spa_buffer_find_meta(spa_buffer, spa_sys::SPA_META_Header) };
+    if meta.is_null() {
+        return;
+    }
+    unsafe {
+        let header = meta.cast::<spa_sys::spa_meta_header>();
+        (*header).flags = 0;
+        (*header).offset = 0;
+        (*header).pts = pts_nanos;
+        (*header).dts_offset = 0;
+        (*header).seq = seq;
+    }
 }
 
 /// Attach the frame's damage rects to a buffer about to be queued. A

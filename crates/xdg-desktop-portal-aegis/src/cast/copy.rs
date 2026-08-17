@@ -9,7 +9,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr::NonNull;
 
 use pipewire as pw;
-use pw::spa::sys as spa_sys;
 
 use super::frame::MAX_FRAME_BYTES;
 use super::state::StreamData;
@@ -157,7 +156,10 @@ pub(crate) fn copy_into_pool(
             (*chunk).offset = 0;
             (*chunk).size = (height * row_bytes) as u32;
             (*chunk).stride = row_bytes as i32;
-            (*chunk).flags = spa_sys::SPA_CHUNK_FLAG_NONE as i32;
+            let seq = data.sequence.get();
+            data.sequence.set(seq + 1);
+            let pts = super::meta::monotonic_pts_nanos();
+            super::meta::attach_header(pool_raw, seq, pts);
             super::meta::attach_damage(pool_raw, damage, width, height as u32);
             stream.queue_raw_buffer(pool_raw);
             true

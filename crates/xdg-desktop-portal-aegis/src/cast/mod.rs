@@ -100,7 +100,7 @@ use format::{
     SHM_POOL_BUFFERS, buffers_pod, format_pods, parse_buffers_data_types, parse_format_param,
 };
 use frame::{frame_len, validate_frame};
-use meta::damage_meta_pod;
+use meta::{damage_meta_pod, header_meta_pod};
 use publish::process_frame;
 use state::{
     DeliveryMode, LatestFrame, Negotiation, StreamData, Transport, replace_latest,
@@ -130,7 +130,10 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(15);
 /// wedges the stream in a circular wait (frozen picture until some external
 /// event renegotiates the stream). The interval matches the stream's
 /// maximum frame cadence, so recovery adds at most one frame of latency.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_MAX_FPS as u64);
+/// A responsive keepalive interval (4ms) ensures that consumer-returned
+/// buffers are reclaimed and released back to the compositor with sub-frame
+/// latency, preventing distributed feedback deadlocks.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(4);
 
 /// Negotiated parameters of a running cast, handed back to the worker once
 /// the stream reaches `Paused` (the first state where the node id exists).
@@ -378,6 +381,7 @@ fn run_cast(
             client: Rc::clone(&client),
             mainloop: mainloop.downgrade(),
             start_state,
+            sequence: Cell::new(0),
             dropped_frames: Cell::new(0),
             warned_unmappable: Cell::new(false),
         })
@@ -437,10 +441,10 @@ fn run_cast(
                 }
                 // Advertise the layout delivery actually uses: the slot's
                 // stride and size for zero-copy dmabuf, tightly packed for
-                // the shared-memory copy path. The damage metadata offer
-                // rides along (see `cast::meta`); a consumer that ignores
-                // it simply gets buffers without the meta block.
-                let (buffers, meta) = {
+                // the shared-memory copy path. The damage and header metadata
+                // offers ride along (see `cast::meta`); a consumer that ignores
+                // them simply gets buffers without the meta blocks.
+                let (buffers, header_meta, damage_meta) = {
                     let transport = data.transport.borrow();
                     let mode = data.negotiation.borrow().mode;
                     let slot = if mode == DeliveryMode::Dmabuf {
@@ -460,11 +464,12 @@ fn run_cast(
                             (transport.width * transport.height * 4) as i32,
                         ),
                     };
-                    (buffers, damage_meta_pod())
+                    (buffers, header_meta_pod(), damage_meta_pod())
                 };
                 let mut params = [
                     Pod::from_bytes(&buffers).expect("buffers pod"),
-                    Pod::from_bytes(&meta).expect("meta pod"),
+                    Pod::from_bytes(&header_meta).expect("header meta pod"),
+                    Pod::from_bytes(&damage_meta).expect("damage meta pod"),
                 ];
                 if let Err(error) = stream.update_params(&mut params) {
                     log::warn!("portal: pipewire update_params failed: {error}");

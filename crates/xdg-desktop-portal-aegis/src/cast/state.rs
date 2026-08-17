@@ -199,6 +199,8 @@ pub(crate) struct StreamData {
     /// Quit handle for fatal transport errors.
     pub(crate) mainloop: pw::main_loop::MainLoopWeak,
     pub(crate) start_state: Rc<RefCell<StartState>>,
+    /// Monotonic frame sequence counter attached to SPA_META_Header.
+    pub(crate) sequence: Cell<u64>,
     /// Portal-side frame drops (unmappable dmabuf, pool starvation),
     /// counted for the stream's lifetime.
     pub(crate) dropped_frames: Cell<u64>,

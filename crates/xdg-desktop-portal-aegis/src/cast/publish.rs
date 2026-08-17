@@ -121,7 +121,11 @@ fn publish_slot(
             drop(transport);
             // SAFETY: `pool_raw` is a live pool buffer of this stream bound
             // to this slot, dequeued earlier and not referenced elsewhere.
+            let seq = data.sequence.get();
+            data.sequence.set(seq + 1);
+            let pts = super::meta::monotonic_pts_nanos();
             unsafe {
+                super::meta::attach_header(pool_raw, seq, pts);
                 super::meta::attach_damage(pool_raw, damage, width, height);
                 stream.queue_raw_buffer(pool_raw)
             };
