@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.20] - 2026-08-20
+
 ### Added
 
 - Prompt dialogs now follow the compositor's desktop preferences: the prompter request (contract v6) carries an appearance snapshot — colour scheme, accent colour, high contrast, reduced motion — projected from the backend's settings store, fixing dialogs that previously guessed the scheme through a GNOME-only gsettings query and never saw the compositor's accent or contrast (ADR-0018).
@@ -627,7 +629,8 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.19...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.20...HEAD
+[0.0.20]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.20
 [0.0.19]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.19
 [0.0.18]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.18
 [0.0.11]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.11
