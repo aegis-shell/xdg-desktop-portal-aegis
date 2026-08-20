@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.0.19] - 2026-08-20
+
 ### Added
 
 - The FileChooser now previews the file under the listing cursor in a pane beside the directory listing: PNG, JPEG, GIF (first frame), WebP, and BMP decode off-thread under strict size caps, downsample to the pane, and render as a GPU texture through the device iris owns (ADR-0017). Non-previewable targets keep the full browsing width, and a preselected `current_file` now also takes the listing cursor so the preview shows on the first frame.
@@ -608,8 +610,9 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.18...HEAD
-[0.0.10]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.10
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.19...HEAD
+[0.0.19]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.19
+[0.0.18]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.18
 [0.0.11]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.11
 [0.0.12]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.12
 [0.0.13]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.13
