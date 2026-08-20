@@ -182,6 +182,7 @@ fn validate_request(request: &FileChooserRequest) -> Result<(), String> {
 pub(crate) fn file_chooser_worker(
     rx: mpsc::Receiver<FileChooserJob>,
     tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
 ) {
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -203,13 +204,14 @@ pub(crate) fn file_chooser_worker(
             continue;
         }
         let tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-file-chooser".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result = run_pick(&tracker, &request_path, request);
+                let result = run_pick(&tracker, &request_path, request, Some(&task_settings));
                 let _ = reply.send_blocking(result);
             })
         {
@@ -223,6 +225,7 @@ fn run_pick(
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
     request: FileChooserRequest,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "file chooser tracker").was_closed(request_path) {
         return cancelled();
@@ -233,7 +236,7 @@ fn run_pick(
     }
 
     let app_id = request.app_id.clone();
-    match invoke_prompter(tracker, request_path, &request) {
+    match invoke_prompter(tracker, request_path, &request, settings) {
         Ok(response @ FileChooserResponse::Selected { .. }) => {
             // Request.Close wins a race with a completed child response.
             if sync::lock(tracker, "file chooser tracker").was_closed(request_path) {
@@ -267,10 +270,12 @@ fn invoke_prompter(
     tracker: &Arc<Mutex<RequestTracker>>,
     request_path: &str,
     request: &FileChooserRequest,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> Result<FileChooserResponse, String> {
     let cancelled = || sync::lock(tracker, "file chooser tracker").was_closed(request_path);
     match prompter::invoke(
         PrompterRequest::file_chooser(request.clone()),
+        settings,
         Some(&cancelled),
     ) {
         Ok(PromptResult::FileChooser(response)) => Ok(response),

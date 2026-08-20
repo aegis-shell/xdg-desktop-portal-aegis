@@ -238,6 +238,7 @@ pub(crate) fn wallpaper_worker(
     rx: mpsc::Receiver<WallpaperJob>,
     tracker: Arc<Mutex<RequestTracker>>,
     socket: PathBuf,
+    settings: crate::settings::SettingsStore,
 ) {
     const MAX_ACTIVE_WALLPAPER_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -265,6 +266,7 @@ pub(crate) fn wallpaper_worker(
         }
         let task_tracker = Arc::clone(&tracker);
         let task_socket = socket.clone();
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -273,6 +275,7 @@ pub(crate) fn wallpaper_worker(
                 let _active = active_guard;
                 let result = run_set(
                     &task_tracker,
+                    Some(&task_settings),
                     &request_path,
                     &app_id,
                     &task_socket,
@@ -294,6 +297,7 @@ pub(crate) fn wallpaper_worker(
 #[allow(clippy::too_many_arguments)]
 fn run_set(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     socket: &Path,
@@ -307,6 +311,7 @@ fn run_set(
     };
     run_set_staged(
         tracker,
+        settings,
         request_path,
         app_id,
         socket,
@@ -322,6 +327,7 @@ fn run_set(
 #[allow(clippy::too_many_arguments)]
 fn run_set_staged(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     socket: &Path,
@@ -342,7 +348,14 @@ fn run_set_staged(
     };
 
     if show_preview {
-        match preview_consent(tracker, request_path, app_id, image_path, parent_window) {
+        match preview_consent(
+            tracker,
+            settings,
+            request_path,
+            app_id,
+            image_path,
+            parent_window,
+        ) {
             Ok(true) => {}
             Ok(false) => return (1, HashMap::new()),
             Err(error) => {
@@ -390,6 +403,7 @@ fn run_set_staged(
 /// cancels.
 fn preview_consent(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     image_path: &Path,
@@ -408,7 +422,7 @@ fn preview_consent(
         parent_window,
     };
     let cancelled = || sync::lock(tracker, "wallpaper tracker").was_closed(request_path);
-    match prompter::invoke(PrompterRequest::confirm(prompt), Some(&cancelled)) {
+    match prompter::invoke(PrompterRequest::confirm(prompt), settings, Some(&cancelled)) {
         Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => Ok(true),
         Ok(PromptResult::Confirm(ConfirmResponse::Cancelled)) | Err(InvokeError::Cancelled) => {
             Ok(false)
@@ -592,6 +606,7 @@ mod tests {
 
         let (response, _) = run_set_staged(
             &tracker(),
+            None,
             "/request/1",
             "app",
             &socket,
@@ -628,6 +643,7 @@ mod tests {
         let (server, socket) = serve("failure", compositor);
         let (response, _) = run_set_staged(
             &tracker(),
+            None,
             "/request/1",
             "app",
             &socket,
@@ -658,6 +674,7 @@ mod tests {
         let (server, socket) = serve("refusal", compositor);
         let (response, _) = run_set_staged(
             &tracker(),
+            None,
             "/request/1",
             "app",
             &socket,
@@ -687,6 +704,7 @@ mod tests {
 
         let (response, _) = run_set_staged(
             &tracker(),
+            None,
             "/request/1",
             "app",
             &socket,

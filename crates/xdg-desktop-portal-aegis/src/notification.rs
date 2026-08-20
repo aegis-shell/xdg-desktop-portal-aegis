@@ -65,15 +65,14 @@ const NOTIFICATION_IFACE: &str = "org.freedesktop.impl.portal.Notification";
 pub(crate) struct NotificationIface {
     /// Blocking handle for the pump thread's signal emission.
     conn: zbus::blocking::Connection,
+    /// Shared with the settings watcher, which re-skins the daemon's
+    /// cards when desktop preferences change.
     daemon: Arc<Mutex<DaemonManager>>,
 }
 
 impl NotificationIface {
-    pub(crate) fn new(conn: zbus::blocking::Connection) -> Self {
-        Self {
-            conn,
-            daemon: Arc::new(Mutex::new(DaemonManager::default())),
-        }
+    pub(crate) fn new(conn: zbus::blocking::Connection, daemon: Arc<Mutex<DaemonManager>>) -> Self {
+        Self { conn, daemon }
     }
 }
 
@@ -323,6 +322,31 @@ impl Drop for DaemonHandle {
 pub(crate) struct DaemonManager {
     daemon: Option<DaemonHandle>,
     live: Arc<Mutex<LiveNotifications>>,
+    /// The latest appearance snapshot; re-pushed after every respawn.
+    appearance: Option<aegis_portal_prompter::PromptAppearance>,
+}
+
+impl DaemonManager {
+    /// Push a new appearance snapshot to a live daemon (no spawn): the
+    /// settings watcher calls this when desktop preferences change. The
+    /// snapshot is remembered so a later respawn re-primes with it.
+    pub(crate) fn push_appearance(
+        &mut self,
+        conn: &zbus::blocking::Connection,
+        settings: &crate::settings::SettingsStore,
+    ) {
+        let appearance = crate::settings::prompt_appearance_of(settings);
+        if self.appearance == Some(appearance) {
+            return;
+        }
+        self.appearance = Some(appearance);
+        if self.daemon.is_some() {
+            self.send(
+                conn,
+                &CommandFrame::new(NotifyCommand::SetAppearance { appearance }),
+            );
+        }
+    }
 }
 
 impl DaemonManager {
@@ -416,6 +440,9 @@ impl DaemonManager {
     }
 
     /// Ensure a live daemon, spawning on first use or after a death.
+    /// A remembered appearance (from [`DaemonManager::push_appearance`])
+    /// is re-pushed after the spawn; a first-run daemon is primed by the
+    /// first notify anyway.
     fn ensure_daemon(&mut self, conn: &zbus::blocking::Connection) -> bool {
         if let Some(daemon) = &mut self.daemon {
             match daemon.child.try_wait() {
@@ -434,6 +461,14 @@ impl DaemonManager {
             Ok(daemon) => {
                 log::info!("portal: notification daemon spawned");
                 self.daemon = Some(daemon);
+                // Re-prime a remembered appearance so respawned cards
+                // never flash the fallback palette (stream v2).
+                if let Some(appearance) = self.appearance {
+                    self.send(
+                        conn,
+                        &CommandFrame::new(NotifyCommand::SetAppearance { appearance }),
+                    );
+                }
                 true
             }
             Err(error) => {

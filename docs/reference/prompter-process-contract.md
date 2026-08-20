@@ -33,9 +33,23 @@ its standard output. A request larger than 8 MiB
 Both directions are versioned envelopes: `PrompterRequest` carries
 `version` plus a tagged `prompt`; `PrompterResponse` carries `version`
 plus a tagged `result`. The version must equal
-`PROCESS_CONTRACT_VERSION` (currently 5) exactly — a mismatched
+`PROCESS_CONTRACT_VERSION` (currently 6) exactly — a mismatched
 backend/prompter pair refuses to interpret each other's fields — and the
 envelopes deny unknown fields.
+
+### Appearance Snapshot (version 6)
+
+Every request carries an optional `appearance` object — the compositor's
+desktop preferences projected by the backend from its settings store
+(Aegis IPC `GetSettings`): `color_scheme` (`system`/`dark`/`light`),
+`accent_color` (`null` or 8-bit RGB), `high_contrast`, and
+`reduced_motion`. The prompter resolves the palette from it (an explicit
+scheme beats the platform query; `system` defers to it), overrides the
+accent and selection wash when the compositor publishes one, restyles for
+high contrast, and passes reduced motion to the UI toolkit. A
+black-transparent accent is rejected at validation. A backend without a
+compositor snapshot still sends the all-defaults projection, which is
+indistinguishable in effect from an absent one.
 
 | `prompt.kind` | Request / response | Portal users |
 |---------------|--------------------|--------------|
@@ -70,11 +84,13 @@ With `--notification-daemon` the process is long-lived instead of
 one-shot. Notifications are asynchronous, so the daemon speaks
 newline-delimited JSON on both pipes: `CommandFrame` (`v`, `cmd`) on
 standard input, `EventFrame` (`v`, `event`) on standard output. Every
-frame's `v` must equal `NOTIFY_STREAM_VERSION` (currently 1); a version
+frame's `v` must equal `NOTIFY_STREAM_VERSION` (currently 2); a version
 mismatch or an oversized line is rejected, never panicked on.
 
-- Commands: `notify`, `close`, `shutdown`. Events: `action_invoked`,
-  `closed`.
+- Commands: `notify`, `close`, `set_appearance` (version 2; carries the
+  same appearance snapshot as the one-shot request, pushed once after
+  spawn and again whenever desktop preferences change), `shutdown`.
+  Events: `action_invoked`, `closed`.
 - One JSON line past 64 KiB (`MAX_NOTIFY_LINE_BYTES`) is rejected; both
   peers read through the same bounded reader so neither grows memory
   unboundedly.

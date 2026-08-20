@@ -256,10 +256,7 @@ mod tests {
             &self,
             _region: Option<aegis_portal_ipc::Rect>,
         ) -> Result<CaptureOutputPayload, String> {
-            if self
-                .fail
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("simulated capture failure".into());
             }
             Ok(CaptureOutputPayload {
@@ -271,10 +268,8 @@ mod tests {
     }
 
     fn temp_socket(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aegis-ipc-tests-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aegis-ipc-tests-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("aegis.sock")
@@ -290,9 +285,7 @@ mod tests {
         let mut capture = PortalCapture::new(socket.clone());
 
         // Baseline: the first capture connects and succeeds.
-        capture
-            .capture_png()
-            .expect("the first capture succeeds");
+        capture.capture_png().expect("the first capture succeeds");
 
         // The compositor goes away entirely (restart). The next capture
         // fails — one reconnect attempt cannot reach a dead socket — but

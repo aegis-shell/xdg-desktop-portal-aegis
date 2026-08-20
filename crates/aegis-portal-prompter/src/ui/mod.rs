@@ -12,6 +12,7 @@ pub mod launcher_edit;
 pub mod notify;
 pub mod secret;
 pub mod secret_buffer;
+pub mod sizing;
 pub mod style;
 
 use std::cell::RefCell;
@@ -20,6 +21,8 @@ use std::rc::Rc;
 use iris::{Application, Config, Frame, Input, PaintHost, StartHost};
 use lens::{key, mods};
 use style::metrics;
+
+use aegis_portal_prompter::PromptAppearance;
 
 /// The stable desktop application id reported to the compositor.
 pub const APP_ID: &str = "dev.aegis.PortalPrompter";
@@ -35,32 +38,83 @@ pub fn window_title(title: &str, app_id: Option<&str>) -> String {
     }
 }
 
-/// Run one prompt window until it closes and hand back the final state.
-/// `build` is the per-frame chrome builder; the state usually carries a
-/// `done: Option<_>` the builder fills before calling [`close_window`].
-pub fn run_window<T>(
+/// One dialog window's chrome policy: the initial and minimum sizes and
+/// the accessibility flags, all derived from the request's appearance
+/// snapshot plus the dialog's measured content.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowChrome {
+    /// Initial logical size (passed to iris).
+    pub size: (i32, i32),
+    /// Minimum logical size the compositor should respect (`None` leaves
+    /// iris's default). Small adaptive dialogs pin their measured size so
+    /// a user cannot shrink them below their content; large dialogs pin a
+    /// lower bound that keeps the layout usable.
+    pub min_size: Option<(i32, i32)>,
+    /// Compositor reduced-motion request, forwarded to lens.
+    pub reduced_motion: bool,
+}
+
+impl WindowChrome {
+    /// A chrome policy from a measured size and an appearance snapshot:
+    /// the minimum equals the initial size, so the window is effectively
+    /// fixed at its content size — right for permission-style prompts,
+    /// whose content does not reflow.
+    #[must_use]
+    pub fn fixed_to(size: (i32, i32), appearance: Option<&PromptAppearance>) -> Self {
+        Self {
+            size,
+            min_size: Some(size),
+            reduced_motion: appearance.is_some_and(|a| a.reduced_motion),
+        }
+    }
+
+    /// A resizable chrome policy: only the accessibility flag is taken
+    /// from the snapshot; the caller pins its own minimum.
+    #[must_use]
+    pub fn resizable(
+        size: (i32, i32),
+        min_size: (i32, i32),
+        appearance: Option<&PromptAppearance>,
+    ) -> Self {
+        Self {
+            size,
+            min_size: Some(min_size),
+            reduced_motion: appearance.is_some_and(|a| a.reduced_motion),
+        }
+    }
+}
+
+/// [`run_chrome_with_lifecycle`] for dialogs without device-backed
+/// resources: title, chrome policy, state, and the per-frame builder.
+pub fn run_window_with_chrome<T>(
     title: &str,
-    size: (i32, i32),
+    chrome: WindowChrome,
     state: T,
     build: impl FnMut(&mut T, &mut Frame, &Input),
 ) -> Result<T, String> {
-    run_window_with_lifecycle(title, size, state, |_, _| {}, build, |_| {})
+    run_chrome_with_lifecycle(title, chrome, state, |_, _| {}, build, |_| {})
 }
 
-/// [`run_window`] with the iris lifecycle hooks wrapped around it:
-/// `on_start` runs once after iris created its device, canvas, and lens
-/// context — the only point a dialog may capture the device for texture
-/// uploads — and `on_stop` runs after the frame loop, before iris destroys
-/// the device, so device-backed resources can be released (ADR-0045). The
-/// paint callback stays unset, keeping the backend's idle frame-skip.
-pub fn run_window_with_lifecycle<T>(
+/// [`run_window_with_chrome`] with the iris lifecycle hooks wrapped
+/// around it: `on_start` runs once after iris created its device, canvas,
+/// and lens context — the only point a dialog may capture the device for
+/// texture uploads — and `on_stop` runs after the frame loop, before iris
+/// destroys the device, so device-backed resources can be released
+/// (ADR-0045). The paint callback stays unset, keeping the backend's
+/// idle frame-skip.
+pub fn run_chrome_with_lifecycle<T>(
     title: &str,
-    size: (i32, i32),
+    chrome: WindowChrome,
     state: T,
     on_start: impl FnOnce(&mut T, DevicePtr),
     mut build: impl FnMut(&mut T, &mut Frame, &Input),
     on_stop: impl FnOnce(&mut T),
 ) -> Result<T, String> {
+    let WindowChrome {
+        size,
+        min_size,
+        reduced_motion,
+    } = chrome;
     let config = Config::new(title.to_owned())
         .map_err(|error| format!("invalid dialog title: {error}"))?
         .app_id(APP_ID)
@@ -79,6 +133,11 @@ pub fn run_window_with_lifecycle<T>(
     let mut on_stop = Some(on_stop);
     let mut start = move |host: StartHost| -> bool {
         let device = DevicePtr::from_host(&host);
+        // The window exists from here on: pin the compositor-facing
+        // minimum size before the first frame paints.
+        if let Some((w, h)) = min_size {
+            set_window_min_size(w, h);
+        }
         if let Some(on_start) = on_start.take() {
             on_start(&mut start_state.borrow_mut(), device);
         }
@@ -89,7 +148,14 @@ pub fn run_window_with_lifecycle<T>(
             on_stop(&mut stop_state.borrow_mut());
         }
     };
+    // Reduced motion needs the live lens context, which only exists inside
+    // the frame envelope: the first build applies it before the dialog's
+    // own builder runs. A pending Option keeps it to exactly one call.
+    let mut motion_pending = reduced_motion.then_some(reduced_motion);
     let mut frame_builder = move |frame: &mut Frame, input: &Input| {
+        if let Some(reduced) = motion_pending.take() {
+            set_reduced_motion(frame, reduced);
+        }
         build(&mut build_state.borrow_mut(), frame, input);
     };
 
@@ -101,16 +167,40 @@ pub fn run_window_with_lifecycle<T>(
         None::<fn(PaintHost)>,
     )
     .map_err(|error| format!("dialog run failed: {error}"))?;
-    // The run has returned, so every callback borrow is over: exactly this
-    // wrapper's clone of the state Rc remains (iris drops its callbacks
-    // before returning), which `try_unwrap` hands back. A panic here would
-    // mean iris kept a callback alive past the run — a binding bug, not a
-    // dialog state problem — so asserting is right.
+    // The run has returned, but this frame's own closures — `start`,
+    // `stop`, `frame_builder` — are still live locals, each holding a
+    // clone of the state Rc. Dropping them first is what leaves exactly
+    // the wrapper's clone for `try_unwrap` to hand back; without it the
+    // notification daemon's sequential window batches would panic on
+    // every graceful close (the one-shot dialogs only survived because
+    // the process exits before the panic can matter).
+    drop(start);
+    drop(stop);
+    drop(frame_builder);
     let state = match Rc::try_unwrap(state) {
         Ok(state) => state,
-        Err(_) => unreachable!("iris released its callbacks before run returned"),
+        Err(_) => unreachable!("run_window locals dropped before try_unwrap"),
     };
     Ok(state.into_inner())
+}
+
+/// Configure the minimum logical window size the compositor should
+/// respect. Thread-affine to the active run like every window call; a
+/// documented no-op on backends without size hints.
+pub fn set_window_min_size(width: i32, height: i32) {
+    // SAFETY: called from the run thread inside a started run; outside a
+    // run iris documents the call as a no-op.
+    unsafe { iris::sys::iris_window_set_min_size(width, height) };
+}
+
+/// Ask lens to drop its fades and eased transitions. Maps the compositor's
+/// reduced-motion preference onto the UI library's switch; a false value
+/// keeps lens's default (animated). Called with the live frame (its raw
+/// pointer is the lens context) at the top of the first build.
+pub fn set_reduced_motion(frame: &mut Frame, reduced: bool) {
+    // SAFETY: the frame is live for the build callback; as_raw is exactly
+    // the lens context this frame belongs to.
+    unsafe { lens::sys::lens_set_reduced_motion(frame.as_raw(), reduced) };
 }
 
 /// A non-owning handle to the `flux_device` iris owns for this run.

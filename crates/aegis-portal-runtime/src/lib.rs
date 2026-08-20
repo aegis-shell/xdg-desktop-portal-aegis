@@ -314,12 +314,17 @@ mod tests {
             drop(rx);
         });
         let tracker = Arc::new(Mutex::new(RequestTracker::default()));
-        let response = zbus::block_on(dispatch(&conn, &tracker, "/r/full", "probe", &tx, |reply| {
-            ProbeJob {
+        let response = zbus::block_on(dispatch(
+            &conn,
+            &tracker,
+            "/r/full",
+            "probe",
+            &tx,
+            |reply| ProbeJob {
                 path: "/r/full".to_string(),
                 reply,
-            }
-        }))
+            },
+        ))
         .expect("a full queue is a refusal, not a D-Bus error");
         assert_eq!(response.0, 2, "portal code 2 = refused");
         assert!(response.1.is_empty());
@@ -337,12 +342,17 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<ProbeJob>(1);
         drop(rx);
         let tracker = Arc::new(Mutex::new(RequestTracker::default()));
-        let error = zbus::block_on(dispatch(&conn, &tracker, "/r/gone", "probe", &tx, |reply| {
-            ProbeJob {
+        let error = zbus::block_on(dispatch(
+            &conn,
+            &tracker,
+            "/r/gone",
+            "probe",
+            &tx,
+            |reply| ProbeJob {
                 path: "/r/gone".to_string(),
                 reply,
-            }
-        }))
+            },
+        ))
         .expect_err("a gone worker is a D-Bus failure");
         assert!(
             error.to_string().contains("probe worker is gone"),
@@ -364,15 +374,22 @@ mod tests {
             }
         });
         let tracker = Arc::new(Mutex::new(RequestTracker::default()));
-        let error = zbus::block_on(dispatch(&conn, &tracker, "/r/drop", "probe", &tx, |reply| {
-            ProbeJob {
+        let error = zbus::block_on(dispatch(
+            &conn,
+            &tracker,
+            "/r/drop",
+            "probe",
+            &tx,
+            |reply| ProbeJob {
                 path: "/r/drop".to_string(),
                 reply,
-            }
-        }))
+            },
+        ))
         .expect_err("a dropped reply is a D-Bus failure");
         assert!(
-            error.to_string().contains("probe worker dropped its response"),
+            error
+                .to_string()
+                .contains("probe worker dropped its response"),
             "unexpected error: {error}"
         );
     }

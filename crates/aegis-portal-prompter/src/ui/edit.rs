@@ -195,8 +195,12 @@ pub struct EditSurface<'a> {
 /// Render one edit surface and, while it is focused, report its caret
 /// rectangle so the IME candidate window tracks the caret. Returns the
 /// row's response (click/hover state for focus-follows-pointer).
-pub fn edit_surface(f: &mut Frame, dark: bool, surface: EditSurface<'_>) -> lens::Response {
-    let palette = style::palette(dark);
+pub fn edit_surface(
+    f: &mut Frame,
+    appearance: &style::ThemeInput,
+    surface: EditSurface<'_>,
+) -> lens::Response {
+    let palette = appearance.palette();
     let opts = LayoutOpts {
         height: metrics::FIELD_HEIGHT,
         pad: metrics::SPACE_S,
@@ -250,7 +254,7 @@ pub fn edit_surface(f: &mut Frame, dark: bool, surface: EditSurface<'_>) -> lens
             if focused {
                 f.row_ex(&caret_bar(palette.text), |_| {});
             }
-            f.push_style(style::muted_style(dark));
+            f.push_style(style::muted_style_for(&palette));
             f.label(surface.placeholder);
             f.pop_style();
             return;
@@ -275,7 +279,7 @@ pub fn edit_surface(f: &mut Frame, dark: bool, surface: EditSurface<'_>) -> lens
                             ..Default::default()
                         },
                         |f| {
-                            f.push_style(style::accent_text_style(dark));
+                            f.push_style(style::accent_text_style_for(&palette));
                             if !runs.pre_before.is_empty() {
                                 f.label(runs.pre_before);
                             }

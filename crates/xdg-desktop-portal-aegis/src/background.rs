@@ -279,6 +279,7 @@ fn results(autostart: bool) -> HashMap<String, Value<'static>> {
 pub(crate) fn background_worker(
     rx: mpsc::Receiver<BackgroundJob>,
     tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
 ) {
     const MAX_ACTIVE_BACKGROUND_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -305,13 +306,21 @@ pub(crate) fn background_worker(
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-background-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result = run_request(&task_tracker, &request_path, &app_id, prompt, autostart);
+                let result = run_request(
+                    &task_tracker,
+                    &request_path,
+                    &app_id,
+                    prompt,
+                    autostart,
+                    Some(&task_settings),
+                );
                 let _ = reply.send_blocking(result);
             })
         {
@@ -328,13 +337,14 @@ fn run_request(
     app_id: &str,
     prompt: ConfirmRequest,
     autostart: Option<AutostartSpec>,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "background tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
     let cancelled = || sync::lock(tracker, "background tracker").was_closed(request_path);
-    let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), Some(&cancelled));
+    let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), settings, Some(&cancelled));
     match confirmed {
         Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => {
             // Request.Close wins a race with a completed child response.

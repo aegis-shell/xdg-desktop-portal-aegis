@@ -15,9 +15,75 @@ use std::path::{Component, Path, PathBuf};
 
 /// Version of the private stdin/stdout contract. The backend and prompter
 /// reject mismatches instead of interpreting fields using different schemas.
-/// Version 5 adds the `choose_source` prompt kind (the ScreenCast source
-/// chooser); version 4 added the app chooser and launcher editor.
-pub const PROCESS_CONTRACT_VERSION: u32 = 5;
+/// Version 6 adds the request-level `appearance` snapshot (compositor
+/// desktop preferences for the dialog's look); version 5 added the
+/// `choose_source` prompt kind; version 4 added the app chooser and
+/// launcher editor.
+pub const PROCESS_CONTRACT_VERSION: u32 = 6;
+
+/// The compositor-owned appearance snapshot every prompt renders with:
+/// the desktop preferences that decide a dialog's palette and motion,
+/// projected by the backend from its settings store. All fields are
+/// optional so the backend can omit the whole snapshot (for example when
+/// the compositor IPC was unavailable at startup); the prompter then
+/// falls back to its own platform query.
+///
+/// This is a deliberate local projection of the compositor's
+/// `DesktopPreferences` (Aegis IPC `GetSettings`), not a dependency on the
+/// `aegis-portal-ipc` crate: the prompter process stays independent of
+/// the backend's wire stack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptAppearance {
+    /// The compositor's resolved colour scheme request (`"system"`,
+    /// `"dark"`, `"light"`), mirroring Aegis `ColorScheme` on the wire.
+    pub color_scheme: PromptColorScheme,
+    /// The user's accent colour as 8-bit RGB, when the compositor
+    /// publishes one; `None` keeps the palette's built-in accent.
+    pub accent_color: Option<PromptAccent>,
+    /// Whether contrast-boosted text is requested.
+    pub high_contrast: bool,
+    /// Whether animations should be minimised (accessibility).
+    pub reduced_motion: bool,
+}
+
+/// The colour-scheme half of [`PromptAppearance`]. Values match the
+/// compositor's kebab-case wire values so the backend can forward its own
+/// enum through serde without a mapping step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptColorScheme {
+    /// Follow the platform; the prompter resolves this itself.
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+/// The accent-colour half of [`PromptAppearance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptAccent {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl PromptAppearance {
+    /// Validate the snapshot's invariants. The fields are plain enums and
+    /// numbers, so only the accent needs a rule: a fully-transparent
+    /// accent (0,0,0 with alpha implied) would blacken every accent
+    /// surface, so it is rejected rather than rendered.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(accent) = self.accent_color
+            && accent.red == 0
+            && accent.green == 0
+            && accent.blue == 0
+        {
+            return Err("appearance accent colour must not be black-transparent".into());
+        }
+        Ok(())
+    }
+}
 
 /// Versioned wire envelope sent to a prompter process.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -25,6 +91,11 @@ pub const PROCESS_CONTRACT_VERSION: u32 = 5;
 pub struct PrompterRequest {
     pub version: u32,
     pub prompt: PromptRequest,
+    /// Compositor desktop preferences for this dialog's look. Absent
+    /// (`null`) means "no snapshot available": the prompter resolves the
+    /// scheme from the platform and applies its default palette.
+    #[serde(default)]
+    pub appearance: Option<PromptAppearance>,
 }
 
 impl PrompterRequest {
@@ -38,7 +109,16 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::FileChooser(request),
+            appearance: None,
         }
+    }
+
+    /// Attach the compositor appearance snapshot the dialog should render
+    /// with. Builders compose: `PrompterRequest::confirm(r).with_appearance(a)`.
+    #[must_use]
+    pub fn with_appearance(mut self, appearance: PromptAppearance) -> Self {
+        self.appearance = Some(appearance);
+        self
     }
 
     #[must_use]
@@ -46,6 +126,7 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::Confirm(confirm),
+            appearance: None,
         }
     }
 
@@ -54,6 +135,7 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::Secret(secret),
+            appearance: None,
         }
     }
 
@@ -62,6 +144,7 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::ChooseApp(choose_app),
+            appearance: None,
         }
     }
 
@@ -70,6 +153,7 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::ChooseSource(choose_source),
+            appearance: None,
         }
     }
 
@@ -78,18 +162,29 @@ impl PrompterRequest {
         Self {
             version: PROCESS_CONTRACT_VERSION,
             prompt: PromptRequest::LauncherEdit(launcher_edit),
+            appearance: None,
         }
     }
 
     pub fn into_prompt(self) -> Result<PromptRequest, String> {
+        self.validate()?;
+        Ok(self.prompt)
+    }
+
+    /// Validate the envelope's version and payload. Mirrors
+    /// [`PrompterRequest::into_prompt`] without consuming the value, so
+    /// the dialog host can check a decoded request before dispatch.
+    pub fn validate(&self) -> Result<(), String> {
         if self.version != PROCESS_CONTRACT_VERSION {
             return Err(format!(
                 "unsupported prompter request version {}; expected {}",
                 self.version, PROCESS_CONTRACT_VERSION
             ));
         }
-        self.prompt.validate()?;
-        Ok(self.prompt)
+        if let Some(appearance) = &self.appearance {
+            appearance.validate()?;
+        }
+        self.prompt.validate()
     }
 
     pub fn into_file_chooser(self) -> Result<FileChooserRequest, String> {
@@ -966,6 +1061,7 @@ mod tests {
         let envelope = PrompterRequest {
             version: PROCESS_CONTRACT_VERSION + 1,
             prompt: PromptRequest::FileChooser(request(FileChooserMode::OpenFile)),
+            appearance: None,
         };
         assert!(envelope.into_file_chooser().is_err());
         let envelope = PrompterResponse {
@@ -1004,6 +1100,70 @@ mod tests {
         let encoded = serde_json::to_value(secret).unwrap();
         assert_eq!(encoded["result"]["kind"], "secret");
         assert_eq!(encoded["result"]["response"]["status"], "secret");
+    }
+
+    #[test]
+    fn appearance_snapshot_round_trips_and_validates() {
+        let appearance = PromptAppearance {
+            color_scheme: PromptColorScheme::Light,
+            accent_color: Some(PromptAccent {
+                red: 43,
+                green: 101,
+                blue: 232,
+            }),
+            high_contrast: true,
+            reduced_motion: false,
+        };
+        let confirm = PrompterRequest::confirm(ConfirmRequest {
+            title: "Share".into(),
+            body: "Share account information?".into(),
+            accept_label: None,
+            deny_label: None,
+            modal: true,
+            parent_window: None,
+        })
+        .with_appearance(appearance);
+        let value = serde_json::to_value(&confirm).unwrap();
+        assert_eq!(value["appearance"]["color_scheme"], "light");
+        assert_eq!(value["appearance"]["accent_color"]["red"], 43);
+        assert_eq!(value["appearance"]["high_contrast"], true);
+        let decoded: PrompterRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.appearance, Some(appearance));
+        assert!(decoded.validate().is_ok());
+
+        // Absent appearance decodes as None (backend without a snapshot).
+        let bare = PrompterRequest::confirm(ConfirmRequest {
+            title: "T".into(),
+            body: "B".into(),
+            accept_label: None,
+            deny_label: None,
+            modal: false,
+            parent_window: None,
+        });
+        let value = serde_json::to_value(&bare).unwrap();
+        assert!(value.get("appearance").is_none() || value["appearance"].is_null());
+        assert_eq!(
+            serde_json::from_value::<PrompterRequest>(value)
+                .unwrap()
+                .appearance,
+            None
+        );
+
+        // A black-transparent accent is rejected before any dialog shows.
+        let invalid = PromptAppearance {
+            accent_color: Some(PromptAccent {
+                red: 0,
+                green: 0,
+                blue: 0,
+            }),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+
+        // Unknown scheme values fail closed (deny_unknown_fields is not
+        // applicable to enums, but serde rejects unknown variants).
+        let bad = serde_json::json!({"color_scheme": "sepia"});
+        assert!(serde_json::from_value::<PromptColorScheme>(bad).is_err());
     }
 
     #[test]

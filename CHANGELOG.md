@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Prompt dialogs now follow the compositor's desktop preferences: the prompter request (contract v6) carries an appearance snapshot — colour scheme, accent colour, high contrast, reduced motion — projected from the backend's settings store, fixing dialogs that previously guessed the scheme through a GNOME-only gsettings query and never saw the compositor's accent or contrast (ADR-0018).
+- Notification cards re-skin live when desktop preferences change: the notification stream grows to v2 with a `set_appearance` command the settings watcher pushes to the running daemon.
+- Content-adaptive window sizing for the permission-style dialogs: confirm, secret, and launcher-editor windows are measured from their actual text through the same headless lens context that renders them, bounded by new design tokens, and pinned to their content size as a compositor minimum; the chooser and file-chooser windows gain explicit minima.
+- Finder-style material layering in the FileChooser: the places rail and preview plate render as translucent bands with hairlines and popover/card radii over the opaque browsing plane, and the overwrite modal dims with the design system's scrim.
+- High-contrast restyling: text, strokes, fields, hover washes, and the modal scrim deepen when the compositor requests contrast; the accent and selection wash follow a published accent colour; reduced motion reaches lens.
+
+### Changed
+
+- Process contract version 5 → 6 and notification stream version 1 → 2; backend and prompter must deploy together (the version checks fail closed on mismatch, as before).
+- The style module's `dark: bool` atoms are retired in favour of palette-driven `*_for(&Palette)` forms; dialog state carries a resolved `ThemeInput` instead of a scheme bool.
+
+### Fixed
+
+- The notification daemon panicked (`Rc::try_unwrap` unreachable) on every graceful window close: the run wrapper's own `start`/`stop`/`frame_builder` closures — each holding a state clone — outlived the iris run instead of being dropped before the unwrap. Sequential window batches (every card group after the first) hit it on close; one-shot dialogs never noticed because the process exits first.
+
 ## [0.0.19] - 2026-08-20
 
 ### Added

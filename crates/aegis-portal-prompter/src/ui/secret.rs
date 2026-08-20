@@ -11,19 +11,21 @@
 //! clear path, and never reaches the clipboard. IME compositions are
 //! masked too, so a preedit never echoes the secret's content.
 
-use aegis_portal_prompter::{PromptResult, SecretRequest, SecretResponse};
+use aegis_portal_prompter::{PromptAppearance, PromptResult, SecretRequest, SecretResponse};
 use lens::{Frame, Input, LayoutOpts, key};
 
 use super::edit;
 use super::secret_buffer::SecretBuffer;
-use super::style::{self, metrics};
+use super::sizing;
+use super::style::{self, ThemeInput, metrics};
 use super::{
-    close_window, display_size, escape_pressed, key_pressed, preedit, run_window, window_title,
+    WindowChrome, close_window, display_size, escape_pressed, key_pressed, preedit,
+    run_window_with_chrome, window_title,
 };
 
 struct State {
     request: SecretRequest,
-    dark: bool,
+    appearance: ThemeInput,
     secret: SecretBuffer,
     /// Caret as a byte index into the secret, always on a char boundary.
     caret: usize,
@@ -33,23 +35,32 @@ struct State {
     done: Option<SecretResponse>,
 }
 
-pub fn run(request: SecretRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: SecretRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = window_title(&request.title, None);
+    let size = sizing::secret_size(&request.title, request.reason.as_deref());
     let state = State {
-        dark: iris::system_prefers_dark(),
+        appearance: ThemeInput::resolve(appearance),
         request,
         secret: SecretBuffer::new(),
         caret: 0,
         focused: true,
         done: None,
     };
-    let state = run_window(&title, (440, 240), state, build)?;
+    let state = run_window_with_chrome(
+        &title,
+        WindowChrome::fixed_to(size, appearance),
+        state,
+        build,
+    )?;
     let response = state.done.unwrap_or(SecretResponse::Cancelled);
     Ok(PromptResult::Secret(response))
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
     if escape_pressed(input) {
         finish(state, SecretResponse::Cancelled);
         return;
@@ -73,7 +84,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                 .as_deref()
                 .filter(|reason| !reason.is_empty())
             {
-                f.push_style(style::muted_style(state.dark));
+                f.push_style(style::muted_style_for(&state.appearance.palette()));
                 f.label_wrapped(reason, width.max(120.0));
                 f.pop_style();
             }
@@ -81,7 +92,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             let composition = if state.focused { preedit(input) } else { None };
             let response = edit::edit_surface(
                 f,
-                state.dark,
+                &state.appearance,
                 edit::EditSurface {
                     id: "secret-field",
                     text: state.secret.as_str(),
@@ -116,7 +127,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(
+                        &state.appearance.palette(),
+                    ));
                     let cancel = f.button("Cancel");
                     f.pop_style();
                     if cancel && state.done.is_none() {
@@ -179,7 +192,7 @@ mod ui_tests {
                 title: "Unlock Keyring".to_owned(),
                 reason: None,
             },
-            dark: false,
+            appearance: ThemeInput::resolve(None),
             secret: SecretBuffer::new(),
             caret: 0,
             focused: true,

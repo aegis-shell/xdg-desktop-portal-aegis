@@ -276,7 +276,11 @@ fn launch_app(app: &AppInfo, uri: &str) -> Result<(), String> {
 
 /// Dispatch open requests independently so one application leaving the
 /// chooser open cannot head-of-line block every other OpenURI request.
-pub(crate) fn open_uri_worker(rx: mpsc::Receiver<OpenUriJob>, tracker: Arc<Mutex<RequestTracker>>) {
+pub(crate) fn open_uri_worker(
+    rx: mpsc::Receiver<OpenUriJob>,
+    tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
+) {
     const MAX_ACTIVE_OPEN_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -302,6 +306,7 @@ pub(crate) fn open_uri_worker(rx: mpsc::Receiver<OpenUriJob>, tracker: Arc<Mutex
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -310,6 +315,7 @@ pub(crate) fn open_uri_worker(rx: mpsc::Receiver<OpenUriJob>, tracker: Arc<Mutex
                 let _active = active_guard;
                 let result = run_open(
                     &task_tracker,
+                    Some(&task_settings),
                     &request_path,
                     &app_id,
                     &uri,
@@ -328,8 +334,10 @@ pub(crate) fn open_uri_worker(rx: mpsc::Receiver<OpenUriJob>, tracker: Arc<Mutex
 
 /// Execute one request: launch the default, or show the chooser and launch
 /// the selection (recording it when the remember checkbox was ticked).
+#[allow(clippy::too_many_arguments)]
 fn run_open(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     uri: &str,
@@ -358,6 +366,7 @@ fn run_open(
         }
         Decision::Choose(candidates) => run_chooser(
             tracker,
+            settings,
             request_path,
             app_id,
             uri,
@@ -369,8 +378,10 @@ fn run_open(
 }
 
 /// Show the chooser dialog and act on its answer.
+#[allow(clippy::too_many_arguments)]
 fn run_chooser(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     uri: &str,
@@ -399,6 +410,7 @@ fn run_chooser(
     let cancelled = || sync::lock(tracker, "open uri tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::choose_app(request.clone()),
+        settings,
         Some(&cancelled),
     );
     match answered {

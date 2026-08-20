@@ -77,13 +77,14 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("--notification-daemon") {
         return ui::notify::run_daemon(wire);
     }
-    let response = match read_request().and_then(run_dialog) {
-        Ok(response) => response,
-        Err(message) => {
-            log::error!("prompter: {message}");
-            PrompterResponse::failed(message)
-        }
-    };
+    let response =
+        match read_request().and_then(|(request, appearance)| run_dialog(request, appearance)) {
+            Ok(response) => response,
+            Err(message) => {
+                log::error!("prompter: {message}");
+                PrompterResponse::failed(message)
+            }
+        };
     match write_response(&mut wire, &response) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -93,7 +94,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_request() -> Result<PromptRequest, String> {
+fn read_request() -> Result<
+    (
+        PromptRequest,
+        Option<aegis_portal_prompter::PromptAppearance>,
+    ),
+    String,
+> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .take(MAX_MESSAGE_BYTES + 1)
@@ -104,7 +111,9 @@ fn read_request() -> Result<PromptRequest, String> {
     }
     let request: PrompterRequest =
         serde_json::from_slice(&bytes).map_err(|error| format!("invalid request JSON: {error}"))?;
-    request.into_prompt()
+    let appearance = request.appearance;
+    let prompt = request.into_prompt()?;
+    Ok((prompt, appearance))
 }
 
 fn write_response(wire: &mut Wire, response: &PrompterResponse) -> Result<(), String> {
@@ -126,14 +135,21 @@ fn write_response(wire: &mut Wire, response: &PrompterResponse) -> Result<(), St
         .map_err(|error| error.to_string())
 }
 
-fn run_dialog(request: PromptRequest) -> Result<PrompterResponse, String> {
+fn run_dialog(
+    request: PromptRequest,
+    appearance: Option<aegis_portal_prompter::PromptAppearance>,
+) -> Result<PrompterResponse, String> {
     let result = match request {
-        PromptRequest::FileChooser(request) => ui::file_chooser::run(request)?,
-        PromptRequest::Confirm(request) => ui::confirm::run(request)?,
-        PromptRequest::Secret(request) => ui::secret::run(request)?,
-        PromptRequest::ChooseApp(request) => ui::choose_app::run(request)?,
-        PromptRequest::ChooseSource(request) => ui::choose_source::run(request)?,
-        PromptRequest::LauncherEdit(request) => ui::launcher_edit::run(request)?,
+        PromptRequest::FileChooser(request) => ui::file_chooser::run(request, appearance.as_ref())?,
+        PromptRequest::Confirm(request) => ui::confirm::run(request, appearance.as_ref())?,
+        PromptRequest::Secret(request) => ui::secret::run(request, appearance.as_ref())?,
+        PromptRequest::ChooseApp(request) => ui::choose_app::run(request, appearance.as_ref())?,
+        PromptRequest::ChooseSource(request) => {
+            ui::choose_source::run(request, appearance.as_ref())?
+        }
+        PromptRequest::LauncherEdit(request) => {
+            ui::launcher_edit::run(request, appearance.as_ref())?
+        }
     };
     Ok(PrompterResponse {
         version: aegis_portal_prompter::PROCESS_CONTRACT_VERSION,

@@ -12,12 +12,16 @@
 //! same call as the app chooser's name-only rows). Decoding *files* is
 //! the file chooser preview pane's job (ADR-0017).
 
-use aegis_portal_prompter::{LauncherEditRequest, LauncherEditResponse, PromptResult};
+use aegis_portal_prompter::{
+    LauncherEditRequest, LauncherEditResponse, PromptAppearance, PromptResult,
+};
 use lens::{Align, Frame, Input, LayoutOpts, TextBuf, key};
 
-use super::style::{self, metrics};
+use super::sizing;
+use super::style::{self, ThemeInput, metrics};
 use super::{
-    close_window, display_size, escape_pressed, focus_widget, key_pressed, run_window, window_title,
+    WindowChrome, close_window, display_size, escape_pressed, focus_widget, key_pressed,
+    run_window_with_chrome, window_title,
 };
 
 /// The name field's widget id (one dialog per prompter process).
@@ -25,7 +29,7 @@ const NAME_FIELD: &str = "launcher-name";
 
 struct State {
     request: LauncherEditRequest,
-    dark: bool,
+    appearance: ThemeInput,
     name: TextBuf,
     /// The lens text field owned keyboard input last frame.
     name_field_focused: bool,
@@ -34,18 +38,36 @@ struct State {
     done: Option<LauncherEditResponse>,
 }
 
-pub fn run(request: LauncherEditRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: LauncherEditRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = window_title(&request.title, Some(&request.app_id));
     let editable = request.editable_name;
+    let intro = format!(
+        "The application '{}' will be added to your applications.",
+        request.app_id
+    );
+    let size = sizing::launcher_edit_size(
+        &request.title,
+        &intro,
+        request.target.as_deref(),
+        request.icon_label.as_deref(),
+    );
     let state = State {
         name: TextBuf::new(1024, &request.name),
         name_field_focused: false,
         name_focus_pending: editable,
         request,
-        dark: iris::system_prefers_dark(),
+        appearance: ThemeInput::resolve(appearance),
         done: None,
     };
-    let state = run_window(&title, (460, 240), state, build)?;
+    let state = run_window_with_chrome(
+        &title,
+        WindowChrome::fixed_to(size, appearance),
+        state,
+        build,
+    )?;
     // Closing the window without answering is a cancellation, matching the
     // other dialogs' delete-event semantics.
     let response = state.done.unwrap_or(LauncherEditResponse::Cancelled);
@@ -59,7 +81,7 @@ fn current_name(state: &State) -> Option<String> {
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
     if escape_pressed(input) {
         finish(state, LauncherEditResponse::Cancelled);
         return;
@@ -85,7 +107,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             f.label(&state.request.title);
             f.pop_style();
 
-            f.push_style(style::muted_style(state.dark));
+            f.push_style(style::muted_style_for(&state.appearance.palette()));
             f.label_wrapped(
                 &format!(
                     "The application '{}' will be added to your applications.",
@@ -140,7 +162,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(
+                        &state.appearance.palette(),
+                    ));
                     let cancel = f.button("Cancel");
                     f.pop_style();
                     if cancel {
@@ -157,7 +181,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     } else {
                         // Build the disabled-looking button anyway so the
                         // layout does not jump when a name appears.
-                        f.push_style(style::disabled_button_style(state.dark));
+                        f.push_style(style::disabled_button_style_for(
+                            &state.appearance.palette(),
+                        ));
                         f.button("Install");
                         f.pop_style();
                     }

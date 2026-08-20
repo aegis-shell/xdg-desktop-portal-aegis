@@ -145,7 +145,11 @@ fn dialog_request(
 
 /// Dispatch consent prompts independently so one application leaving a
 /// prompt open cannot head-of-line block every other Access request.
-pub(crate) fn access_worker(rx: mpsc::Receiver<AccessJob>, tracker: Arc<Mutex<RequestTracker>>) {
+pub(crate) fn access_worker(
+    rx: mpsc::Receiver<AccessJob>,
+    tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
+) {
     const MAX_ACTIVE_ACCESS_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -168,13 +172,20 @@ pub(crate) fn access_worker(rx: mpsc::Receiver<AccessJob>, tracker: Arc<Mutex<Re
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-access-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result = run_dialog(&task_tracker, &request_path, &app_id, prompt);
+                let result = run_dialog(
+                    &task_tracker,
+                    &request_path,
+                    &app_id,
+                    prompt,
+                    Some(&task_settings),
+                );
                 let _ = reply.send_blocking(result);
             })
         {
@@ -190,13 +201,14 @@ fn run_dialog(
     request_path: &str,
     app_id: &str,
     prompt: ConfirmRequest,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "access tracker").was_closed(request_path) {
         return (1, HashMap::new());
     }
 
     let cancelled = || sync::lock(tracker, "access tracker").was_closed(request_path);
-    let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), Some(&cancelled));
+    let confirmed = prompter::invoke(PrompterRequest::confirm(prompt), settings, Some(&cancelled));
     match confirmed {
         Ok(PromptResult::Confirm(ConfirmResponse::Confirmed)) => {
             log::info!("portal: AccessDialog for '{app_id}' granted");

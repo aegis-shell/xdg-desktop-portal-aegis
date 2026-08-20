@@ -103,8 +103,12 @@ pub enum PortalError {
 }
 
 /// Process adapter kept at the composition root so Secret storage depends on
-/// only a narrow prompt capability, not toolkit or compositor IPC.
-struct PortalSecretPrompter;
+/// only a narrow prompt capability, not toolkit or compositor IPC. Carries a
+/// clone of the settings store so the unlock dialog follows the compositor
+/// appearance like every other prompt.
+struct PortalSecretPrompter {
+    settings: settings::SettingsStore,
+}
 
 impl SecretPrompter for PortalSecretPrompter {
     fn prompt_secret(
@@ -118,6 +122,7 @@ impl SecretPrompter for PortalSecretPrompter {
                 title: title.to_owned(),
                 reason: reason.map(str::to_owned),
             }),
+            Some(&self.settings),
             Some(cancelled),
         )
         .map_err(|error| error.to_string())?;
@@ -224,7 +229,9 @@ pub fn run() -> Result<(), PortalError> {
     // Secret is declared in aegis.portal, so its storage is part of the
     // service's startup contract. Never acquire the bus name with that
     // advertised interface missing.
-    let secret_service = SecretService::initialize(Arc::new(PortalSecretPrompter))?;
+    let secret_service = SecretService::initialize(Arc::new(PortalSecretPrompter {
+        settings: settings_store.clone(),
+    }))?;
 
     // Serve before requesting the name so no call can arrive at a name we own
     // but do not serve yet (same ordering as the SNI tray watcher).
@@ -322,9 +329,12 @@ pub fn run() -> Result<(), PortalError> {
     )?;
     // Notification supervises the daemon-mode prompter itself (lazily
     // spawned on the first AddNotification); no worker, no Request objects.
+    // One daemon manager shared by the Notification interface and the
+    // settings watcher: appearance changes re-skin the live cards.
+    let notify_daemon = Arc::new(std::sync::Mutex::new(notification::DaemonManager::default()));
     conn.object_server().at(
         DESKTOP_PATH,
-        notification::NotificationIface::new(conn.clone()),
+        notification::NotificationIface::new(conn.clone(), Arc::clone(&notify_daemon)),
     )?;
     conn.object_server().at(
         DESKTOP_PATH,
@@ -357,6 +367,7 @@ pub fn run() -> Result<(), PortalError> {
     let cast_worker_tracker = Arc::clone(&tracker);
     let cast_worker_socket = socket.clone();
     let cast_worker_store = Arc::clone(&restore_store);
+    let cast_worker_settings = settings_store.clone();
     spawn_worker("aegis-portal-screencast", move || {
         screencast::cast_worker(
             cast_rx,
@@ -366,6 +377,7 @@ pub fn run() -> Result<(), PortalError> {
             sessions,
             cast_worker_store,
             cast_worker_socket,
+            cast_worker_settings,
         )
     })?;
 
@@ -376,46 +388,61 @@ pub fn run() -> Result<(), PortalError> {
     // FileChooser dispatches one supervised UI task/process per request and
     // never shares the compositor capture worker.
     let file_chooser_tracker = Arc::clone(&tracker);
+    let file_chooser_settings = settings_store.clone();
     spawn_worker("aegis-portal-file-chooser", move || {
-        file_chooser::file_chooser_worker(file_chooser_rx, file_chooser_tracker)
+        file_chooser::file_chooser_worker(
+            file_chooser_rx,
+            file_chooser_tracker,
+            file_chooser_settings,
+        )
     })?;
 
     let account_tracker = Arc::clone(&tracker);
+    let account_settings = settings_store.clone();
     spawn_worker("aegis-portal-account", move || {
-        account::account_worker(account_rx, account_tracker)
+        account::account_worker(account_rx, account_tracker, account_settings)
     })?;
 
     let access_tracker = Arc::clone(&tracker);
+    let access_settings = settings_store.clone();
     spawn_worker("aegis-portal-access", move || {
-        access::access_worker(access_rx, access_tracker)
+        access::access_worker(access_rx, access_tracker, access_settings)
     })?;
 
     // AppChooser uses the same per-request supervised prompter pattern as
     // Access; candidate resolution happens in the served method.
     let app_chooser_tracker = Arc::clone(&tracker);
+    let app_chooser_settings = settings_store.clone();
     spawn_worker("aegis-portal-app-chooser", move || {
-        app_chooser::app_chooser_worker(app_chooser_rx, app_chooser_tracker)
+        app_chooser::app_chooser_worker(app_chooser_rx, app_chooser_tracker, app_chooser_settings)
     })?;
 
     // OpenURI launches resolved applications itself and reuses the
     // AppChooser dialog when the user must pick one.
     let open_uri_tracker = Arc::clone(&tracker);
+    let open_uri_settings = settings_store.clone();
     spawn_worker("aegis-portal-open-uri", move || {
-        open_uri::open_uri_worker(open_uri_rx, open_uri_tracker)
+        open_uri::open_uri_worker(open_uri_rx, open_uri_tracker, open_uri_settings)
     })?;
 
     // Background consent uses the same supervised confirmation prompt as
     // Access; the autostart entry write happens on the worker task.
     let background_tracker = Arc::clone(&tracker);
+    let background_settings = settings_store.clone();
     spawn_worker("aegis-portal-background", move || {
-        background::background_worker(background_rx, background_tracker)
+        background::background_worker(background_rx, background_tracker, background_settings)
     })?;
 
     // DynamicLauncher's backend surface is the install-confirmation dialog
     // only; the frontend performs the actual installation.
     let dynamic_launcher_tracker = Arc::clone(&tracker);
+    let dynamic_launcher_settings = settings_store.clone();
     spawn_worker("aegis-portal-dynamic-launcher", move || {
-        dynamic_launcher::dynamic_launcher_worker(dynamic_launcher_rx, dynamic_launcher_tracker)
+        dynamic_launcher::dynamic_launcher_worker(
+            dynamic_launcher_rx,
+            dynamic_launcher_tracker,
+            dynamic_launcher_settings,
+        )
     })?;
 
     // Wallpaper crosses the compositor IPC and does slow image I/O, so it
@@ -424,8 +451,14 @@ pub fn run() -> Result<(), PortalError> {
     wallpaper::clean_staging();
     let wallpaper_tracker = Arc::clone(&tracker);
     let wallpaper_socket = socket.clone();
+    let wallpaper_settings = settings_store.clone();
     spawn_worker("aegis-portal-wallpaper", move || {
-        wallpaper::wallpaper_worker(wallpaper_rx, wallpaper_tracker, wallpaper_socket)
+        wallpaper::wallpaper_worker(
+            wallpaper_rx,
+            wallpaper_tracker,
+            wallpaper_socket,
+            wallpaper_settings,
+        )
     })?;
 
     // Print spools the document and hands it to the system `lp` client
@@ -435,7 +468,8 @@ pub fn run() -> Result<(), PortalError> {
         print::print_worker(print_rx, print_tracker)
     })?;
 
-    settings::spawn_watcher(conn.clone(), socket, settings_store).map_err(PortalError::Worker)?;
+    settings::spawn_watcher(conn.clone(), socket, settings_store, notify_daemon)
+        .map_err(PortalError::Worker)?;
 
     conn.request_name(BUS_NAME)?;
 

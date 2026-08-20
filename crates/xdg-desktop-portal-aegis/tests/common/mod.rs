@@ -173,6 +173,47 @@ pub fn read_prompter_request(
     request.into_prompt().expect("validate prompter request")
 }
 
+/// Read one recorded request's appearance snapshot (contract v6), decoded
+/// from the raw JSON so the wire shape — not just the typed projection —
+/// is what the assertion sees. `None` when the request omitted it.
+#[must_use]
+pub fn read_prompter_appearance(
+    directory: &std::path::Path,
+    index: u32,
+) -> Option<aegis_portal_ipc::DesktopPreferences> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join(format!("request-{index}.json")))
+            .expect("read recorded prompter request"),
+    )
+    .expect("decode recorded prompter request JSON");
+    value.get("appearance").map(|appearance| {
+        let color_scheme = match appearance["color_scheme"].as_str() {
+            Some("dark") => aegis_portal_ipc::ColorScheme::Dark,
+            Some("light") => aegis_portal_ipc::ColorScheme::Light,
+            _ => aegis_portal_ipc::ColorScheme::System,
+        };
+        let accent_color =
+            appearance["accent_color"]
+                .as_object()
+                .map(|accent| aegis_portal_ipc::AccentColor {
+                    red: accent["red"].as_u64().unwrap_or_default() as u8,
+                    green: accent["green"].as_u64().unwrap_or_default() as u8,
+                    blue: accent["blue"].as_u64().unwrap_or_default() as u8,
+                });
+        aegis_portal_ipc::DesktopPreferences {
+            color_scheme,
+            accent_color,
+            contrast: if appearance["high_contrast"].as_bool().unwrap_or(false) {
+                aegis_portal_ipc::Contrast::High
+            } else {
+                aegis_portal_ipc::Contrast::Normal
+            },
+            reduced_motion: appearance["reduced_motion"].as_bool().unwrap_or(false),
+            ..aegis_portal_ipc::DesktopPreferences::default()
+        }
+    })
+}
+
 /// Create a pipe-compatible, one-shot prompter fixture. Each invocation
 /// records its request before returning the correspondingly numbered reply.
 pub fn fake_prompter(directory: &std::path::Path) -> PathBuf {

@@ -213,6 +213,7 @@ fn icon_label(icon_v: &Value<'_>) -> Option<String> {
 pub(crate) fn dynamic_launcher_worker(
     rx: mpsc::Receiver<DynamicLauncherJob>,
     tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
 ) {
     const MAX_ACTIVE_PREPARE_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -237,13 +238,21 @@ pub(crate) fn dynamic_launcher_worker(
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-dynamic-launcher-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result = run_prepare(&task_tracker, &request_path, &app_id, request, icon);
+                let result = run_prepare(
+                    &task_tracker,
+                    &request_path,
+                    &app_id,
+                    request,
+                    icon,
+                    Some(&task_settings),
+                );
                 let _ = reply.send_blocking(result);
             })
         {
@@ -261,6 +270,7 @@ fn run_prepare(
     app_id: &str,
     request: LauncherEditRequest,
     icon: OwnedValue,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "dynamic launcher tracker").was_closed(request_path) {
         return (1, HashMap::new());
@@ -269,6 +279,7 @@ fn run_prepare(
     let cancelled = || sync::lock(tracker, "dynamic launcher tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::launcher_edit(request.clone()),
+        settings,
         Some(&cancelled),
     );
     match answered {

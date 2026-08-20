@@ -398,6 +398,7 @@ impl ScreenCastIface {
 /// Dispatch blocking selections and PipeWire negotiations independently.
 /// Session close/end events stay on this dispatcher and therefore remain
 /// responsive even while another application has a confirmation open.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cast_worker(
     rx: mpsc::Receiver<CastJob>,
     jobs: mpsc::SyncSender<CastJob>,
@@ -406,6 +407,7 @@ pub(crate) fn cast_worker(
     sessions: Arc<Mutex<SessionRegistry>>,
     restore_store: Arc<Mutex<RestoreStore>>,
     socket: PathBuf,
+    settings: crate::settings::SettingsStore,
 ) {
     const MAX_ACTIVE_CAST_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -439,6 +441,7 @@ pub(crate) fn cast_worker(
                 let task_sessions = Arc::clone(&sessions);
                 let task_store = Arc::clone(&restore_store);
                 let task_socket = socket.clone();
+                let task_settings = settings.clone();
                 let active_guard = ActiveGuard(Arc::clone(&active));
                 let spawn_failure_reply = reply.clone();
                 if let Err(error) = std::thread::Builder::new()
@@ -450,6 +453,7 @@ pub(crate) fn cast_worker(
                             &task_tracker,
                             &task_sessions,
                             &task_store,
+                            Some(&task_settings),
                             &mut picker,
                             &request_path,
                             &session_path,
@@ -523,6 +527,7 @@ fn select_sources(
     tracker: &Arc<Mutex<RequestTracker>>,
     sessions: &Arc<Mutex<SessionRegistry>>,
     store: &Arc<Mutex<RestoreStore>>,
+    settings: Option<&crate::settings::SettingsStore>,
     picker: &mut crate::ipc::PortalCapture,
     request_path: &str,
     session_path: &str,
@@ -619,6 +624,7 @@ fn select_sources(
     } else {
         match choose_source(
             tracker,
+            settings,
             request_path,
             app_id,
             choices,
@@ -781,6 +787,7 @@ fn servable_source(
 /// is a prompter failure.
 fn choose_source(
     tracker: &Arc<Mutex<RequestTracker>>,
+    settings: Option<&crate::settings::SettingsStore>,
     request_path: &str,
     app_id: &str,
     options: Vec<aegis_portal_prompter::SourceChoice>,
@@ -800,6 +807,7 @@ fn choose_source(
     let cancelled = || sync::lock(tracker, "screencast tracker").was_closed(request_path);
     let answered = crate::prompter::invoke(
         aegis_portal_prompter::PrompterRequest::choose_source(request.clone()),
+        settings,
         Some(&cancelled),
     );
     match answered {

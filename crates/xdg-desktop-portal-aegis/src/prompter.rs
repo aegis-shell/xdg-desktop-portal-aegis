@@ -43,6 +43,8 @@ use std::time::Duration;
 use aegis_portal_prompter::{PromptResult, PrompterRequest, PrompterResponse};
 use zeroize::Zeroizing;
 
+use crate::settings::SettingsStore;
+
 const PROMPTER_ENV: &str = "AEGIS_PORTAL_PROMPTER";
 const MAX_MESSAGE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -54,7 +56,23 @@ pub(crate) enum InvokeError {
     Failed(String),
 }
 
+/// Invoke one prompter, stamping the compositor appearance snapshot from
+/// `settings` onto the request. Every prompt call site funnels through
+/// here so no dialog can miss the appearance contract.
 pub(crate) fn invoke(
+    mut request: PrompterRequest,
+    settings: Option<&SettingsStore>,
+    cancellation: Option<&dyn Fn() -> bool>,
+) -> Result<PromptResult, InvokeError> {
+    if let Some(appearance) = settings.map(crate::settings::prompt_appearance_of) {
+        request = request.with_appearance(appearance);
+    }
+    invoke_raw(request, cancellation)
+}
+
+/// Spawn the prompter and speak the one-shot contract without touching
+/// the request.
+fn invoke_raw(
     request: PrompterRequest,
     cancellation: Option<&dyn Fn() -> bool>,
 ) -> Result<PromptResult, InvokeError> {
@@ -305,6 +323,7 @@ mod tests {
                 modal: false,
                 parent_window: None,
             }),
+            appearance: None,
         }
     }
 
@@ -323,11 +342,11 @@ mod tests {
             &dir,
             "ok.sh",
             // A minimal confirm response: accepted with no results.
-            r#"printf '%s' '{"version":5,"result":{"kind":"confirm","response":{"status":"confirmed"}}}'"#,
+            r#"printf '%s' '{"version":6,"result":{"kind":"confirm","response":{"status":"confirmed"}}}'"#,
         );
         let override_env = PrompterOverride::install();
         override_env.point_at(&script);
-        let result = invoke(confirm_request(), None);
+        let result = invoke(confirm_request(), None, None);
         let _ = std::fs::remove_dir_all(&dir);
         match result {
             Ok(PromptResult::Confirm(_)) => {}
@@ -341,8 +360,8 @@ mod tests {
         let script = fake_prompter(&dir, "crash.sh", "exit 3");
         let override_env = PrompterOverride::install();
         override_env.point_at(&script);
-        let error =
-            invoke(confirm_request(), None).expect_err("a crashing prompter must not succeed");
+        let error = invoke(confirm_request(), None, None)
+            .expect_err("a crashing prompter must not succeed");
         let _ = std::fs::remove_dir_all(&dir);
         let InvokeError::Failed(message) = error else {
             panic!("expected Failed, got {error:?}");
@@ -356,7 +375,7 @@ mod tests {
         let script = fake_prompter(&dir, "badjson.sh", "printf 'not-json'");
         let override_env = PrompterOverride::install();
         override_env.point_at(&script);
-        let error = invoke(confirm_request(), None).expect_err("bad JSON must fail");
+        let error = invoke(confirm_request(), None, None).expect_err("bad JSON must fail");
         let _ = std::fs::remove_dir_all(&dir);
         let InvokeError::Failed(message) = error else {
             panic!("expected Failed, got {error:?}");
@@ -376,7 +395,7 @@ mod tests {
         );
         let override_env = PrompterOverride::install();
         override_env.point_at(&script);
-        let error = invoke(confirm_request(), None).expect_err("oversized output must fail");
+        let error = invoke(confirm_request(), None, None).expect_err("oversized output must fail");
         let _ = std::fs::remove_dir_all(&dir);
         let InvokeError::Failed(message) = error else {
             panic!("expected Failed, got {error:?}");
@@ -404,7 +423,7 @@ mod tests {
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = cancelled.clone();
         let cancel = move || observed.load(std::sync::atomic::Ordering::SeqCst);
-        let handle = std::thread::spawn(move || invoke(confirm_request(), Some(&cancel)));
+        let handle = std::thread::spawn(move || invoke(confirm_request(), None, Some(&cancel)));
         // Give the child a moment to start and record its pid.
         let pid = loop {
             if let Ok(text) = std::fs::read_to_string(&marker) {

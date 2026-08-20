@@ -12,11 +12,15 @@
 //! contract (`AppChoice::icon`) so an icon-capable dialog needs no version
 //! bump.
 
-use aegis_portal_prompter::{ChooseAppRequest, ChooseAppResponse, PromptResult};
+use aegis_portal_prompter::{ChooseAppRequest, ChooseAppResponse, PromptAppearance, PromptResult};
 use lens::{Align, Frame, Input, LayoutOpts, TableColumn, TableOpts};
 
+use super::style::ThemeInput;
 use super::style::{self, metrics};
-use super::{close_window, display_size, escape_pressed, focus_widget, run_window, window_title};
+use super::{
+    WindowChrome, close_window, display_size, escape_pressed, focus_widget, run_window_with_chrome,
+    window_title,
+};
 
 /// The listing table's id. One dialog runs per prompter process, so a
 /// static id suffices.
@@ -30,7 +34,7 @@ enum ChoiceState {
 
 struct State {
     request: ChooseAppRequest,
-    dark: bool,
+    appearance: ThemeInput,
     /// The highlighted row; always a valid index while the dialog runs
     /// (validation guarantees at least one candidate).
     selected: i32,
@@ -40,7 +44,10 @@ struct State {
     done: Option<ChooseAppResponse>,
 }
 
-pub fn run(request: ChooseAppRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: ChooseAppRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = window_title(&request.title, Some(&request.app_id));
     let choices = request
         .choices
@@ -60,13 +67,18 @@ pub fn run(request: ChooseAppRequest) -> Result<PromptResult, String> {
         .collect();
     let state = State {
         request,
-        dark: iris::system_prefers_dark(),
+        appearance: ThemeInput::resolve(appearance),
         selected: 0,
         choices,
         list_focus_pending: true,
         done: None,
     };
-    let state = run_window(&title, (480, 360), state, build)?;
+    let state = run_window_with_chrome(
+        &title,
+        WindowChrome::resizable((480, 360), (420, 300), appearance),
+        state,
+        build,
+    )?;
     // Closing the window without answering is a cancellation, matching the
     // other dialogs' delete-event semantics.
     let response = state.done.unwrap_or(ChooseAppResponse::Cancelled);
@@ -74,7 +86,7 @@ pub fn run(request: ChooseAppRequest) -> Result<PromptResult, String> {
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
     if escape_pressed(input) && !choices_popup_open(state, f) {
         finish(state, None);
         return;
@@ -93,7 +105,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             f.label(&state.request.title);
             f.pop_style();
 
-            f.push_style(style::muted_style(state.dark));
+            f.push_style(style::muted_style_for(&state.appearance.palette()));
             f.label_wrapped(
                 &format!(
                     "Choose an application to open content of type {}",
@@ -159,7 +171,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(
+                        &state.appearance.palette(),
+                    ));
                     let cancel = f.button("Cancel");
                     f.pop_style();
                     if cancel {

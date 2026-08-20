@@ -98,7 +98,11 @@ fn account_reason(options: &HashMap<String, Value<'_>>) -> Result<Option<String>
 
 /// Dispatch consent prompts independently so one application leaving a
 /// prompt open cannot head-of-line block every other Account request.
-pub(crate) fn account_worker(rx: mpsc::Receiver<AccountJob>, tracker: Arc<Mutex<RequestTracker>>) {
+pub(crate) fn account_worker(
+    rx: mpsc::Receiver<AccountJob>,
+    tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
+) {
     const MAX_ACTIVE_ACCOUNT_REQUESTS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -122,14 +126,21 @@ pub(crate) fn account_worker(rx: mpsc::Receiver<AccountJob>, tracker: Arc<Mutex<
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-account-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result =
-                    run_request(&task_tracker, &request_path, &app_id, parent_window, reason);
+                let result = run_request(
+                    &task_tracker,
+                    &request_path,
+                    &app_id,
+                    parent_window,
+                    reason,
+                    Some(&task_settings),
+                );
                 let _ = reply.send_blocking(result);
             })
         {
@@ -146,6 +157,7 @@ fn run_request(
     app_id: &str,
     parent_window: Option<String>,
     reason: Option<String>,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "account tracker").was_closed(request_path) {
         return (1, HashMap::new());
@@ -169,6 +181,7 @@ fn run_request(
             modal: true,
             parent_window,
         }),
+        settings,
         Some(&cancelled),
     );
     match confirmed {

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use aegis_portal_ipc::{ColorScheme, Contrast, DesktopPreferences};
+use aegis_portal_prompter::{PromptAccent, PromptAppearance, PromptColorScheme};
 use aegis_portal_runtime::sync;
 use zbus::zvariant::{OwnedValue, Str, Structure};
 
@@ -30,7 +31,8 @@ pub(crate) struct SettingsStore {
 }
 
 impl SettingsStore {
-    fn snapshot(&self) -> DesktopPreferences {
+    /// The current compositor desktop preferences.
+    pub(crate) fn snapshot(&self) -> DesktopPreferences {
         sync::read_lock(&self.preferences, "settings store").clone()
     }
 
@@ -38,6 +40,33 @@ impl SettingsStore {
         let mut current = sync::write_lock(&self.preferences, "settings store");
         std::mem::replace(&mut *current, preferences)
     }
+}
+
+/// The appearance snapshot every prompter process renders with, projected
+/// from the compositor's desktop preferences: exactly the fields the
+/// prompter's palette and motion consume (contract v6). `None` means the
+/// backend had no compositor snapshot; the prompter then falls back to
+/// its own platform query.
+pub(crate) fn prompt_appearance(preferences: &DesktopPreferences) -> Option<PromptAppearance> {
+    Some(PromptAppearance {
+        color_scheme: match preferences.color_scheme {
+            ColorScheme::System => PromptColorScheme::System,
+            ColorScheme::Dark => PromptColorScheme::Dark,
+            ColorScheme::Light => PromptColorScheme::Light,
+        },
+        accent_color: preferences.accent_color.map(|accent| PromptAccent {
+            red: accent.red,
+            green: accent.green,
+            blue: accent.blue,
+        }),
+        high_contrast: preferences.contrast == Contrast::High,
+        reduced_motion: preferences.reduced_motion,
+    })
+}
+
+/// The store's current appearance snapshot.
+pub(crate) fn prompt_appearance_of(store: &SettingsStore) -> PromptAppearance {
+    prompt_appearance(&store.snapshot()).expect("projection is total over the preferences")
 }
 
 #[derive(Clone)]
@@ -296,9 +325,19 @@ fn changed_settings(
 fn update_and_emit(
     conn: &zbus::blocking::Connection,
     store: &SettingsStore,
+    notify_daemon: &Arc<std::sync::Mutex<crate::notification::DaemonManager>>,
     preferences: DesktopPreferences,
 ) {
     let previous = store.replace(preferences.clone());
+    // Appearance-affecting changes re-skin the notification daemon's
+    // live cards (stream v2 `set_appearance`).
+    if previous.color_scheme != preferences.color_scheme
+        || previous.accent_color != preferences.accent_color
+        || previous.contrast != preferences.contrast
+        || previous.reduced_motion != preferences.reduced_motion
+    {
+        sync::lock(notify_daemon, "notification daemon").push_appearance(conn, store);
+    }
     for (namespace, key, value) in changed_settings(&previous, &preferences) {
         if let Err(error) = conn.emit_signal(
             None::<&str>,
@@ -316,10 +355,11 @@ pub(crate) fn spawn_watcher(
     conn: zbus::blocking::Connection,
     socket: PathBuf,
     store: SettingsStore,
+    notify_daemon: Arc<std::sync::Mutex<crate::notification::DaemonManager>>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("aegis-portal-settings".to_owned())
-        .spawn(move || watch_loop(conn, socket, store))
+        .spawn(move || watch_loop(conn, socket, store, notify_daemon))
         .map(|_| ())
 }
 
@@ -343,10 +383,15 @@ pub(crate) fn prime_store(socket: &Path, store: &SettingsStore) {
     }
 }
 
-fn watch_loop(conn: zbus::blocking::Connection, socket: PathBuf, store: SettingsStore) {
+fn watch_loop(
+    conn: zbus::blocking::Connection,
+    socket: PathBuf,
+    store: SettingsStore,
+    notify_daemon: Arc<std::sync::Mutex<crate::notification::DaemonManager>>,
+) {
     let mut reported_disconnect = false;
     loop {
-        match watch_connection(&conn, &socket, &store) {
+        match watch_connection(&conn, &socket, &store, &notify_daemon) {
             Ok(()) => unreachable!("settings subscription only exits on an IPC error"),
             Err(error) => {
                 if !reported_disconnect {
@@ -368,6 +413,7 @@ fn watch_connection(
     conn: &zbus::blocking::Connection,
     socket: &Path,
     store: &SettingsStore,
+    notify_daemon: &Arc<std::sync::Mutex<crate::notification::DaemonManager>>,
 ) -> std::io::Result<()> {
     let mut events = aegis_portal_ipc::Client::connect_with_timeout(
         socket,
@@ -382,12 +428,12 @@ fn watch_connection(
         aegis_portal_ipc::ConnectionCapabilities::QUERY,
         IPC_TIMEOUT,
     )?;
-    update_and_emit(conn, store, query.settings()?.preferences);
+    update_and_emit(conn, store, notify_daemon, query.settings()?.preferences);
     log::info!("portal: subscribed to compositor desktop preferences");
 
     loop {
         if let aegis_portal_ipc::Event::SettingsChanged { .. } = events.next_event()? {
-            update_and_emit(conn, store, query.settings()?.preferences);
+            update_and_emit(conn, store, notify_daemon, query.settings()?.preferences);
         }
     }
 }

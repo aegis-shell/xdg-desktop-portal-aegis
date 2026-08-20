@@ -14,8 +14,10 @@
 use std::io;
 use std::io::{BufRead as _, Read as _};
 
-/// Version of the notification stream protocol.
-pub const NOTIFY_STREAM_VERSION: u32 = 1;
+/// Version of the notification stream protocol. Version 2 adds the
+/// `set_appearance` command (compositor desktop preferences for the
+/// cards' look, pushed whenever settings change).
+pub const NOTIFY_STREAM_VERSION: u32 = 2;
 
 /// One JSON line past this size is rejected.
 pub const MAX_NOTIFY_LINE_BYTES: usize = 64 * 1024;
@@ -104,7 +106,16 @@ fn bounded(name: &str, value: &str, limit: usize) -> Result<(), String> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NotifyCommand {
     Notify(Notification),
-    Close { app_id: String, id: String },
+    Close {
+        app_id: String,
+        id: String,
+    },
+    /// Replace the appearance snapshot the cards render with (stream
+    /// version 2). Sent once after the daemon starts and again whenever
+    /// the compositor's desktop preferences change.
+    SetAppearance {
+        appearance: crate::PromptAppearance,
+    },
     Shutdown,
 }
 
@@ -166,6 +177,7 @@ impl CommandFrame {
                 bounded("app id", app_id, MAX_APP_ID_BYTES)?;
                 bounded("notification id", id, MAX_NOTIFICATION_ID_BYTES)?;
             }
+            NotifyCommand::SetAppearance { appearance } => appearance.validate()?,
             NotifyCommand::Shutdown => {}
         }
         Ok(frame)
@@ -273,12 +285,21 @@ mod tests {
 
     #[test]
     fn command_frames_round_trip() {
+        let set_appearance = NotifyCommand::SetAppearance {
+            appearance: crate::PromptAppearance {
+                color_scheme: crate::PromptColorScheme::Dark,
+                accent_color: None,
+                high_contrast: false,
+                reduced_motion: true,
+            },
+        };
         for cmd in [
             NotifyCommand::Notify(notification()),
             NotifyCommand::Close {
                 app_id: "dev.aegis.Test".into(),
                 id: "msg-1".into(),
             },
+            set_appearance,
             NotifyCommand::Shutdown,
         ] {
             let line = CommandFrame::new(cmd.clone()).encode().unwrap();
@@ -286,6 +307,33 @@ mod tests {
             let decoded = CommandFrame::decode(&line).unwrap();
             assert_eq!(decoded.cmd, cmd);
             assert_eq!(decoded.v, NOTIFY_STREAM_VERSION);
+        }
+    }
+
+    #[test]
+    fn set_appearance_command_decodes_from_literal_json() {
+        // The literal shape the backend writes, pinned so the two sides
+        // cannot drift apart silently.
+        let line = concat!(
+            r#"{"v":2,"cmd":{"kind":"set_appearance","appearance":"#,
+            r#"{"color_scheme":"dark","accent_color":{"red":1,"green":2,"blue":3},"#,
+            r#""high_contrast":false,"reduced_motion":false}}}"#,
+            "\n"
+        );
+        let frame = CommandFrame::decode(line.as_bytes()).unwrap();
+        match frame.cmd {
+            NotifyCommand::SetAppearance { appearance } => {
+                assert_eq!(appearance.color_scheme, crate::PromptColorScheme::Dark);
+                assert_eq!(
+                    appearance.accent_color,
+                    Some(crate::PromptAccent {
+                        red: 1,
+                        green: 2,
+                        blue: 3
+                    })
+                );
+            }
+            other => panic!("expected SetAppearance, got {other:?}"),
         }
     }
 
@@ -311,8 +359,21 @@ mod tests {
     fn malformed_and_oversized_frames_are_rejected() {
         assert!(CommandFrame::decode(b"").is_err());
         assert!(CommandFrame::decode(b"not json\n").is_err());
-        assert!(CommandFrame::decode(b"{\"v\":2,\"cmd\":{\"kind\":\"shutdown\"}}\n").is_err());
-        assert!(CommandFrame::decode(b"{\"v\":1,\"cmd\":{\"kind\":\"explode\"}}\n").is_err());
+        assert!(CommandFrame::decode(b"{\"v\":3,\"cmd\":{\"kind\":\"shutdown\"}}\n").is_err());
+        assert!(CommandFrame::decode(b"{\"v\":2,\"cmd\":{\"kind\":\"explode\"}}\n").is_err());
+        // A black-transparent accent is rejected on the stream too.
+        assert!(
+            CommandFrame::decode(
+                concat!(
+                    r#"{"v":2,"cmd":{"kind":"set_appearance","appearance":"#,
+                    r#"{"color_scheme":"system","accent_color":{"red":0,"green":0,"blue":0},"#,
+                    r#""high_contrast":false,"reduced_motion":false}}}"#,
+                    "\n"
+                )
+                .as_bytes()
+            )
+            .is_err()
+        );
 
         let mut too_many_buttons = notification();
         too_many_buttons.buttons = vec![

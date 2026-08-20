@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use aegis_portal_prompter::PromptAppearance;
 use aegis_portal_prompter::notify::{
     CommandFrame, EventFrame, MAX_LIVE_NOTIFICATIONS, Notification, NotifyCommand, NotifyEvent,
     read_line_bounded,
@@ -32,7 +33,9 @@ use aegis_portal_prompter::notify::{
 use lens::{Align, Frame, Input, LayoutOpts};
 
 use super::style::{self, metrics};
-use super::{close_window, escape_pressed, run_window, truncate_to_width};
+use super::{
+    WindowChrome, close_window, escape_pressed, run_window_with_chrome, truncate_to_width,
+};
 use crate::wire::Wire;
 
 /// One live notification card.
@@ -45,7 +48,13 @@ struct Card {
 struct State {
     /// Newest first.
     cards: Vec<Card>,
-    dark: bool,
+    /// The resolved appearance the cards render with. Re-resolved from
+    /// the latest `SetAppearance` command (stream v2); the platform
+    /// fallback applies until the backend pushes one.
+    appearance: style::ThemeInput,
+    /// The last pushed appearance snapshot, kept for the window chrome
+    /// (the reduced-motion flag rides the snapshot, not the palette).
+    pending_appearance: Option<PromptAppearance>,
     commands: mpsc::Receiver<NotifyCommand>,
     events: mpsc::Sender<NotifyEvent>,
     shutdown: bool,
@@ -79,6 +88,10 @@ impl State {
 fn apply_command(state: &mut State, cmd: NotifyCommand) {
     match cmd {
         NotifyCommand::Shutdown => state.shutdown = true,
+        NotifyCommand::SetAppearance { appearance } => {
+            state.appearance = style::ThemeInput::resolve(Some(&appearance));
+            state.pending_appearance = Some(appearance);
+        }
         NotifyCommand::Close { app_id, id } => {
             if let Some(index) = state
                 .cards
@@ -143,7 +156,8 @@ pub fn run_daemon(wire: Wire) -> ExitCode {
 
     let mut state = State {
         cards: Vec::new(),
-        dark: iris::system_prefers_dark(),
+        appearance: style::ThemeInput::resolve(None),
+        pending_appearance: None,
         commands: command_rx,
         events,
         shutdown: false,
@@ -165,7 +179,12 @@ pub fn run_daemon(wire: Wire) -> ExitCode {
         if state.cards.is_empty() {
             continue;
         }
-        state = match run_window("Notifications", (420, 520), state, build) {
+        state = match run_window_with_chrome(
+            "Notifications",
+            WindowChrome::resizable((420, 520), (360, 240), state.pending_appearance.as_ref()),
+            state,
+            build,
+        ) {
             Ok(state) => state,
             Err(error) => {
                 log::error!("prompter: notification window failed: {error}");
@@ -245,7 +264,7 @@ fn spawn_writer(events: mpsc::Receiver<NotifyEvent>, wire: Wire) -> std::thread:
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
 
     // Commands first: the reader thread's wake guarantees this frame runs
     // soon after a command lands.
@@ -293,7 +312,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
 fn card(state: &mut State, f: &mut Frame, index: usize) {
     let notification = state.cards[index].notification.clone();
     let key = format!("{}:{}", notification.app_id, notification.id);
-    let palette = style::palette(state.dark);
+    let palette = state.appearance.palette();
 
     let body_opts = LayoutOpts {
         gap: metrics::SPACE_XXS,
@@ -316,7 +335,7 @@ fn card(state: &mut State, f: &mut Frame, index: usize) {
                     f.pop_style();
                 }
                 if !notification.body.is_empty() {
-                    f.push_style(style::muted_style(state.dark));
+                    f.push_style(style::muted_style_for(&palette));
                     f.label_wrapped(&notification.body, width.max(120.0));
                     f.pop_style();
                 }
@@ -355,7 +374,7 @@ fn card(state: &mut State, f: &mut Frame, index: usize) {
             }
             f.flex(1.0);
             f.spacer(0.0);
-            f.push_style(style::secondary_button_style(state.dark));
+            f.push_style(style::secondary_button_style_for(&palette));
             let dismiss = f.button("Dismiss");
             f.pop_style();
             if dismiss {
@@ -376,7 +395,8 @@ mod tests {
         let (events, _event_rx) = mpsc::channel();
         State {
             cards: Vec::new(),
-            dark: true,
+            appearance: style::ThemeInput::resolve(None),
+            pending_appearance: None,
             commands: command_rx,
             events,
             shutdown: false,

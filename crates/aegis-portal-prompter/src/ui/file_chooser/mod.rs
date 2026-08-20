@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aegis_portal_prompter::{
-    BytePath, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter, PromptResult,
+    BytePath, FileChooserMode, FileChooserRequest, FileChooserResponse, FileFilter,
+    PromptAppearance, PromptResult,
 };
 use lens::{
     Align, Color, Frame, Input, LayoutOpts, ModalOpts, TableColumn, TableOpts, TextBuf, key, mods,
@@ -37,12 +38,12 @@ use model::{
 };
 use preview::{PreviewPanel, PreviewState};
 
-use super::style::{self, metrics};
+use super::style::{self, ThemeInput, metrics};
 use super::{
-    back_icon, close_window, command_held, committed_text, computer_icon, display_size,
-    draw_texture_centered, edit_icon, escape_pressed, focus_widget, forward_icon, home_icon,
-    key_pressed, modifiers, new_folder_icon, parent_icon, raw_icon, run_window_with_lifecycle,
-    truncate_to_width, window_title,
+    WindowChrome, back_icon, close_window, command_held, committed_text, computer_icon,
+    display_size, draw_texture_centered, edit_icon, escape_pressed, focus_widget, forward_icon,
+    home_icon, key_pressed, modifiers, new_folder_icon, parent_icon, raw_icon,
+    run_chrome_with_lifecycle, truncate_to_width, window_title,
 };
 
 /// Double-click window for "activate" (navigate/open) gestures.
@@ -56,7 +57,7 @@ const OVERWRITE_MODAL: &str = "chooser-overwrite";
 
 struct State {
     request: FileChooserRequest,
-    dark: bool,
+    appearance: ThemeInput,
     dir: PathBuf,
     entries: Vec<Entry>,
     listing_error: Option<String>,
@@ -133,17 +134,20 @@ enum ChoiceState {
     Options(i32),
 }
 
-pub fn run(request: FileChooserRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: FileChooserRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = requested_title(&request);
     let title = window_title(&title, Some(&request.app_id));
-    let mut state = State::new(request);
+    let mut state = State::new(request, ThemeInput::resolve(appearance));
     state.reload_entries();
     // The lifecycle hooks capture iris's device for the preview pane's
     // texture uploads and release its textures before the device goes
     // away; the default window grows to fit the pane beside the listing.
-    let state = run_window_with_lifecycle(
+    let state = run_chrome_with_lifecycle(
         &title,
-        (1100, 600),
+        WindowChrome::resizable((1100, 600), (760, 420), appearance),
         state,
         |state, device| state.preview.attach_device(device),
         build,
@@ -177,7 +181,7 @@ fn default_accept_label(mode: FileChooserMode) -> &'static str {
 }
 
 impl State {
-    fn new(request: FileChooserRequest) -> State {
+    fn new(request: FileChooserRequest, appearance: ThemeInput) -> State {
         let filters = if request.filters.is_empty() {
             request.current_filter.iter().cloned().collect()
         } else {
@@ -245,7 +249,7 @@ impl State {
             name_field_focused: false,
             name_focus_pending: save_mode,
             request,
-            dark: iris::system_prefers_dark(),
+            appearance,
             dir,
             entries: Vec::new(),
             listing_error: None,
@@ -683,13 +687,13 @@ fn typeahead(state: &mut State, text: &str) {
 fn icon_tool_button(
     f: &mut Frame,
     id: &str,
-    dark: bool,
+    palette: &style::Palette,
     enabled: bool,
     icon: impl Fn(&mut Frame),
 ) -> bool {
     f.size_next(metrics::CONTROL_HEIGHT, metrics::CONTROL_HEIGHT);
     if !enabled {
-        f.push_style(style::muted_style(dark));
+        f.push_style(style::muted_style_for(palette));
     }
     // Lens containers align only on the cross axis and pack the main axis
     // from the start, so `centered` supplies the main-axis centring: the
@@ -816,7 +820,8 @@ fn handle_keys(state: &mut State, f: &mut Frame, input: &Input) {
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
+    let palette = state.appearance.palette();
     state.ctrl_held = command_held(input);
     if state.reload {
         state.reload_entries();
@@ -853,7 +858,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     if icon_tool_button(
                         f,
                         "go-back",
-                        state.dark,
+                        &palette,
                         state.history.back().is_some(),
                         |f| back_icon(f, metrics::ICON),
                     ) && let Some(target) = state.history.go_back(&current_dir)
@@ -863,7 +868,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     if icon_tool_button(
                         f,
                         "go-forward",
-                        state.dark,
+                        &palette,
                         state.history.forward().is_some(),
                         |f| forward_icon(f, metrics::ICON),
                     ) && let Some(target) = state.history.go_forward(&current_dir)
@@ -873,20 +878,20 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     if icon_tool_button(
                         f,
                         "go-parent",
-                        state.dark,
+                        &palette,
                         state.dir.parent().is_some(),
                         |f| parent_icon(f, metrics::ICON),
                     ) && let Some(parent) = state.dir.parent().map(Path::to_path_buf)
                     {
                         state.navigate(parent);
                     }
-                    if icon_tool_button(f, "go-home", state.dark, true, |f| {
+                    if icon_tool_button(f, "go-home", &palette, true, |f| {
                         home_icon(f, metrics::ICON)
                     }) && let Some(home) = std::env::home_dir()
                     {
                         state.navigate(home);
                     }
-                    if icon_tool_button(f, "new-folder", state.dark, true, |f| {
+                    if icon_tool_button(f, "new-folder", &palette, true, |f| {
                         new_folder_icon(f, metrics::ICON)
                     }) {
                         state.creating_folder = true;
@@ -923,7 +928,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         breadcrumb(state, f);
                         f.flex(1.0);
                         f.spacer(0.0);
-                        if icon_tool_button(f, "edit-location", state.dark, true, |f| {
+                        if icon_tool_button(f, "edit-location", &palette, true, |f| {
                             edit_icon(f, metrics::ICON)
                         }) {
                             start_location_edit(state);
@@ -934,7 +939,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             if state.location_editing
                 && let Some(error) = state.location_error.clone()
             {
-                f.push_style(style::error_style(state.dark));
+                f.push_style(style::error_style_for(&palette));
                 f.label_sized(&error, metrics::FONT_SMALL);
                 f.pop_style();
             }
@@ -971,7 +976,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     },
                 );
                 if let Some(error) = state.folder_error.clone() {
-                    f.push_style(style::error_style(state.dark));
+                    f.push_style(style::error_style_for(&palette));
                     f.label_sized(&error, metrics::FONT_SMALL);
                     f.pop_style();
                 }
@@ -1014,20 +1019,28 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     ..Default::default()
                 },
                 |f| {
-                    f.scroll("chooser-places", |f| {
-                        f.column_ex(
-                            &LayoutOpts {
-                                width: metrics::SIDEBAR_WIDTH,
-                                gap: metrics::SPACE_XXS,
-                                ..Default::default()
-                            },
-                            |f| {
-                                for index in 0..state.places.len() {
-                                    let place = state.places[index].clone();
-                                    place_row(state, f, index, &place);
-                                }
-                            },
-                        );
+                    // The places rail is a translucent material band
+                    // (Finder's sidebar read): a light wash plus hairline
+                    // over the opaque surface, so the browsing column
+                    // reads as the content plane beside it.
+                    let mut rail = style::band_layout_opts(state.appearance.dark());
+                    rail.width = metrics::SIDEBAR_WIDTH;
+                    f.column_ex(&rail, |f| {
+                        f.scroll("chooser-places", |f| {
+                            f.column_ex(
+                                &LayoutOpts {
+                                    width: metrics::SIDEBAR_WIDTH,
+                                    gap: metrics::SPACE_XXS,
+                                    ..Default::default()
+                                },
+                                |f| {
+                                    for index in 0..state.places.len() {
+                                        let place = state.places[index].clone();
+                                        place_row(state, f, index, &place);
+                                    }
+                                },
+                            );
+                        });
                     });
                     f.separator();
                     f.column_ex(
@@ -1037,12 +1050,12 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                         },
                         |f| {
                             if let Some(error) = state.listing_error.clone() {
-                                f.push_style(style::error_style(state.dark));
+                                f.push_style(style::error_style_for(&palette));
                                 f.label_sized(&error, metrics::FONT_SMALL);
                                 f.pop_style();
                             }
                             if state.entries.is_empty() && state.listing_error.is_none() {
-                                f.push_style(style::small_muted_style(state.dark));
+                                f.push_style(style::small_muted_style_for(&palette));
                                 f.label_sized("This folder is empty", metrics::FONT_SMALL);
                                 f.pop_style();
                             }
@@ -1109,7 +1122,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                                 activate_entry(state, &entry);
                             }
                             if !state.typeahead.0.is_empty() {
-                                f.push_style(style::small_muted_style(state.dark));
+                                f.push_style(style::small_muted_style_for(&palette));
                                 f.label_sized(
                                     &format!("Search: {}", state.typeahead.0),
                                     metrics::FONT_SMALL,
@@ -1125,7 +1138,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             );
 
             if state.request.mode == FileChooserMode::SaveFiles {
-                f.push_style(style::small_muted_style(state.dark));
+                f.push_style(style::small_muted_style_for(&palette));
                 f.label_sized(
                     &format!("New files will be created in {}", state.dir.display()),
                     metrics::FONT_SMALL,
@@ -1163,7 +1176,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(&palette));
                     let cancel = f.button("Cancel");
                     f.pop_style();
                     if cancel {
@@ -1184,7 +1197,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     } else if !valid {
                         // Build the disabled-looking button anyway so the
                         // layout does not jump when it becomes valid.
-                        f.push_style(style::disabled_button_style(state.dark));
+                        f.push_style(style::disabled_button_style_for(&palette));
                         f.button(label);
                         f.pop_style();
                     }
@@ -1214,6 +1227,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             OVERWRITE_MODAL,
             &ModalOpts {
                 title: Some("Replace File?"),
+                backdrop: style::modal_backdrop(state.appearance.dark()),
                 min_width: 340.0,
                 ..Default::default()
             },
@@ -1239,7 +1253,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                                 f.flex(1.0);
                                 f.spacer(0.0);
                                 f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                                f.push_style(style::secondary_button_style(state.dark));
+                                f.push_style(style::secondary_button_style_for(&palette));
                                 let cancel = f.button("Cancel");
                                 f.pop_style();
                                 if cancel {
@@ -1276,17 +1290,18 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
 /// last four components. The current folder is filled and inert; clicking
 /// an ancestor navigates to it.
 fn breadcrumb(state: &mut State, f: &mut Frame) {
+    let palette = state.appearance.palette();
     let chain = breadcrumbs(&state.dir);
     let hidden = chain.len().saturating_sub(4);
     if hidden > 0 {
-        f.push_style(style::muted_style(state.dark));
+        f.push_style(style::muted_style_for(&palette));
         f.label("…");
         f.pop_style();
     }
     let last = chain.len().saturating_sub(1);
     for (position, component) in chain.into_iter().skip(hidden).enumerate() {
         if position > 0 || hidden > 0 {
-            f.push_style(style::muted_style(state.dark));
+            f.push_style(style::muted_style_for(&palette));
             f.label("›");
             f.pop_style();
         }
@@ -1304,7 +1319,7 @@ fn breadcrumb(state: &mut State, f: &mut Frame) {
 
 /// The current accent wash, resolved from the state's theme preference.
 fn palette_active(state: &State) -> Color {
-    style::palette(state.dark).active
+    style::palette(state.appearance.dark()).active
 }
 
 /// One breadcrumb segment: the root shows a drive glyph, folders show
@@ -1360,6 +1375,7 @@ fn crumb_name(component: &Path) -> String {
 /// narrow to fit it beside the listing. The pane is presentation only —
 /// it never changes the selection or the accept result.
 fn preview_pane(state: &mut State, f: &mut Frame, input: &Input) {
+    let palette = state.appearance.palette();
     // Too narrow to be worth the split: keep the whole width for browsing.
     let (window_w, _) = display_size(input);
     if window_w > 0.0 && window_w < metrics::PREVIEW_MIN_WINDOW_W {
@@ -1380,47 +1396,46 @@ fn preview_pane(state: &mut State, f: &mut Frame, input: &Input) {
         PreviewState::Hidden => {}
         PreviewState::Loading | PreviewState::Failed { .. } | PreviewState::Ready { .. } => {
             f.separator();
-            f.column_ex(
-                &LayoutOpts {
-                    width: metrics::PREVIEW_WIDTH,
-                    gap: metrics::SPACE_S,
-                    pad: metrics::SPACE_XS,
-                    ..Default::default()
-                },
-                |f| match pane {
-                    PreviewState::Ready {
-                        texture,
-                        source_size,
-                        file_bytes,
-                    } => {
-                        // The image box flexes to fill the pane's height;
-                        // the caption row below keeps its intrinsic size.
-                        f.flex(1.0);
-                        f.scroll("chooser-preview-image", |f| {
-                            let (w, h) = preview_image_box();
-                            draw_texture_centered(f, &texture, w, h);
-                        });
-                        preview_caption(
-                            f,
-                            state.dark,
-                            entry_name.as_deref(),
-                            Some((source_size, file_bytes)),
-                        );
-                    }
-                    PreviewState::Loading => {
-                        f.push_style(style::small_muted_style(state.dark));
-                        f.label_sized("Decoding preview…", metrics::FONT_SMALL);
-                        f.pop_style();
-                    }
-                    PreviewState::Failed { reason } => {
-                        f.push_style(style::small_muted_style(state.dark));
-                        f.label_wrapped_sized(&reason, metrics::FONT_SMALL, metrics::PREVIEW_WIDTH);
-                        f.pop_style();
-                        preview_caption(f, state.dark, entry_name.as_deref(), None);
-                    }
-                    PreviewState::Hidden => {}
-                },
-            );
+            // The preview renders as a card (Finder's preview plate): the
+            // material wash and card radius lift it off the listing plane.
+            let mut card = style::band_layout_opts(state.appearance.dark());
+            card.radius = metrics::RADIUS_CARD;
+            card.width = metrics::PREVIEW_WIDTH;
+            card.gap = metrics::SPACE_S;
+            card.pad = metrics::SPACE_XS;
+            f.column_ex(&card, |f| match pane {
+                PreviewState::Ready {
+                    texture,
+                    source_size,
+                    file_bytes,
+                } => {
+                    // The image box flexes to fill the pane's height;
+                    // the caption row below keeps its intrinsic size.
+                    f.flex(1.0);
+                    f.scroll("chooser-preview-image", |f| {
+                        let (w, h) = preview_image_box();
+                        draw_texture_centered(f, &texture, w, h);
+                    });
+                    preview_caption(
+                        f,
+                        &palette,
+                        entry_name.as_deref(),
+                        Some((source_size, file_bytes)),
+                    );
+                }
+                PreviewState::Loading => {
+                    f.push_style(style::small_muted_style_for(&palette));
+                    f.label_sized("Decoding preview…", metrics::FONT_SMALL);
+                    f.pop_style();
+                }
+                PreviewState::Failed { reason } => {
+                    f.push_style(style::small_muted_style_for(&palette));
+                    f.label_wrapped_sized(&reason, metrics::FONT_SMALL, metrics::PREVIEW_WIDTH);
+                    f.pop_style();
+                    preview_caption(f, &palette, entry_name.as_deref(), None);
+                }
+                PreviewState::Hidden => {}
+            });
         }
     }
 }
@@ -1444,13 +1459,13 @@ fn preview_image_box() -> (f32, f32) {
 /// both captured at decode time so no frame stats the file.
 fn preview_caption(
     f: &mut Frame,
-    dark: bool,
+    palette: &style::Palette,
     name: Option<&str>,
     details: Option<((u32, u32), u64)>,
 ) {
     if let Some(name) = name {
         let shown = truncate_to_width(f, name, metrics::PREVIEW_WIDTH - 2.0 * metrics::SPACE_XS);
-        f.push_style(style::small_muted_style(dark));
+        f.push_style(style::small_muted_style_for(palette));
         f.label_sized(&shown, metrics::FONT_SMALL);
         f.pop_style();
     }
@@ -1460,7 +1475,7 @@ fn preview_caption(
         parts.push(preview::format_size(bytes));
     }
     if !parts.is_empty() {
-        f.push_style(style::small_muted_style(dark));
+        f.push_style(style::small_muted_style_for(palette));
         f.label_sized(&parts.join(" · "), metrics::FONT_SMALL);
         f.pop_style();
     }
@@ -1700,7 +1715,7 @@ mod ui_tests {
     }
 
     fn fresh_state(mode: FileChooserMode, fixture: &Fixture) -> State {
-        let mut state = State::new(request(mode, fixture));
+        let mut state = State::new(request(mode, fixture), ThemeInput::resolve(None));
         state.reload_entries();
         state
     }
@@ -1961,7 +1976,7 @@ mod ui_tests {
         write_png(&fixture.0.join("photo.png"), 40, 20);
         let mut req = request(FileChooserMode::OpenFile, &fixture);
         req.current_file = Some(BytePath::from(fixture.0.join("photo.png")));
-        let mut state = State::new(req);
+        let mut state = State::new(req, ThemeInput::resolve(None));
         state.reload_entries();
 
         // The listing's cursor row is the preselected file
@@ -1979,7 +1994,7 @@ mod ui_tests {
         // leaves the cursor unset, not panicked.
         let mut req = request(FileChooserMode::OpenFile, &fixture);
         req.current_file = Some(BytePath::from(fixture.0.join("gone.png")));
-        let mut state = State::new(req);
+        let mut state = State::new(req, ThemeInput::resolve(None));
         state.reload_entries();
         assert_eq!(state.focus_index, None);
     }

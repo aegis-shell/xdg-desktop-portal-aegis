@@ -56,7 +56,7 @@ sync with it.
 A confirmation dialog:
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -64,14 +64,23 @@ A secret prompt (masked editing: typing, Backspace, caret keys, Ctrl+V,
 Enter to submit):
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
+  | ./target/debug/aegis-portal-prompter; echo
+```
+
+A confirmation dialog rendered with a compositor appearance snapshot
+(contract v6): an explicit light scheme, an accent override, high
+contrast, and reduced motion —
+
+```bash
+printf '%s' '{"version":6,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Light scheme with accent.","accept_label":"_Continue","modal":false,"parent_window":null}},"appearance":{"color_scheme":"light","accent_color":{"red":43,"green":101,"blue":232},"high_contrast":true,"reduced_motion":true}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
 A file chooser with a filter and multi-selection:
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"file_chooser","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"file_chooser","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -79,7 +88,7 @@ A save dialog — the download-location prompt a browser raises before
 writing a download — with a suggested file name:
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"file_chooser","request":{"mode":"save_file","app_id":"dev.aegis.Test","title":"Save Download","accept_label":null,"modal":false,"parent_window":null,"multiple":false,"current_folder":null,"current_name":"report.pdf","current_file":null,"filters":[],"current_filter":null,"choices":[],"files":[]}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"file_chooser","request":{"mode":"save_file","app_id":"dev.aegis.Test","title":"Save Download","accept_label":null,"modal":false,"parent_window":null,"multiple":false,"current_folder":null,"current_name":"report.pdf","current_file":null,"filters":[],"current_filter":null,"choices":[],"files":[]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -87,14 +96,14 @@ An application chooser (the AppChooser/OpenURI surface) with the
 remember checkbox:
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"choose_app","request":{"app_id":"dev.aegis.Test","title":"Open With","content_type":"text/plain","parent_window":null,"apps":[{"id":"org.foo.Editor.desktop","name":"Foo Editor","icon":null},{"id":"org.bar.Notes.desktop","name":"Bar Notes","icon":null}],"choices":[{"id":"remember","label":"Remember this choice","options":[],"selected":"false"}]}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"choose_app","request":{"app_id":"dev.aegis.Test","title":"Open With","content_type":"text/plain","parent_window":null,"apps":[{"id":"org.foo.Editor.desktop","name":"Foo Editor","icon":null},{"id":"org.bar.Notes.desktop","name":"Bar Notes","icon":null}],"choices":[{"id":"remember","label":"Remember this choice","options":[],"selected":"false"}]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
 A launcher-name editor (the DynamicLauncher surface):
 
 ```bash
-printf '%s' '{"version":5,"prompt":{"kind":"launcher_edit","request":{"app_id":"dev.aegis.Test","title":"Install Launcher","name":"Cool App","editable_name":true,"target":null,"icon_label":"cool-app","modal":false,"parent_window":null}}}' \
+printf '%s' '{"version":6,"prompt":{"kind":"launcher_edit","request":{"app_id":"dev.aegis.Test","title":"Install Launcher","name":"Cool App","editable_name":true,"target":null,"icon_label":"cool-app","modal":false,"parent_window":null}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -104,7 +113,7 @@ newline-delimited commands (the `aegis_portal_prompter::notify`
 protocol) to its standard input:
 
 ```bash
-printf '%s\n' '{"v":1,"cmd":{"kind":"notify","app_id":"dev.aegis.Test","id":"n1","title":"Build finished","body":"","priority":"normal","default_action":null,"buttons":[],"expire_hint":10}}' \
+printf '%s\n' '{"v":2,"cmd":{"kind":"notify","app_id":"dev.aegis.Test","id":"n1","title":"Build finished","body":"","priority":"normal","default_action":null,"buttons":[],"expire_hint":10}}' \
   | ./target/debug/aegis-portal-prompter --notification-daemon
 ```
 

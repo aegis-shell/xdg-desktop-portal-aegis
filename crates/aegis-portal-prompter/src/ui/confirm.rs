@@ -1,27 +1,45 @@
 //! The yes/no confirmation dialog (portal Account/Access consent flows):
 //! a centered heading, wrapped body text, and Cancel plus one affirmative
 //! button. Escape or the window's close button cancels.
+//!
+//! The window is content-adaptive ([`super::sizing`]): measured from the
+//! actual heading and body text, so a one-line permission request gets a
+//! compact window and a long localized body grows up to the design cap
+//! before wrapping. The dialog renders with the compositor appearance
+//! snapshot from the request (contract v6).
 
-use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptResult};
+use aegis_portal_prompter::{ConfirmRequest, ConfirmResponse, PromptAppearance, PromptResult};
 use lens::{Align, Frame, Input, LayoutOpts};
 
-use super::style::{self, metrics};
-use super::{close_window, display_size, escape_pressed, run_window, window_title};
+use super::sizing;
+use super::style::{self, ThemeInput, metrics};
+use super::{
+    WindowChrome, close_window, display_size, escape_pressed, run_window_with_chrome, window_title,
+};
 
 struct State {
     request: ConfirmRequest,
-    dark: bool,
+    appearance: ThemeInput,
     done: Option<ConfirmResponse>,
 }
 
-pub fn run(request: ConfirmRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: ConfirmRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = window_title(&request.title, None);
+    let size = sizing::confirm_size(&request.title, &request.body);
     let state = State {
-        dark: iris::system_prefers_dark(),
+        appearance: ThemeInput::resolve(appearance),
         request,
         done: None,
     };
-    let state = run_window(&title, (460, 220), state, build)?;
+    let state = run_window_with_chrome(
+        &title,
+        WindowChrome::fixed_to(size, appearance),
+        state,
+        build,
+    )?;
     // Closing the window without answering is a cancellation, matching the
     // former GTK dialog's delete-event semantics.
     let response = state.done.unwrap_or(ConfirmResponse::Cancelled);
@@ -29,7 +47,7 @@ pub fn run(request: ConfirmRequest) -> Result<PromptResult, String> {
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
     if escape_pressed(input) {
         finish(state, ConfirmResponse::Cancelled);
         return;
@@ -47,7 +65,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             f.label(&state.request.title);
             f.pop_style();
 
-            f.push_style(style::muted_style(state.dark));
+            f.push_style(style::muted_style_for(&state.appearance.palette()));
             f.label_wrapped(&state.request.body, width.max(120.0));
             f.pop_style();
 
@@ -65,7 +83,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(
+                        &state.appearance.palette(),
+                    ));
                     let deny = state
                         .request
                         .deny_label

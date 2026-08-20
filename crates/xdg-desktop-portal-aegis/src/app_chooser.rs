@@ -274,6 +274,7 @@ pub(crate) fn remembers(choices: &[(String, String)]) -> bool {
 pub(crate) fn app_chooser_worker(
     rx: mpsc::Receiver<AppChooserJob>,
     tracker: Arc<Mutex<RequestTracker>>,
+    settings: crate::settings::SettingsStore,
 ) {
     const MAX_ACTIVE_APP_CHOOSERS: usize = 32;
     struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -297,13 +298,20 @@ pub(crate) fn app_chooser_worker(
             continue;
         }
         let task_tracker = Arc::clone(&tracker);
+        let task_settings = settings.clone();
         let active_guard = ActiveGuard(Arc::clone(&active));
         let spawn_failure_reply = reply.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("aegis-portal-app-chooser-task".to_owned())
             .spawn(move || {
                 let _active = active_guard;
-                let result = run_dialog(&task_tracker, &request_path, &app_id, request);
+                let result = run_dialog(
+                    &task_tracker,
+                    &request_path,
+                    &app_id,
+                    request,
+                    Some(&task_settings),
+                );
                 let _ = reply.send_blocking(result);
             })
         {
@@ -320,6 +328,7 @@ fn run_dialog(
     request_path: &str,
     app_id: &str,
     request: ChooseAppRequest,
+    settings: Option<&crate::settings::SettingsStore>,
 ) -> (u32, HashMap<String, Value<'static>>) {
     if sync::lock(tracker, "app chooser tracker").was_closed(request_path) {
         return (1, HashMap::new());
@@ -328,6 +337,7 @@ fn run_dialog(
     let cancelled = || sync::lock(tracker, "app chooser tracker").was_closed(request_path);
     let answered = prompter::invoke(
         PrompterRequest::choose_app(request.clone()),
+        settings,
         Some(&cancelled),
     );
     match answered {

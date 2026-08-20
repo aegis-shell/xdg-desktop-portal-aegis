@@ -7,11 +7,16 @@
 //! close button cancels. The highlighted option's description renders
 //! under the list.
 
-use aegis_portal_prompter::{ChooseSourceRequest, ChooseSourceResponse, PromptResult};
+use aegis_portal_prompter::{
+    ChooseSourceRequest, ChooseSourceResponse, PromptAppearance, PromptResult,
+};
 use lens::{Align, Frame, Input, LayoutOpts, TableColumn, TableOpts};
 
-use super::style::{self, metrics};
-use super::{close_window, display_size, escape_pressed, focus_widget, run_window, window_title};
+use super::style::{self, ThemeInput, metrics};
+use super::{
+    WindowChrome, close_window, display_size, escape_pressed, focus_widget, run_window_with_chrome,
+    window_title,
+};
 
 /// The listing table's id. One dialog runs per prompter process, so a
 /// static id suffices.
@@ -19,7 +24,7 @@ const LIST_ID: &str = "choose-source-list";
 
 struct State {
     request: ChooseSourceRequest,
-    dark: bool,
+    appearance: ThemeInput,
     /// The highlighted row; always a valid index while the dialog runs
     /// (validation guarantees at least one option).
     selected: i32,
@@ -29,17 +34,25 @@ struct State {
     done: Option<ChooseSourceResponse>,
 }
 
-pub fn run(request: ChooseSourceRequest) -> Result<PromptResult, String> {
+pub fn run(
+    request: ChooseSourceRequest,
+    appearance: Option<&PromptAppearance>,
+) -> Result<PromptResult, String> {
     let title = window_title(&request.title, Some(&request.app_id));
     let state = State {
         request,
-        dark: iris::system_prefers_dark(),
+        appearance: ThemeInput::resolve(appearance),
         selected: 0,
         remember: false,
         list_focus_pending: true,
         done: None,
     };
-    let state = run_window(&title, (480, 320), state, build)?;
+    let state = run_window_with_chrome(
+        &title,
+        WindowChrome::resizable((480, 320), (420, 280), appearance),
+        state,
+        build,
+    )?;
     // Closing the window without answering is a cancellation, matching the
     // other dialogs' delete-event semantics.
     let response = state.done.unwrap_or(ChooseSourceResponse::Cancelled);
@@ -47,7 +60,7 @@ pub fn run(request: ChooseSourceRequest) -> Result<PromptResult, String> {
 }
 
 fn build(state: &mut State, f: &mut Frame, input: &Input) {
-    f.set_theme(style::theme(state.dark));
+    f.set_theme(style::theme_for(&state.appearance));
     if escape_pressed(input) {
         finish(state, None);
         return;
@@ -66,7 +79,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
             f.label(&state.request.title);
             f.pop_style();
 
-            f.push_style(style::muted_style(state.dark));
+            f.push_style(style::muted_style_for(&state.appearance.palette()));
             f.label_wrapped("Choose what to share", width.max(120.0));
             f.pop_style();
 
@@ -116,7 +129,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                 .get(state.selected.max(0) as usize)
                 .and_then(|option| option.description.as_deref())
             {
-                f.push_style(style::muted_style(state.dark));
+                f.push_style(style::muted_style_for(&state.appearance.palette()));
                 f.label_wrapped(description, width.max(120.0));
                 f.pop_style();
             }
@@ -138,7 +151,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                     f.spacer(0.0);
 
                     f.size_next(metrics::BUTTON_WIDTH, metrics::CONTROL_HEIGHT);
-                    f.push_style(style::secondary_button_style(state.dark));
+                    f.push_style(style::secondary_button_style_for(
+                        &state.appearance.palette(),
+                    ));
                     let cancel = f.button("Cancel");
                     f.pop_style();
                     if cancel {
