@@ -131,13 +131,29 @@ pub(crate) fn parse_select_options(options: &HashMap<String, Value<'_>>) -> Sele
 /// protocol can serve. OBS's unified screen-capture source always offers
 /// monitor|window and breaks on a strict equality check. The window bit and
 /// the Embedded cursor mode need protocol 29.
-fn validate_select(options: &SelectOptions, protocol: u32) -> Result<(), String> {
+/// The protocol-independent shape checks an interface method can run
+/// without touching compositor IPC: no undefined source-type bits and a
+/// defined persist mode. The capability-dependent half (servable subset,
+/// cursor mode) lives in [`validate_select`] and runs on the worker, where
+/// the live negotiated protocol is known — see `ipc::cached_protocol_version`.
+fn validate_select_shape(options: &SelectOptions) -> Result<(), String> {
     if options.source_types & !(SOURCE_TYPE_MONITOR | SOURCE_TYPE_WINDOW) != 0 {
         return Err(format!(
             "source types {:#b} name undefined bits",
             options.source_types
         ));
     }
+    if options.persist_mode > 2 {
+        return Err(format!(
+            "persist_mode {} is not defined by the ScreenCast contract",
+            options.persist_mode
+        ));
+    }
+    Ok(())
+}
+
+fn validate_select(options: &SelectOptions, protocol: u32) -> Result<(), String> {
+    validate_select_shape(options)?;
     // The mask must intersect what the compositor can serve. A window bit
     // alongside monitor is accepted everywhere and served as monitor on
     // pre-29 compositors; only a mask with no servable subset fails.
@@ -167,12 +183,6 @@ fn validate_select(options: &SelectOptions, protocol: u32) -> Result<(), String>
             ));
         }
     }
-    if options.persist_mode > 2 {
-        return Err(format!(
-            "persist_mode {} is not defined by the ScreenCast contract",
-            options.persist_mode
-        ));
-    }
     Ok(())
 }
 
@@ -183,7 +193,6 @@ pub(crate) struct ScreenCastIface {
     pub(crate) tracker: Arc<Mutex<RequestTracker>>,
     pub(crate) sessions: Arc<Mutex<SessionRegistry>>,
     pub(crate) jobs: mpsc::SyncSender<CastJob>,
-    pub(crate) socket: PathBuf,
 }
 
 #[zbus::interface(name = "org.freedesktop.impl.portal.ScreenCast")]
@@ -254,8 +263,10 @@ impl ScreenCastIface {
             )));
         }
         let options = parse_select_options(&options);
-        validate_select(&options, self.compositor_version())
-            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        // Only the protocol-independent shape here: the capability half of
+        // the validation runs on the worker against the live negotiated
+        // protocol (an interface method must not open compositor sockets).
+        validate_select_shape(&options).map_err(zbus::fdo::Error::InvalidArgs)?;
 
         let path = handle.as_str().to_string();
         log::debug!("portal: SelectSources for '{app_id}' on {session_path} at {path}");
@@ -359,14 +370,13 @@ impl ScreenCastIface {
 }
 
 impl ScreenCastIface {
-    /// The live negotiated compositor protocol; a compositor that cannot be
-    /// reached reports the conservative minimum, which advertises monitor
-    /// sources and the Hidden cursor mode only.
+    /// The live negotiated compositor protocol; a compositor that has not
+    /// been reached yet reports the conservative minimum, which advertises
+    /// monitor sources and the Hidden cursor mode only. Served from the
+    /// process-wide cache so property reads never open a socket (see
+    /// `ipc::cached_protocol_version`).
     fn compositor_version(&self) -> u32 {
-        let mut capture = crate::ipc::PortalCapture::new(self.socket.clone());
-        capture
-            .protocol_version()
-            .unwrap_or(aegis_portal_ipc::MIN_PROTOCOL_VERSION)
+        crate::ipc::cached_protocol_version()
     }
 
     /// `Ok(false)` is bounded backpressure, reported as portal response 2;
@@ -526,6 +536,12 @@ fn select_sources(
     let protocol = picker
         .protocol_version()
         .unwrap_or(aegis_portal_ipc::MIN_PROTOCOL_VERSION);
+    // The capability half of SelectSources validation, against the live
+    // negotiated protocol (the interface method checked only the shape).
+    if let Err(error) = validate_select(&options, protocol) {
+        log::warn!("portal: refusing SelectSources: {error}");
+        return 2;
+    }
 
     // A valid restore token skips every dialog: the stored selection is
     // restored as-is and the token stays valid. Anything else — an unknown,
@@ -1026,6 +1042,24 @@ mod tests {
         assert_eq!(parsed.restore_token, None);
         assert!(validate_select(&parsed, 24).is_ok());
         assert!(validate_select(&parsed, 29).is_ok());
+    }
+
+    #[test]
+    fn select_shape_rejects_protocol_independent_garbage() {
+        // Undefined source-type bits are malformed on every protocol.
+        let mut garbage = parse_select_options(&HashMap::new());
+        garbage.source_types |= 1 << 9;
+        assert!(validate_select_shape(&garbage).is_err());
+        assert!(validate_select(&garbage, 29).is_err());
+        // An undefined persist mode likewise.
+        let mut persist = parse_select_options(&HashMap::new());
+        persist.persist_mode = 3;
+        assert!(validate_select_shape(&persist).is_err());
+        assert!(validate_select(&persist, 29).is_err());
+        // The shape check is protocol-free: a monitor-only mask passes it
+        // even where the capability half would still reject other masks.
+        let monitor_only = parse_select_options(&HashMap::new());
+        assert!(validate_select_shape(&monitor_only).is_ok());
     }
 
     #[test]

@@ -67,7 +67,10 @@ fn structure_value<T>(value: T) -> OwnedValue
 where
     Structure<'static>: From<T>,
 {
-    OwnedValue::try_from(Structure::from(value)).expect("static setting structure is owned")
+    // Infallible for the fully-owned static structures built here: the
+    // try_from exists only for borrowed variants this function never
+    // produces.
+    OwnedValue::try_from(Structure::from(value)).expect("owned static setting structure")
 }
 
 fn portal_color_scheme(value: ColorScheme) -> u32 {

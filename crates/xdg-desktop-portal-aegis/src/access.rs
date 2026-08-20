@@ -64,33 +64,20 @@ impl AccessIface {
             }
         };
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(AccessJob::Dialog {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            prompt,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing Access request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "access worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("access worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "access",
+            &self.jobs,
+            |reply| AccessJob::Dialog {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                prompt,
+                reply,
+            },
+        )
+        .await
     }
 
     #[zbus(property, name = "version")]

@@ -391,7 +391,13 @@ impl DaemonManager {
             if !self.ensure_daemon(conn) {
                 return false;
             }
-            let daemon = self.daemon.as_mut().expect("daemon just ensured");
+            // `ensure_daemon` returned true, so a live daemon exists; the
+            // let-else keeps a future refactor of that invariant from
+            // panicking a D-Bus method instead of failing the send.
+            let Some(daemon) = self.daemon.as_mut() else {
+                log::error!("portal: notification daemon missing after ensure");
+                return false;
+            };
             if daemon
                 .stdin
                 .write_all(&line)

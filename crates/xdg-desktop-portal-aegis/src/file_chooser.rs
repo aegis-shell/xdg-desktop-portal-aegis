@@ -146,31 +146,19 @@ impl FileChooserIface {
             return Ok(failed());
         }
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        match self.jobs.try_send(FileChooserJob::Choose {
-            request_path: path.clone(),
-            request,
-            reply,
-        }) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing FileChooser: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "file chooser worker is gone".to_owned(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("file chooser worker dropped its response".to_owned())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "file chooser",
+            &self.jobs,
+            |reply| FileChooserJob::Choose {
+                request_path: path.clone(),
+                request,
+                reply,
+            },
+        )
+        .await
     }
 }
 

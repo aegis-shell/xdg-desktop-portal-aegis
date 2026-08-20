@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- The FileChooser now previews the file under the listing cursor in a pane beside the directory listing: PNG, JPEG, GIF (first frame), WebP, and BMP decode off-thread under strict size caps, downsample to the pane, and render as a GPU texture through the device iris owns (ADR-0017). Non-previewable targets keep the full browsing width, and a preselected `current_file` now also takes the listing cursor so the preview shows on the first frame.
+- `scripts/version-consistency.sh`: a CI gate that fails when `Cargo.toml`/`meson.build`/`CHANGELOG.md` versions, the README/compatibility IPC protocol numbers, or the smoke-test payload contract versions drift from their sources of truth in code.
+
+### Changed
+
+- The shared request-dispatch tail (register, enqueue with backpressure refusal, await, finish) moved into `aegis_portal_runtime::dispatch`, replacing twelve copies of the same block across the portal interfaces.
+- `ScreenCast` capability reporting is served from a process-wide cache of the negotiated compositor protocol, so D-Bus property reads no longer open a compositor socket; the capability half of `SelectSources` validation now runs on the worker against the live protocol.
+- `apps.rs` split into `apps/{desktop,mimeapps,exec}.rs` by spec area (desktop-entry scanning, association lists, `Exec` expansion).
+- Workspace dependency table now pins every multi-crate dependency (`async-channel`, `argon2`, `chacha20poly1305`, `hkdf`, `rand`, `sha2`), matching the audit policy `deny.toml` documents.
+
+### Fixed
+
+- Documentation drift: `portal-ui-testing.md` smoke payloads used contract version 4 against version 5, `README.md` and the compatibility table reported protocol 25 against the implemented 29, `CHANGELOG.md` lost its 0.0.15 section and every post-0.0.9 link reference, `meson.build` was eight releases behind, and `cast-frame-path.md` was orphaned from the reference index.
+- A hung prompter child is now verified to be reaped when the caller cancels (unit coverage for the prompter supervision: crash, invalid JSON, oversized response, cancellation).
+
 ## [0.0.18] - 2026-08-18
 
 ### Fixed
@@ -29,6 +46,8 @@ All notable changes to this project are documented in this file.
   non-empty alternatives to match consumer-offered DRM modifiers, resolving
   DmaBuf zero-copy negotiation failures that previously caused consumers like OBS
   to fall back to CPU shared-memory readback.
+
+## [0.0.15] - 2026-08-17
 
 ### Fixed
 
@@ -589,7 +608,16 @@ All notable changes to this project are documented in this file.
 - Declared compatibility with Aegis `v0.0.9` through exact tagged Cargo
   dependencies.
 
-[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/compare/v0.0.18...HEAD
+[0.0.10]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.10
+[0.0.11]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.11
+[0.0.12]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.12
+[0.0.13]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.13
+[0.0.14]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.14
+[0.0.15]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.15
+[0.0.16]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.16
+[0.0.17]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.17
+[0.0.18]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.18
 [0.0.9]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.9
 [0.0.8]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.8
 [0.0.7]: https://github.com/aegis-shell/xdg-desktop-portal-aegis/releases/tag/v0.0.7

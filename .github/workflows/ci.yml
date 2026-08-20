@@ -28,6 +28,8 @@ jobs:
           tool: cargo-deny@0.20.2
       - name: Check dependencies
         run: cargo deny --all-features check
+      - name: Check version consistency
+        run: ./scripts/version-consistency.sh
 
   msrv:
     runs-on: ubuntu-24.04

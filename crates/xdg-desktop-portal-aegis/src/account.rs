@@ -65,34 +65,21 @@ impl AccountIface {
             }
         };
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(AccountJob::GetUserInformation {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            parent_window: (!window.is_empty()).then(|| window.to_owned()),
-            reason,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing Account request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "account worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("account worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "get_user_information",
+            &self.jobs,
+            |reply| AccountJob::GetUserInformation {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                parent_window: (!window.is_empty()).then(|| window.to_owned()),
+                reason,
+                reply,
+            },
+        )
+        .await
     }
 }
 

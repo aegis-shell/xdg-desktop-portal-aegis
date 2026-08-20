@@ -45,6 +45,15 @@ pub mod metrics {
     // ---- widths --------------------------------------------------------
     /// The places sidebar.
     pub const SIDEBAR_WIDTH: f32 = 176.0;
+    /// The preview pane (ADR-0017), mirroring the sidebar's rhythm.
+    pub const PREVIEW_WIDTH: f32 = 224.0;
+    /// Below this window width the preview pane collapses (browsing keeps
+    /// the full width); the default 1100-wide window clears it with room
+    /// for the listing.
+    pub const PREVIEW_MIN_WINDOW_W: f32 = 760.0;
+    /// The preview image box's height allowance inside the pane; the pane
+    /// clips around the aspect-fitted image.
+    pub const PREVIEW_IMAGE_HEIGHT: f32 = 300.0;
     /// The quiet secondary action (Cancel).
     pub const BUTTON_WIDTH: f32 = 88.0;
     /// The default action (Open/Save/Replace/Unlock).

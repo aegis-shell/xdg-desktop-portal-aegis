@@ -1,4 +1,39 @@
-//! Supervision for one Portal-owned, one-shot optics (iris/lens) prompter process.
+//! Supervision for one Portal-owned, one-shot optics (iris/lens) prompter
+//! process.
+//!
+//! ## Lifetime and hang policy
+//!
+//! Each request spawns one prompter, writes one JSON request, and waits for
+//! the process to exit — the dialog's window lifetime *is* the request's
+//! lifetime, so a user who leaves a dialog open keeps its child alive for
+//! as long as they like. There is deliberately **no wall-clock timeout**:
+//! any bound short enough to be safe would kill legitimate sessions (a
+//! user reading a folder tree or weighing a consent prompt), and the
+//! prompter owns no locks or exclusive resources the daemon needs. The
+//! bound that does exist is *count*, not time:
+//!
+//! - `Request.Close` (delivered through the `cancellation` closure)
+//!   terminates the child immediately and answers the caller with code 1;
+//! - each interface caps concurrent dialogs (for example
+//!   `MAX_ACTIVE_FILE_CHOOSERS`), so a caller that spawns-and-forgets
+//!   saturates its own cap and further requests are refused with code 2
+//!   instead of accumulating without end;
+//! - a crashed or hung-with-closed-stdout child is reaped by the exit
+//!   poll below; a child that never exits and never answers stays alive
+//!   only until the frontend gives up on the request.
+//!
+//! The wait is a 20 ms `try_wait` poll so that `cancellation` is observed
+//! without a signal: one sleeping thread per open dialog is the accepted
+//! cost (an in-flight dialog is user-visible work, not idle load).
+//!
+//! ## Response hygiene
+//!
+//! The response can carry a vault password: the read buffer is a
+//! `Zeroizing` pre-sized to 1 KiB (the realistic no-realloc size for
+//! secret-bearing answers), `mlock`'d while parsed (best effort), and the
+//! backend runs with core dumps disabled. See ADR-0009 for the vault
+//! lifecycle and ADR-0014 for why the prompter's stdout is private to the
+//! contract.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -194,4 +229,217 @@ pub(crate) fn executable() -> Result<PathBuf, String> {
     Err(format!(
         "aegis-portal-prompter was not found beside the backend or in the standard libexec directories; set {PROMPTER_ENV}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `invoke` resolves its executable through the process environment, so
+    /// the tests serialize on one lock and restore the variable after.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the prompter override under the [`ENV_LOCK`] mutex.
+    ///
+    /// # Safety (caller: the test harness)
+    /// Rust 2024 marks `set_var` unsafe because a concurrent reader could
+    /// observe a torn value. These tests are the only writers of this
+    /// variable in the test binary, every access holds `ENV_LOCK`, and the
+    /// reader they race with (`invoke`) runs on the same test thread that
+    /// performed the write, so no concurrent observation exists.
+    fn set_override(value: Option<&std::ffi::OsStr>) {
+        match value {
+            Some(value) => unsafe { std::env::set_var(PROMPTER_ENV, value) },
+            None => unsafe { std::env::remove_var(PROMPTER_ENV) },
+        }
+    }
+
+    struct PrompterOverride<'a> {
+        _guard: std::sync::MutexGuard<'a, ()>,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl PrompterOverride<'_> {
+        fn point_at(&self, script: &std::path::Path) {
+            set_override(Some(script.as_os_str()));
+        }
+
+        fn install() -> PrompterOverride<'static> {
+            let guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prior = std::env::var_os(PROMPTER_ENV);
+            PrompterOverride {
+                _guard: guard,
+                prior,
+            }
+        }
+    }
+
+    impl Drop for PrompterOverride<'_> {
+        fn drop(&mut self) {
+            set_override(self.prior.as_deref());
+        }
+    }
+
+    /// Write an executable `sh` script under `dir` acting as the prompter.
+    fn fake_prompter(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut mode = std::fs::metadata(&path).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&path, mode).unwrap();
+        path
+    }
+
+    fn confirm_request() -> PrompterRequest {
+        use aegis_portal_prompter::{ConfirmRequest, PromptRequest};
+        PrompterRequest {
+            version: aegis_portal_prompter::PROCESS_CONTRACT_VERSION,
+            prompt: PromptRequest::Confirm(ConfirmRequest {
+                title: "test".to_owned(),
+                body: "body".to_owned(),
+                accept_label: None,
+                deny_label: None,
+                modal: false,
+                parent_window: None,
+            }),
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aegis-prompter-unit-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_valid_response_decodes() {
+        let dir = temp_dir("ok");
+        let script = fake_prompter(
+            &dir,
+            "ok.sh",
+            // A minimal confirm response: accepted with no results.
+            r#"printf '%s' '{"version":5,"result":{"kind":"confirm","response":{"status":"confirmed"}}}'"#,
+        );
+        let override_env = PrompterOverride::install();
+        override_env.point_at(&script);
+        let result = invoke(confirm_request(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Ok(PromptResult::Confirm(_)) => {}
+            other => panic!("expected a confirmed dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_crashed_prompter_reports_failure() {
+        let dir = temp_dir("crash");
+        let script = fake_prompter(&dir, "crash.sh", "exit 3");
+        let override_env = PrompterOverride::install();
+        override_env.point_at(&script);
+        let error =
+            invoke(confirm_request(), None).expect_err("a crashing prompter must not succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let InvokeError::Failed(message) = error else {
+            panic!("expected Failed, got {error:?}");
+        };
+        assert!(message.contains("no response"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn invalid_json_reports_failure() {
+        let dir = temp_dir("badjson");
+        let script = fake_prompter(&dir, "badjson.sh", "printf 'not-json'");
+        let override_env = PrompterOverride::install();
+        override_env.point_at(&script);
+        let error = invoke(confirm_request(), None).expect_err("bad JSON must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let InvokeError::Failed(message) = error else {
+            panic!("expected Failed, got {error:?}");
+        };
+        assert!(message.contains("invalid JSON"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn an_oversized_response_is_refused() {
+        let dir = temp_dir("oversize");
+        // Emit more than MAX_MESSAGE_BYTES so the post-read bound check
+        // fires; dd from /dev/zero keeps the script small.
+        let script = fake_prompter(
+            &dir,
+            "oversize.sh",
+            "dd if=/dev/zero bs=1048576 count=9 2>/dev/null",
+        );
+        let override_env = PrompterOverride::install();
+        override_env.point_at(&script);
+        let error = invoke(confirm_request(), None).expect_err("oversized output must fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        let InvokeError::Failed(message) = error else {
+            panic!("expected Failed, got {error:?}");
+        };
+        assert!(message.contains("8 MiB"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn cancellation_kills_the_child_and_answers_cancelled() {
+        let dir = temp_dir("cancel");
+        // The child never answers on its own; it records its liveness into
+        // a pid file so the test can prove it died after cancellation.
+        let marker = dir.join("alive");
+        let script = fake_prompter(
+            &dir,
+            "hang.sh",
+            &format!(
+                "printf '%s' $$ > {}\nwhile :; do sleep 0.1; done",
+                marker.display()
+            ),
+        );
+        let override_env = PrompterOverride::install();
+        override_env.point_at(&script);
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let cancel = move || observed.load(std::sync::atomic::Ordering::SeqCst);
+        let handle = std::thread::spawn(move || invoke(confirm_request(), Some(&cancel)));
+        // Give the child a moment to start and record its pid.
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                break text.trim().to_owned();
+            }
+            if handle.is_finished() {
+                panic!("invoke returned before cancellation was observed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = handle
+            .join()
+            .unwrap()
+            .expect_err("cancellation must not succeed");
+
+        // The recorded pid must be gone: prove the child was killed rather
+        // than orphaned. `kill -0` fails for a dead pid.
+        let reaped = (|| {
+            for _ in 0..100 {
+                let status = std::process::Command::new("kill")
+                    .args(["-0", &pid])
+                    .status();
+                if !matches!(status, Ok(code) if code.success()) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(error, InvokeError::Cancelled), "got {error:?}");
+        assert!(
+            reaped,
+            "the hung prompter (pid {pid}) survived cancellation"
+        );
+    }
 }

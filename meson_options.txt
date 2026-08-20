@@ -2,5 +2,5 @@ option(
   'pam',
   type: 'boolean',
   value: false,
-  description: 'Build and install the optional GPL-3.0-only pam_aegis module',
+  description: 'Build and install the optional MIT-licensed pam_aegis module',
 )

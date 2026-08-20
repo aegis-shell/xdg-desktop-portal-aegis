@@ -11,17 +11,17 @@ rust-version.workspace = true
 
 [dependencies]
 aegis-portal-runtime.workspace = true
-async-channel = "2"
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
+async-channel = { workspace = true }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 dirs.workspace = true
-hkdf = "0.12"
+hkdf = { workspace = true }
 libc.workspace = true
 log.workspace = true
-rand = "0.8"
+rand = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = { workspace = true }
 thiserror.workspace = true
 zbus.workspace = true
 zeroize = { workspace = true, features = ["derive"] }

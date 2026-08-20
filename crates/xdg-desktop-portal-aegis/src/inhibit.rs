@@ -84,7 +84,11 @@ impl SystemInhibitor for Logind {
                 .map_err(|error| format!("system bus unavailable: {error}"))?;
             *guard = Some(conn);
         }
-        let conn = guard.as_ref().expect("connection just established");
+        // Invariant, not a fallible step: the branch above stored the
+        // connection, and the lock is still held.
+        let conn = guard
+            .as_ref()
+            .expect("logind connection stored under the same lock");
         let reply = conn.call_method(
             Some("org.freedesktop.login1"),
             "/org/freedesktop/login1",

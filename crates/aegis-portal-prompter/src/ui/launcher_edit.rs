@@ -6,10 +6,11 @@
 //! chooser's save-name entry; the app-owned `edit.rs` surfaces exist for
 //! fields that need programmatic caret moves, which this one never does.
 //!
-//! The icon renders as its label only: decoding arbitrary image bytes into
-//! a lens texture is not trivial, so the backend echoes the icon variant
-//! back in the portal results instead of sending it across the pipe (the
-//! same call as the app chooser's name-only rows).
+//! The icon renders as its label only: the icon arrives as a themed name
+//! or a variant tag on the wire, not as bytes the dialog could turn into
+//! a texture, so the backend echoes it back in the portal results (the
+//! same call as the app chooser's name-only rows). Decoding *files* is
+//! the file chooser preview pane's job (ADR-0017).
 
 use aegis_portal_prompter::{LauncherEditRequest, LauncherEditResponse, PromptResult};
 use lens::{Align, Frame, Input, LayoutOpts, TextBuf, key};

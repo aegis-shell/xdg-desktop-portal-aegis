@@ -65,18 +65,33 @@ struct MultiConsumerData {
     loop_weak: pw::main_loop::MainLoopWeak,
 }
 
+/// Parameters for [`consume_frames_metadata`]: the stream's geometry and
+/// the modifiers the consumer will offer, plus the receive target count.
+pub struct ConsumeRequest<'a> {
+    pub node_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub modifiers: &'a [u64],
+    pub count: usize,
+    pub ready: std::sync::mpsc::Sender<()>,
+    pub timeout: Duration,
+}
+
 /// Connect to the PipeWire daemon listening on `socket`, subscribe to
 /// `node_id`, and receive `count` frames with their attached metadata blocks.
 pub fn consume_frames_metadata(
     socket: &Path,
-    node_id: u32,
-    width: u32,
-    height: u32,
-    modifiers: &[u64],
-    count: usize,
-    ready: std::sync::mpsc::Sender<()>,
-    timeout: Duration,
+    request: ConsumeRequest<'_>,
 ) -> Result<Vec<ReceivedFrame>, String> {
+    let ConsumeRequest {
+        node_id,
+        width,
+        height,
+        modifiers,
+        count,
+        ready,
+        timeout,
+    } = request;
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(pw::init);
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
@@ -190,7 +205,8 @@ pub fn consume_frames_metadata(
                         return;
                     };
                     if slice.len() < size {
-                        *data.error.borrow_mut() = Some("shared buffer is smaller than its chunk".into());
+                        *data.error.borrow_mut() =
+                            Some("shared buffer is smaller than its chunk".into());
                         if let Some(mainloop) = data.loop_weak.upgrade() {
                             mainloop.quit();
                         }

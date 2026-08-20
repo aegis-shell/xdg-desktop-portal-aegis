@@ -589,10 +589,11 @@ const MAX_LAUNCHER_NAME_BYTES: usize = 1024;
 /// to the prompter: the user reviews the proposed launcher name (editing
 /// it when `editable_name`), then confirms or cancels the installation.
 ///
-/// The icon itself never crosses the pipe: the dialog cannot decode
-/// arbitrary image bytes into a lens texture, so the backend echoes the
-/// icon variant back in the portal results verbatim and only a short
-/// human-readable label (the themed name, or a generic note) is shown.
+/// The icon itself never crosses the pipe — its bytes are not a file the
+/// dialog could open, so the backend echoes the icon variant back in the
+/// portal results verbatim and only a short human-readable label (the
+/// themed name, or a generic note) is shown. (The file chooser's preview
+/// pane decodes *files* through its own pipeline; see ADR-0017.)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LauncherEditRequest {
     pub app_id: String,

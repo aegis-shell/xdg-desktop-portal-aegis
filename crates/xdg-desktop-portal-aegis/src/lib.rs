@@ -143,11 +143,7 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(task)
-        .map_err(|error| {
-            PortalError::Bus(zbus::Error::Failure(format!(
-                "spawn {name} worker: {error}"
-            )))
-        })?;
+        .map_err(PortalError::Worker)?;
     Ok(())
 }
 
@@ -249,7 +245,6 @@ pub fn run() -> Result<(), PortalError> {
             tracker: Arc::clone(&tracker),
             sessions: Arc::clone(&sessions),
             jobs: cast_jobs.clone(),
-            socket: socket.clone(),
         },
     )?;
     // Stateless sandbox-policy query surface; no worker, no IPC.

@@ -86,33 +86,20 @@ impl AppChooserIface {
             }
         };
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(AppChooserJob::Choose {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            request,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing AppChooser request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "app chooser worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("app chooser worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "choose",
+            &self.jobs,
+            |reply| AppChooserJob::Choose {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                request,
+                reply,
+            },
+        )
+        .await
     }
 
     /// The frontend's mid-dialog choice updates. The one-shot prompter

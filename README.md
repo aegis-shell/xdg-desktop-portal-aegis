@@ -4,7 +4,7 @@
 [xdg-desktop-portal](https://flatpak.github.io/xdg-desktop-portal/)
 backend for the Aegis desktop. It translates freedesktop portal D-Bus
 requests into Portal-owned services and, only for compositor resources, a
-narrow projection of Aegis IPC (protocol 25, negotiating down to 24). It
+narrow projection of Aegis IPC (protocol 29, negotiating down to 24). It
 publishes ScreenCast streams
 through PipeWire and hosts the encrypted, per-application Secret portal.
 
@@ -27,10 +27,10 @@ UI host from a small Cargo workspace:
 ## Compatibility
 
 Portal and Aegis releases have independent version sequences. The current
-workspace speaks Aegis IPC protocol 25 and negotiates down to 24. The
+workspace speaks Aegis IPC protocol 29 and negotiates down to 24. The
 protocol-24 wire schema is verified against Aegis `v0.0.11` and `v0.0.12`;
 Aegis `v0.0.15` provides protocol 25, and `v0.0.16`–`v0.0.21` speak
-protocol 27, which the handshake negotiates down. Wallpaper uses the
+protocol 29, which the handshake negotiates down. Wallpaper uses the
 compositor's long-standing `SetWallpaper` op, available in every
 supported release. This is a runtime compatibility contract, not a source
 dependency; see the

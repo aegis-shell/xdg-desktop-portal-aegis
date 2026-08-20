@@ -83,34 +83,21 @@ impl DynamicLauncherIface {
         };
         let (request, icon) = prepared;
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(DynamicLauncherJob::Prepare {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            request,
-            icon,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing PrepareInstall request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "dynamic launcher worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("dynamic launcher worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "prepare",
+            &self.jobs,
+            |reply| DynamicLauncherJob::Prepare {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                request,
+                icon,
+                reply,
+            },
+        )
+        .await
     }
 
     /// Non-interactive installation is never permitted: every install goes

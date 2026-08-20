@@ -80,35 +80,23 @@ impl WallpaperIface {
             }
         };
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(WallpaperJob::Set {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            path: image_path,
-            show_preview,
-            parent_window: (!parent_window.is_empty()).then(|| parent_window.to_owned()),
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing SetWallpaperURI: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok(2);
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "wallpaper worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("wallpaper worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result.map(|(response, _)| response)
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "set_wallpaper_uri",
+            &self.jobs,
+            |reply| WallpaperJob::Set {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                path: image_path,
+                show_preview,
+                parent_window: (!parent_window.is_empty()).then(|| parent_window.to_owned()),
+                reply,
+            },
+        )
+        .await
+        .map(|(response, _)| response)
     }
 
     #[zbus(property, name = "version")]

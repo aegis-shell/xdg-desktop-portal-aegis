@@ -18,3 +18,4 @@
 | [0014](0014-prompter-privatizes-standard-output.md) | The prompter privatizes its standard output | Accepted |
 | [0015](0015-protocol-29-projection.md) | The protocol-29 projection | Accepted |
 | [0016](0016-screencast-runtime-protocol-29.md) | The ScreenCast runtime surface for protocol 29 | Accepted |
+| [0017](0017-file-chooser-image-preview.md) | The FileChooser previews images in the prompter | Accepted |

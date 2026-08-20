@@ -739,7 +739,7 @@ fn screencast_republishes_compositor_frames_through_real_pipewire() {
 #[path = "media/pipewire_consumer.rs"]
 mod pipewire_consumer;
 use pipewire_consumer::{
-    Received, consume_frames_metadata, consume_one_frame, consume_one_frame_damage,
+    ConsumeRequest, Received, consume_frames_metadata, consume_one_frame, consume_one_frame_damage,
 };
 
 /// DRM_FORMAT_XRGB8888: the fourcc the compositor announces for its
@@ -1898,13 +1898,15 @@ fn screencast_negotiates_multi_modifier_consumer_zero_copy() {
     let consumer = std::thread::spawn(move || {
         consume_frames_metadata(
             &socket,
-            node_id,
-            2,
-            2,
-            &consumer_modifiers,
-            1,
-            ready_tx,
-            Duration::from_secs(8),
+            ConsumeRequest {
+                node_id,
+                width: 2,
+                height: 2,
+                modifiers: &consumer_modifiers,
+                count: 1,
+                ready: ready_tx,
+                timeout: Duration::from_secs(8),
+            },
         )
     });
     ready_rx
@@ -1955,7 +1957,18 @@ fn screencast_continuous_cadence_and_pts_headers() {
     let socket = env.runtime_dir.join("pipewire-0");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let consumer = std::thread::spawn(move || {
-        consume_frames_metadata(&socket, node_id, 2, 2, &[], 5, ready_tx, Duration::from_secs(8))
+        consume_frames_metadata(
+            &socket,
+            ConsumeRequest {
+                node_id,
+                width: 2,
+                height: 2,
+                modifiers: &[],
+                count: 5,
+                ready: ready_tx,
+                timeout: Duration::from_secs(8),
+            },
+        )
     });
     ready_rx
         .recv_timeout(Duration::from_secs(5))

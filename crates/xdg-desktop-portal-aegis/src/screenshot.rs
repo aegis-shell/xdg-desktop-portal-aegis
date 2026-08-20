@@ -160,36 +160,23 @@ impl ScreenshotIface {
             options.target
         );
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(CaptureJob::Screenshot {
-            request_path: path.clone(),
-            token,
-            app_id: app_id.to_string(),
-            interactive: options.interactive,
-            target: options.target,
-            permission_store_checked: options.permission_store_checked,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing Screenshot: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "capture worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("capture worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "screenshot",
+            &self.jobs,
+            |reply| CaptureJob::Screenshot {
+                request_path: path.clone(),
+                token,
+                app_id: app_id.to_string(),
+                interactive: options.interactive,
+                target: options.target,
+                permission_store_checked: options.permission_store_checked,
+                reply,
+            },
+        )
+        .await
     }
 
     async fn pick_color(
@@ -202,32 +189,19 @@ impl ScreenshotIface {
         let path = handle.as_str().to_string();
         log::info!("portal: PickColor for '{app_id}' at {path}");
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(CaptureJob::PickColor {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing PickColor: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "capture worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("capture worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "pick color",
+            &self.jobs,
+            |reply| CaptureJob::PickColor {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                reply,
+            },
+        )
+        .await
     }
 
     #[zbus(property, name = "version")]

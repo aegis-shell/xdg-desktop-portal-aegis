@@ -1,5 +1,23 @@
 # Release Checklist
 
+## Version Alignment
+
+1. Bump `workspace.package.version` in `Cargo.toml` and every
+   `[Unreleased]` heading in `CHANGELOG.md` (add the matching
+   `[0.0.N]: …/tag/v0.0.N` link-ref definition and move the
+   `[Unreleased]` compare base to the new tag).
+2. Set `meson.build`'s `project(version:)` to the same value.
+3. Run `scripts/version-consistency.sh` — it fails until every versioned
+   surface below agrees:
+   - `Cargo.toml` workspace version ↔ `meson.build` version ↔ the newest
+     `CHANGELOG.md` release heading and link refs,
+   - `README.md` and `docs/reference/compatibility.md` protocol numbers ↔
+     `aegis-portal-ipc`'s `PROTOCOL_VERSION`/`MIN_PROTOCOL_VERSION`,
+   - `docs/dev/portal-ui-testing.md` payload versions ↔
+     `aegis-portal-prompter`'s `PROCESS_CONTRACT_VERSION`,
+   - `docs/dev/documentation/` is never modified by a code change
+     (governance firewall, see `AGENTS.md`).
+
 ## Canonical Dependency State
 
 1. Resolve the workspace with `--locked` from a clean checkout.

@@ -9,7 +9,8 @@
 //! mode), typing selects by name, Enter activates, Backspace/Alt+Up walks
 //! up, Ctrl+H toggles dotfiles, Enter accepts, saving over an existing
 //! file asks for confirmation, and Escape cancels (closing the window
-//! cancels too).
+//! cancels too). The file under the cursor previews in a pane beside the
+//! listing when its format decodes cheaply (ADR-0017).
 //!
 //! The location and save-name fields are plain lens text fields; after a
 //! programmatic rewrite (Tab completion, a pre-filled name) the caret is
@@ -18,6 +19,7 @@
 //! host-owned cursor/selection (optics ADR-0066).
 
 mod model;
+mod preview;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -33,12 +35,14 @@ use model::{
     Entry, History, Place, PlaceIcon, breadcrumbs, common_prefix, expand_tilde, list_dir,
     normalize_lexical, split_dir_tail, typeahead_index, valid_filename,
 };
+use preview::{PreviewPanel, PreviewState};
 
 use super::style::{self, metrics};
 use super::{
-    back_icon, close_window, command_held, committed_text, computer_icon, edit_icon,
-    escape_pressed, focus_widget, forward_icon, home_icon, key_pressed, modifiers, new_folder_icon,
-    parent_icon, raw_icon, run_window, truncate_to_width, window_title,
+    back_icon, close_window, command_held, committed_text, computer_icon, display_size,
+    draw_texture_centered, edit_icon, escape_pressed, focus_widget, forward_icon, home_icon,
+    key_pressed, modifiers, new_folder_icon, parent_icon, raw_icon, run_window_with_lifecycle,
+    truncate_to_width, window_title,
 };
 
 /// Double-click window for "activate" (navigate/open) gestures.
@@ -114,6 +118,12 @@ struct State {
     /// Whether Ctrl/Super is held this frame (multi-select modifier),
     /// sampled at the top of every build.
     ctrl_held: bool,
+    /// The preselected file's basename, resolved to a listing cursor row
+    /// by the first reload (the entries are not loaded at construction).
+    focus_pending: Option<std::ffi::OsString>,
+    /// The preview pane (ADR-0017): decodes the file under the listing
+    /// cursor off-thread and draws it to the right of the listing.
+    preview: PreviewPanel,
     reload: bool,
     done: Option<FileChooserResponse>,
 }
@@ -128,7 +138,17 @@ pub fn run(request: FileChooserRequest) -> Result<PromptResult, String> {
     let title = window_title(&title, Some(&request.app_id));
     let mut state = State::new(request);
     state.reload_entries();
-    let state = run_window(&title, (920, 540), state, build)?;
+    // The lifecycle hooks capture iris's device for the preview pane's
+    // texture uploads and release its textures before the device goes
+    // away; the default window grows to fit the pane beside the listing.
+    let state = run_window_with_lifecycle(
+        &title,
+        (1100, 600),
+        state,
+        |state, device| state.preview.attach_device(device),
+        build,
+        |state| state.preview.release(),
+    )?;
     let response = state.done.unwrap_or(FileChooserResponse::Cancelled);
     Ok(PromptResult::FileChooser(response))
 }
@@ -178,6 +198,13 @@ impl State {
             .or_else(std::env::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let selected = start_file.into_iter().collect::<BTreeSet<PathBuf>>();
+        // The preselected file also takes the listing cursor, so it is
+        // visibly focused (and previewed) from the first frame.
+        let focus_index = selected
+            .iter()
+            .next()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_os_string());
 
         let initial_name = match request.mode {
             FileChooserMode::SaveFile => request
@@ -235,6 +262,7 @@ impl State {
             location_field_focused: false,
             location_error: None,
             focus_index: None,
+            focus_pending: focus_index,
             // In save mode the name entry takes the initial focus instead.
             table_focus_pending: !save_mode,
             history: History::default(),
@@ -247,6 +275,7 @@ impl State {
             folder_focus: false,
             folder_field_focused: false,
             ctrl_held: false,
+            preview: PreviewPanel::new(),
             reload: true,
             done: None,
         }
@@ -283,6 +312,16 @@ impl State {
                 self.entries = Vec::new();
                 self.listing_error = Some(error);
             }
+        }
+        // The first listing resolves the preselected file's row: give it
+        // the cursor so the selection (and the preview) is visible.
+        if let Some(name) = self.focus_pending.take()
+            && let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.path.file_name() == Some(name.as_os_str()))
+        {
+            self.focus_index = Some(index);
         }
         self.reload = false;
     }
@@ -967,7 +1006,7 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                 );
             }
 
-            // ---- places sidebar + directory listing ---------------------
+            // ---- places sidebar + directory listing + preview pane ------
             f.row_ex(
                 &LayoutOpts {
                     gap: metrics::SPACE_S,
@@ -1079,6 +1118,9 @@ fn build(state: &mut State, f: &mut Frame, input: &Input) {
                             }
                         },
                     );
+                    // The preview pane (ADR-0017): the file under the
+                    // listing cursor, when its format decodes cheaply.
+                    preview_pane(state, f, input);
                 },
             );
 
@@ -1309,6 +1351,119 @@ fn crumb_name(component: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_owned())
+}
+
+/// The preview pane to the right of the listing (ADR-0017): the file under
+/// the listing cursor, when its format decodes cheaply (PNG, JPEG, GIF,
+/// WebP, BMP). Non-previewable targets collapse the pane entirely so
+/// browsing keeps the full width; the pane also hides on windows too
+/// narrow to fit it beside the listing. The pane is presentation only —
+/// it never changes the selection or the accept result.
+fn preview_pane(state: &mut State, f: &mut Frame, input: &Input) {
+    // Too narrow to be worth the split: keep the whole width for browsing.
+    let (window_w, _) = display_size(input);
+    if window_w > 0.0 && window_w < metrics::PREVIEW_MIN_WINDOW_W {
+        state.preview.state_for(None);
+        return;
+    }
+    let target = state
+        .focus_index
+        .and_then(|index| state.entries.get(index))
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| entry.path.clone());
+    let pane = state.preview.state_for(target.as_deref());
+    let entry_name = target
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    match pane {
+        PreviewState::Hidden => {}
+        PreviewState::Loading | PreviewState::Failed { .. } | PreviewState::Ready { .. } => {
+            f.separator();
+            f.column_ex(
+                &LayoutOpts {
+                    width: metrics::PREVIEW_WIDTH,
+                    gap: metrics::SPACE_S,
+                    pad: metrics::SPACE_XS,
+                    ..Default::default()
+                },
+                |f| match pane {
+                    PreviewState::Ready {
+                        texture,
+                        source_size,
+                        file_bytes,
+                    } => {
+                        // The image box flexes to fill the pane's height;
+                        // the caption row below keeps its intrinsic size.
+                        f.flex(1.0);
+                        f.scroll("chooser-preview-image", |f| {
+                            let (w, h) = preview_image_box();
+                            draw_texture_centered(f, &texture, w, h);
+                        });
+                        preview_caption(
+                            f,
+                            state.dark,
+                            entry_name.as_deref(),
+                            Some((source_size, file_bytes)),
+                        );
+                    }
+                    PreviewState::Loading => {
+                        f.push_style(style::small_muted_style(state.dark));
+                        f.label_sized("Decoding preview…", metrics::FONT_SMALL);
+                        f.pop_style();
+                    }
+                    PreviewState::Failed { reason } => {
+                        f.push_style(style::small_muted_style(state.dark));
+                        f.label_wrapped_sized(&reason, metrics::FONT_SMALL, metrics::PREVIEW_WIDTH);
+                        f.pop_style();
+                        preview_caption(f, state.dark, entry_name.as_deref(), None);
+                    }
+                    PreviewState::Hidden => {}
+                },
+            );
+        }
+    }
+}
+
+/// The image box for the preview: the pane's content width and a height
+/// allowance the scroll clips around. The drawn image is aspect-fitted to
+/// this box by `draw_texture_centered`, so a tall or wide photo centers
+/// instead of stretching.
+fn preview_image_box() -> (f32, f32) {
+    // The scroll's viewport height is not known before the first layout
+    // pass; the fixed allowance plus clipping keeps the box stable across
+    // frames without measuring probes.
+    (
+        metrics::PREVIEW_WIDTH - 2.0 * metrics::SPACE_XS,
+        metrics::PREVIEW_IMAGE_HEIGHT,
+    )
+}
+
+/// The quiet caption under the preview: the file name (truncated), and —
+/// when the decode succeeded — its pixel dimensions and size on disk,
+/// both captured at decode time so no frame stats the file.
+fn preview_caption(
+    f: &mut Frame,
+    dark: bool,
+    name: Option<&str>,
+    details: Option<((u32, u32), u64)>,
+) {
+    if let Some(name) = name {
+        let shown = truncate_to_width(f, name, metrics::PREVIEW_WIDTH - 2.0 * metrics::SPACE_XS);
+        f.push_style(style::small_muted_style(dark));
+        f.label_sized(&shown, metrics::FONT_SMALL);
+        f.pop_style();
+    }
+    let mut parts = Vec::new();
+    if let Some(((w, h), bytes)) = details {
+        parts.push(format!("{w} × {h}"));
+        parts.push(preview::format_size(bytes));
+    }
+    if !parts.is_empty() {
+        f.push_style(style::small_muted_style(dark));
+        f.label_sized(&parts.join(" · "), metrics::FONT_SMALL);
+        f.pop_style();
+    }
 }
 
 /// One sidebar shortcut row, highlighted when it is the browsed folder.
@@ -1585,6 +1740,22 @@ mod ui_tests {
         state.selected.iter().cloned().collect()
     }
 
+    /// Write a small two-tone PNG so the preview path decodes real bytes.
+    fn write_png(path: &Path, width: u32, height: u32) {
+        let mut rgba = image::RgbaImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let even = (x / 8 + y / 8) % 2 == 0;
+                rgba.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([if even { 240 } else { 32 }, 96, 160, 255]),
+                );
+            }
+        }
+        rgba.save(path).expect("png fixture writes");
+    }
+
     #[test]
     fn table_keyboard_drives_cursor_selection_and_activation() {
         let fixture = Fixture::new("kbd");
@@ -1724,5 +1895,117 @@ mod ui_tests {
         settle(&mut ui, &mut state);
         tap(&mut ui, &mut state, key::ESCAPE);
         assert!(matches!(state.done, Some(FileChooserResponse::Cancelled)));
+    }
+
+    #[test]
+    fn preview_pane_loads_decodes_and_caches_images() {
+        let fixture = Fixture::new("preview");
+        // A real PNG alongside the plain fixture files; dirs sort first,
+        // then files alphabetically: notes.txt, photo.png, report.pdf.
+        write_png(&fixture.0.join("photo.png"), 40, 20);
+        let mut ui = Ui::headless().unwrap();
+        let mut state = fresh_state(FileChooserMode::OpenFile, &fixture);
+        state.reload_entries();
+        settle(&mut ui, &mut state);
+
+        // No cursor: the pane hides without touching the worker.
+        assert!(matches!(
+            state.preview.state_for(None),
+            preview::PreviewState::Hidden
+        ));
+
+        // The cursor lands on the PNG: a decode is requested (no device
+        // in headless mode, so the texture never uploads, but the decode
+        // itself runs on the worker and must round-trip).
+        type_text(&mut ui, &mut state, "pho");
+        // Rows: alpha/ beta/ notes.txt photo.png report.pdf.
+        assert_eq!(state.focus_index, Some(3));
+        let target = fixture.0.join("photo.png");
+        assert!(matches!(
+            state.preview.state_for(Some(&target)),
+            preview::PreviewState::Loading
+        ));
+        // The worker finishes; draining admits the decode (headless has
+        // no device, so the upload is skipped but the pending target
+        // clears only through the channel — poll until it settles).
+        let mut decoded = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = state.preview.state_for(Some(&target));
+            if state.preview.pending_is_none() {
+                decoded = true;
+                break;
+            }
+        }
+        assert!(decoded, "the worker decode never completed");
+        // The decode result itself is validated by the pure decode test
+        // below; here the contract is the state machine: still loading in
+        // headless (no device to upload through), never failed.
+        assert!(matches!(
+            state.preview.state_for(Some(&target)),
+            preview::PreviewState::Loading
+        ));
+
+        // Moving to a non-image hides the pane again.
+        type_text(&mut ui, &mut state, "not");
+        let notes = fixture.0.join("notes.txt");
+        assert!(matches!(
+            state.preview.state_for(Some(&notes)),
+            preview::PreviewState::Hidden
+        ));
+    }
+
+    #[test]
+    fn preselected_file_takes_the_cursor_and_previews() {
+        let fixture = Fixture::new("preselect");
+        write_png(&fixture.0.join("photo.png"), 40, 20);
+        let mut req = request(FileChooserMode::OpenFile, &fixture);
+        req.current_file = Some(BytePath::from(fixture.0.join("photo.png")));
+        let mut state = State::new(req);
+        state.reload_entries();
+
+        // The listing's cursor row is the preselected file
+        // (alpha/ beta/ notes.txt photo.png report.pdf → index 3).
+        assert_eq!(state.focus_index, Some(3));
+        assert_eq!(selected_paths(&state), vec![fixture.0.join("photo.png")]);
+
+        // The headless pane requests its decode without a device.
+        let target = fixture.0.join("photo.png");
+        assert!(matches!(
+            state.preview.state_for(Some(&target)),
+            preview::PreviewState::Loading
+        ));
+        // A non-existent preselection (deleted between request and dialog)
+        // leaves the cursor unset, not panicked.
+        let mut req = request(FileChooserMode::OpenFile, &fixture);
+        req.current_file = Some(BytePath::from(fixture.0.join("gone.png")));
+        let mut state = State::new(req);
+        state.reload_entries();
+        assert_eq!(state.focus_index, None);
+    }
+
+    #[test]
+    fn preview_decode_downsamples_real_pngs() {
+        let fixture = Fixture::new("preview-decode");
+        // A PNG larger than the texture budget: the decode must cap it.
+        let big = fixture.0.join("big.png");
+        write_png(&big, 1400, 700);
+        let decoded = preview::decode_preview(&big).expect("large png decodes");
+        assert_eq!(decoded.source_size, (1400, 700));
+        assert_eq!((decoded.width, decoded.height), (672, 336));
+        assert_eq!(decoded.pixels.len(), 672 * 336 * 4);
+        // The caption's size rides the decode; frames never stat the file.
+        assert!(decoded.file_bytes > 0);
+        // A small PNG decodes at its natural size.
+        let small = fixture.0.join("small.png");
+        write_png(&small, 60, 40);
+        let decoded = preview::decode_preview(&small).expect("small png decodes");
+        assert_eq!((decoded.width, decoded.height), (60, 40));
+        // A non-image refuses with a reason, not a panic.
+        let reason = match preview::decode_preview(&fixture.0.join("notes.txt")) {
+            Err(reason) => reason,
+            Ok(_) => panic!("text files do not decode"),
+        };
+        assert!(reason.contains("no preview"), "unexpected reason: {reason}");
     }
 }

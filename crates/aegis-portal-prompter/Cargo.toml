@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 env_logger = { workspace = true }
 flux-sys = { workspace = true }
+image = { workspace = true }
 iris = { workspace = true }
 iris-sys = { workspace = true }
 lens = { workspace = true }

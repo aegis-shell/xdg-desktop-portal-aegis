@@ -243,11 +243,14 @@ impl SecretService {
         let state = Arc::clone(&self.state);
         let spawned = std::thread::Builder::new()
             .name("aegis-secret-auto-lock".to_owned())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(30));
-                let mut state = sync::lock(&state, "secret state");
-                if state.is_unlocked() && state.last_accessed.elapsed() >= idle_timeout {
-                    if state.vault.take().is_some() {
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(30));
+                    let mut state = sync::lock(&state, "secret state");
+                    if state.is_unlocked()
+                        && state.last_accessed.elapsed() >= idle_timeout
+                        && state.vault.take().is_some()
+                    {
                         log::info!(
                             "portal: secret vault auto-locked after {idle_timeout:?} of inactivity"
                         );

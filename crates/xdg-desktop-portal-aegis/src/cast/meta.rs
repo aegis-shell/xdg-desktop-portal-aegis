@@ -85,7 +85,7 @@ pub(crate) fn monotonic_pts_nanos() -> i64 {
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
-    (ts.tv_sec as i64) * 1_000_000_000 + (ts.tv_nsec as i64)
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 
 /// Attach standard header metadata (PTS timestamp and monotonic sequence)
@@ -93,11 +93,7 @@ pub(crate) fn monotonic_pts_nanos() -> i64 {
 ///
 /// # Safety
 /// `buffer` must be a live pool buffer of this stream.
-pub(crate) unsafe fn attach_header(
-    buffer: *mut pw_sys::pw_buffer,
-    seq: u64,
-    pts_nanos: i64,
-) {
+pub(crate) unsafe fn attach_header(buffer: *mut pw_sys::pw_buffer, seq: u64, pts_nanos: i64) {
     let spa_buffer = unsafe { (*buffer).buffer };
     if spa_buffer.is_null() {
         return;

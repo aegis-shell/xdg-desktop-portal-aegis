@@ -142,36 +142,23 @@ impl OpenUriIface {
             );
         }
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(OpenUriJob::Open {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            uri,
-            content_type,
-            parent_window: (!parent_window.is_empty()).then(|| parent_window.to_owned()),
-            ask,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing OpenURI request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed(
-                    "open uri worker is gone".to_string(),
-                ));
-            }
-        }
-        let result = response.recv().await.map_err(|_| {
-            zbus::fdo::Error::Failed("open uri worker dropped its response".to_string())
-        });
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "open",
+            &self.jobs,
+            |reply| OpenUriJob::Open {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                uri,
+                content_type,
+                parent_window: (!parent_window.is_empty()).then(|| parent_window.to_owned()),
+                ask,
+                reply,
+            },
+        )
+        .await
     }
 }
 

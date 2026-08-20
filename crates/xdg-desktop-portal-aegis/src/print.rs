@@ -116,34 +116,22 @@ impl PrintIface {
             .filter(|token| *token != 0)
             .unwrap_or_else(fresh_token);
 
-        aegis_portal_runtime::register(&self.conn, &self.tracker, &path).await?;
-        let (reply, response) = async_channel::bounded(1);
-        let queued = self.jobs.try_send(PrintJob::Print {
-            request_path: path.clone(),
-            app_id: app_id.to_string(),
-            title: title.to_string(),
-            fd,
-            token,
-            reply,
-        });
-        match queued {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                log::warn!("portal: refusing Print request: worker queue is full");
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Ok((2, HashMap::new()));
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-                return Err(zbus::fdo::Error::Failed("print worker is gone".to_string()));
-            }
-        }
-        let result = response
-            .recv()
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("print worker dropped its response".to_string()));
-        aegis_portal_runtime::finish(&self.conn, &self.tracker, &path).await;
-        result
+        aegis_portal_runtime::dispatch(
+            &self.conn,
+            &self.tracker,
+            &path,
+            "print",
+            &self.jobs,
+            |reply| PrintJob::Print {
+                request_path: path.clone(),
+                app_id: app_id.to_string(),
+                title: title.to_string(),
+                fd,
+                token,
+                reply,
+            },
+        )
+        .await
     }
 
     /// The local frontend contract level this backend implements. The impl

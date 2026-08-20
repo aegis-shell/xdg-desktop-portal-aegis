@@ -10,6 +10,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-channel = "2"
+async-channel = { workspace = true }
 log.workspace = true
 zbus.workspace = true

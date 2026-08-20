@@ -47,12 +47,16 @@ repository `AGENTS.md`), or from the system installation otherwise.
 The prompter is a stdin/stdout contract process: write one versioned JSON
 request to standard input and it shows the real lens window; the response
 JSON appears on standard output when you answer, press Escape, or close
-the window. No bus, daemon, or display server setup is required.
+the window. No bus, daemon, or display server setup is required. The
+`"version"` field must equal
+`aegis_portal_prompter::PROCESS_CONTRACT_VERSION` (currently `5`);
+`scripts/version-consistency.sh` checks that the payloads below stay in
+sync with it.
 
 A confirmation dialog:
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"confirm","request":{"title":"Smoke Test","body":"Lens UI works.","accept_label":"_Continue","modal":false,"parent_window":null}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -60,14 +64,14 @@ A secret prompt (masked editing: typing, Backspace, caret keys, Ctrl+V,
 Enter to submit):
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"secret","request":{"title":"Unlock Keyring","reason":"dev.aegis.Test wants access."}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
 A file chooser with a filter and multi-selection:
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"file_chooser","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"file_chooser","request":{"mode":"open_file","app_id":"dev.aegis.Test","title":"Open File","accept_label":null,"modal":false,"parent_window":null,"multiple":true,"current_folder":null,"current_name":null,"current_file":null,"filters":[{"label":"Images","rules":[{"kind":"glob","value":"*.png"}]}],"current_filter":null,"choices":[],"files":[]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -75,7 +79,7 @@ A save dialog — the download-location prompt a browser raises before
 writing a download — with a suggested file name:
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"file_chooser","request":{"mode":"save_file","app_id":"dev.aegis.Test","title":"Save Download","accept_label":null,"modal":false,"parent_window":null,"multiple":false,"current_folder":null,"current_name":"report.pdf","current_file":null,"filters":[],"current_filter":null,"choices":[],"files":[]}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"file_chooser","request":{"mode":"save_file","app_id":"dev.aegis.Test","title":"Save Download","accept_label":null,"modal":false,"parent_window":null,"multiple":false,"current_folder":null,"current_name":"report.pdf","current_file":null,"filters":[],"current_filter":null,"choices":[],"files":[]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -83,14 +87,14 @@ An application chooser (the AppChooser/OpenURI surface) with the
 remember checkbox:
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"choose_app","request":{"app_id":"dev.aegis.Test","title":"Open With","content_type":"text/plain","parent_window":null,"apps":[{"id":"org.foo.Editor.desktop","name":"Foo Editor","icon":null},{"id":"org.bar.Notes.desktop","name":"Bar Notes","icon":null}],"choices":[{"id":"remember","label":"Remember this choice","options":[],"selected":"false"}]}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"choose_app","request":{"app_id":"dev.aegis.Test","title":"Open With","content_type":"text/plain","parent_window":null,"apps":[{"id":"org.foo.Editor.desktop","name":"Foo Editor","icon":null},{"id":"org.bar.Notes.desktop","name":"Bar Notes","icon":null}],"choices":[{"id":"remember","label":"Remember this choice","options":[],"selected":"false"}]}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
 A launcher-name editor (the DynamicLauncher surface):
 
 ```bash
-printf '%s' '{"version":4,"prompt":{"kind":"launcher_edit","request":{"app_id":"dev.aegis.Test","title":"Install Launcher","name":"Cool App","editable_name":true,"target":null,"icon_label":"cool-app","modal":false,"parent_window":null}}}' \
+printf '%s' '{"version":5,"prompt":{"kind":"launcher_edit","request":{"app_id":"dev.aegis.Test","title":"Install Launcher","name":"Cool App","editable_name":true,"target":null,"icon_label":"cool-app","modal":false,"parent_window":null}}}' \
   | ./target/debug/aegis-portal-prompter; echo
 ```
 
@@ -133,7 +137,9 @@ closure on a headless lens `Ui` with synthetic input — key presses,
 modifier chords, and text commits — and assert the resulting state:
 the listing table's cursor/selection/activation contract, typeahead,
 Ctrl+Space multi-select, location-field Tab completion and navigation,
-the pre-filled save name's caret, and Escape cancellation:
+the pre-filled save name's caret, Escape cancellation, and the preview
+pane's state machine (hide for non-images, request-and-await one decode
+per file, cache revisit) with real PNG fixtures the tests generate:
 
 ```bash
 cargo test -p aegis-portal-prompter
@@ -141,7 +147,12 @@ cargo test -p aegis-portal-prompter
 
 They need no Wayland display, compositor, or D-Bus session (the lens
 text stack still discovers fonts through fontconfig), so they run in CI
-with the rest of the unit tests.
+with the rest of the unit tests. The headless `Ui` has no `flux`
+device, so preview tests assert the decode pipeline (caps, downsampling,
+premultiplication, format gating) and the pane's state transitions; the
+texture upload itself is exercised by the direct setup above — set
+`current_file` to an image and watch for the `preview texture …
+uploaded` debug line.
 
 ### Synthetic Interaction Tests
 

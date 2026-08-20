@@ -17,7 +17,7 @@ aegis-portal-secret = { workspace = true }
 # Session D-Bus bridge: pure-Rust zbus with the blocking API so the service
 # stays on a plain `std::thread` model without an async runtime.
 zbus = { workspace = true }
-async-channel = "2"
+async-channel = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
@@ -30,7 +30,7 @@ zeroize = { workspace = true }
 # stale frames.
 pipewire = { version = "0.10", features = ["v0_3_34"] }
 dirs = { workspace = true }
-rand = "0.8"
+rand = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 # Account portal: getpwuid for the account id and GECOS real name.
@@ -40,12 +40,12 @@ libc = { workspace = true }
 # Independent wire-format fixtures keep the assembled daemon tests from
 # trusting the secret implementation under test.
 aegis-portal-ipc = { workspace = true, features = ["test-server"] }
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [lib]
 name = "aegis_portal"
